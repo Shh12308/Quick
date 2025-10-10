@@ -1,61 +1,58 @@
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import httpx
+import os
 
 app = FastAPI(title="Mini AI Test")
 
-# Allow CORS from any origin (for your frontend)
+# Allow your frontend to call the API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # adjust if needed
     allow_methods=["*"],
     allow_headers=["*"]
 )
 
-# ---- Text generation endpoint ----
+HF_API_KEY = os.getenv("HF_API_KEY")  # set this in Render secrets
+TEXT_MODEL = "gpt2"
+IMAGE_MODEL = "runwayml/stable-diffusion-v1-5"
+
+if not HF_API_KEY:
+    raise RuntimeError("Please set HF_API_KEY environment variable")
+
+HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"}
+
+# ---- Text generation ----
 @app.post("/generate/text")
 async def generate_text(prompt: str = Form(...)):
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            res = await client.post(
-                "https://api-inference.huggingface.co/models/gpt2",
-                json={"inputs": prompt},
-                headers={"Content-Type": "application/json"}
-            )
-            data = res.json()
-            if "error" in data:
-                return {"error": data["error"]}
-            text = data[0].get("generated_text", "")
-            return {"text": text}
-        except Exception as e:
-            return {"error": str(e)}
+    payload = {"inputs": prompt, "options": {"wait_for_model": True}}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(f"https://api-inference.huggingface.co/models/{TEXT_MODEL}", headers=HEADERS, json=payload)
+        if r.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Inference failed: {r.text}")
+        result = r.json()
+        return JSONResponse({"text": result[0]["generated_text"]})
 
-# ---- Image generation endpoint ----
+# ---- Image generation ----
 @app.post("/generate/image")
 async def generate_image(prompt: str = Form(...)):
-    async with httpx.AsyncClient(timeout=60) as client:
-        try:
-            form_data = {"text": prompt}
-            res = await client.post(
-                "https://api.deepai.org/api/text2img",
-                headers={"api-key": "quickstart-QUdJIGlzIGNvbWluZy4uLi4K"},
-                data=form_data
-            )
-            data = res.json()
-            if "output_url" in data:
-                return {"url": data["output_url"]}
-            else:
-                return {"error": data.get("err", "Unknown error")}
-        except Exception as e:
-            return {"error": str(e)}
+    payload = {"inputs": prompt, "options": {"wait_for_model": True}}
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(f"https://api-inference.huggingface.co/models/{IMAGE_MODEL}", headers=HEADERS, json=payload)
+        if r.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Inference failed: {r.text}")
+        data = r.json()
+        if "error" in data:
+            raise HTTPException(status_code=500, detail=data["error"])
+        # Hugging Face returns base64 images; here we just return URL if available
+        return JSONResponse({"url": data[0]["generated_image"]})
 
-# ---- Simple voice placeholder endpoint ----
+# ---- Voice generation (optional placeholder) ----
 @app.post("/generate/voice")
 async def generate_voice(prompt: str = Form(...)):
-    # For testing, return a static sample audio
-    return {"audioUrl": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3", "reply": prompt}
-
-# ---- Health check ----
-@app.get("/")
-async def root():
-    return {"status": "Mini AI server is running"}
+    # For testing, just return a fixed sample audio URL
+    return JSONResponse({
+        "audioUrl": "https://www2.cs.uic.edu/~i101/SoundFiles/BabyElephantWalk60.wav",
+        "reply": prompt
+    })
