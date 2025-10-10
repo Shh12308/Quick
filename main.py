@@ -1,43 +1,27 @@
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, Form
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
-import os
+from diffusers import StableDiffusionPipeline
+import torch
+import base64
+from io import BytesIO
 
-app = FastAPI(title="Mini Image Generator")
+app = FastAPI(title="Local Image Generator")
 
-# Allow your frontend to access the backend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # or restrict to your frontend URL
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Load model once (uses GPU if available)
+pipe = StableDiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5",
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
 )
-
-HF_API_KEY = os.getenv("HF_API_KEY")  # Set this in Render Environment Variables
-MODEL_NAME = "runwayml/stable-diffusion-v1-5"
-
-if not HF_API_KEY:
-    raise RuntimeError("Please set HF_API_KEY environment variable")
+pipe = pipe.to("cuda" if torch.cuda.is_available() else "cpu")
 
 @app.post("/generate")
-async def generate_image(prompt: str = Form(...), width: int = Form(512), height: int = Form(512)):
-    """
-    Generates an image using Hugging Face Inference API
-    Returns base64 image string
-    """
-    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
-    payload = {
-        "inputs": prompt,
-        "options": {"wait_for_model": True}
-    }
+async def generate_image(prompt: str = Form(...), width: int = 512, height: int = 512):
+    # Generate image
+    image = pipe(prompt, height=height, width=width).images[0]
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(f"https://api-inference.huggingface.co/models/{MODEL_NAME}", headers=headers, json=payload)
-        if r.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Inference failed: {r.text}")
-        data = r.json()
-        if isinstance(data, dict) and "error" in data:
-            raise HTTPException(status_code=500, detail=data["error"])
-        return JSONResponse(content=data)
+    # Convert to base64
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    img_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    
+    return JSONResponse({"image_base64": img_str})
