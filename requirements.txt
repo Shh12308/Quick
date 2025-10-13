@@ -13,7 +13,6 @@ typing-extensions==4.15.0
 # === Supabase SDK ===
 supabase==2.5.0
 gotrue==2.12.4
-postgrest-py==0.10.6   # fixed version
 
 # === Utility ===
 pydantic==2.12.0
