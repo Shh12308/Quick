@@ -8,6 +8,7 @@ import jwt from "jsonwebtoken";
 import cors from "cors";
 import Stripe from "stripe";
 import bodyParser from "body-parser";
+import bcrypt from "bcryptjs";
 
 dotenv.config();
 
@@ -36,7 +37,7 @@ const userSchema = new mongoose.Schema({
   googleId: String,
   name: String,
   email: { type: String, required: true, unique: true },
-  password: String, // only for manual signup
+  password: String, // hashed for manual accounts
   picture: String,
   subscriptionType: { type: String, default: "free" },
   subscriptionActive: { type: Boolean, default: false },
@@ -47,7 +48,7 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.model("User", userSchema);
 
-// === Passport Setup ===
+// === Passport Google Setup ===
 passport.use(new GoogleStrategy.Strategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
@@ -91,24 +92,59 @@ app.use(passport.session());
 // Health check
 app.get("/", (req, res) => res.json({ message: "Server is up 🚀" }));
 
-// Manual Signup
+// === Manual Signup ===
 app.post("/signup", async (req, res) => {
   try {
     const { fullName, email, password } = req.body;
-    if (!fullName || !email || !password) return res.status(400).json({ message: "All fields are required" });
+    if (!fullName || !email || !password)
+      return res.status(400).json({ message: "All fields are required" });
 
     const existing = await User.findOne({ email });
-    if (existing) return res.status(400).json({ message: "Email already in use" });
+    if (existing)
+      return res.status(400).json({ message: "Email already in use" });
 
-    // In production, hash passwords before storing
-    const newUser = await User.create({ name: fullName, email, password });
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = await User.create({
+      name: fullName,
+      email,
+      password: hashedPassword
+    });
+
     res.status(201).json({ message: "Account created", userId: newUser._id });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// Google Auth login
+// === Manual Login ===
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ message: "All fields are required" });
+
+    const user = await User.findOne({ email });
+    if (!user)
+      return res.status(400).json({ message: "Invalid email or password" });
+
+    if (!user.password)
+      return res.status(400).json({ message: "This account uses Google Sign-In" });
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch)
+      return res.status(400).json({ message: "Invalid email or password" });
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    user.lastLogin = Date.now();
+    await user.save();
+
+    res.json({ token, user });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// === Google Auth login ===
 app.get("/api/auth/google",
   passport.authenticate("google", { scope: ["profile", "email"] })
 );
@@ -129,7 +165,7 @@ app.get("/api/auth/google/callback",
   }
 );
 
-// Protected route
+// === Protected route (works for manual or Google login) ===
 app.get("/api/user", async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
@@ -146,7 +182,7 @@ app.get("/api/user", async (req, res) => {
   }
 });
 
-// Stripe Checkout Session
+// === Stripe Checkout ===
 app.post("/create-checkout-session", async (req, res) => {
   const { priceId, userId } = req.body;
   try {
@@ -164,7 +200,7 @@ app.post("/create-checkout-session", async (req, res) => {
   }
 });
 
-// Stripe Webhook
+// === Stripe Webhook ===
 app.post("/webhook", async (req, res) => {
   const sig = req.headers["stripe-signature"];
   let event;
@@ -181,13 +217,13 @@ app.post("/webhook", async (req, res) => {
     await User.findByIdAndUpdate(userId, {
       subscriptionType: "premium",
       subscriptionActive: true,
-      subscriptionEnd: new Date(Date.now() + 30*24*60*60*1000) // 1 month
+      subscriptionEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 1 month
     });
   }
 
   res.status(200).send("Webhook received");
 });
 
-// Start server
+// === Start server ===
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
