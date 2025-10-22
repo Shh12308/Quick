@@ -21,7 +21,7 @@ app.use(cors({
   credentials: true
 }));
 
-// Needed for Stripe webhook raw body
+// Stripe webhook requires raw body
 app.use("/webhook", bodyParser.raw({ type: "application/json" }));
 
 // === MongoDB Setup ===
@@ -35,7 +35,8 @@ mongoose.connect(process.env.MONGO_URI, {
 const userSchema = new mongoose.Schema({
   googleId: String,
   name: String,
-  email: String,
+  email: { type: String, required: true, unique: true },
+  password: String, // only for manual signup
   picture: String,
   subscriptionType: { type: String, default: "free" },
   subscriptionActive: { type: Boolean, default: false },
@@ -47,8 +48,7 @@ const userSchema = new mongoose.Schema({
 const User = mongoose.model("User", userSchema);
 
 // === Passport Setup ===
-const GoogleStrategyObj = GoogleStrategy.Strategy;
-passport.use(new GoogleStrategyObj({
+passport.use(new GoogleStrategy.Strategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
   callbackURL: "/api/auth/google/callback"
@@ -86,17 +86,33 @@ app.use(session({
 app.use(passport.initialize());
 app.use(passport.session());
 
-// === ROUTES ===
+// === Routes ===
 
 // Health check
 app.get("/", (req, res) => res.json({ message: "Server is up 🚀" }));
+
+// Manual Signup
+app.post("/signup", async (req, res) => {
+  try {
+    const { fullName, email, password } = req.body;
+    if (!fullName || !email || !password) return res.status(400).json({ message: "All fields are required" });
+
+    const existing = await User.findOne({ email });
+    if (existing) return res.status(400).json({ message: "Email already in use" });
+
+    // In production, hash passwords before storing
+    const newUser = await User.create({ name: fullName, email, password });
+    res.status(201).json({ message: "Account created", userId: newUser._id });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
 // Google Auth login
 app.get("/api/auth/google",
   passport.authenticate("google", { scope: ["profile", "email"] })
 );
 
-// Google Auth callback
 app.get("/api/auth/google/callback",
   passport.authenticate("google", { session: false }),
   async (req, res) => {
@@ -106,14 +122,14 @@ app.get("/api/auth/google/callback",
     const isMobile = req.headers["user-agent"]?.includes("Mobile");
 
     if (isMobile) {
-      return res.redirect(`${mobileDeepLink}?token=${token}`);
+      res.redirect(`${mobileDeepLink}?token=${token}`);
     } else {
-      return res.redirect(`${redirectURL}/auth-success?token=${token}`);
+      res.redirect(`${redirectURL}/auth-success?token=${token}`);
     }
   }
 );
 
-// Protected user route
+// Protected route
 app.get("/api/user", async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
@@ -122,7 +138,6 @@ app.get("/api/user", async (req, res) => {
     const token = authHeader.split(" ")[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findById(decoded.id);
-
     if (!user) return res.status(404).json({ error: "User not found" });
 
     res.json({ user });
@@ -131,40 +146,7 @@ app.get("/api/user", async (req, res) => {
   }
 });
 
-// === Manual Signup Route ===
-app.post("/signup", async (req, res) => {
-  try {
-    const { fullName, email, password } = req.body;
-
-    if (!fullName || !email || !password) {
-      return res.status(400).json({ message: "All fields are required" });
-    }
-
-    // Check if the user already exists
-    let existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ message: "Email already in use" });
-    }
-
-    // NOTE: For production, always hash passwords with bcrypt!
-    const newUser = new User({
-      name: fullName,
-      email,
-      password, // store hashed password in production
-      subscriptionType: "free",
-      subscriptionActive: false
-    });
-
-    await newUser.save();
-
-    res.status(201).json({ message: "Account created successfully!", userId: newUser._id });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Server error" });
-  }
-});
-
-// === Stripe Checkout Session ===
+// Stripe Checkout Session
 app.post("/create-checkout-session", async (req, res) => {
   const { priceId, userId } = req.body;
   try {
@@ -182,11 +164,10 @@ app.post("/create-checkout-session", async (req, res) => {
   }
 });
 
-// === Stripe Webhook to confirm payment ===
+// Stripe Webhook
 app.post("/webhook", async (req, res) => {
   const sig = req.headers["stripe-signature"];
   let event;
-
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
@@ -197,7 +178,6 @@ app.post("/webhook", async (req, res) => {
     const session = event.data.object;
     const userId = session.metadata.userId;
 
-    // Update user subscription in MongoDB
     await User.findByIdAndUpdate(userId, {
       subscriptionType: "premium",
       subscriptionActive: true,
@@ -208,6 +188,6 @@ app.post("/webhook", async (req, res) => {
   res.status(200).send("Webhook received");
 });
 
-// === START SERVER ===
+// Start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
