@@ -246,5 +246,35 @@ app.post("/create-checkout-session", async (req, res) => {
   }
 });
 
-// Stripe Webhook
-app.post("/webhook", async (req
+// === Stripe Webhook ===
+app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error("❌ Webhook signature verification failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const userId = session.metadata.userId;
+
+      console.log(`✅ Checkout complete for user ${userId}`);
+
+      await User.findByIdAndUpdate(userId, {
+        subscriptionType: "premium",
+        subscriptionActive: true,
+        subscriptionEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // +30 days
+      });
+    }
+
+    res.status(200).send("✅ Webhook processed");
+  } catch (err) {
+    console.error("❌ Error in webhook handling:", err);
+    res.status(500).send("Internal webhook error");
+  }
+});
