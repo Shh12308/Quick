@@ -1,23 +1,38 @@
-datasource db {
-  provider = "mongodb"  // or "postgresql" if you prefer SQL
-  url      = env("DATABASE_URL")
+import { PrismaClient } from "@prisma/client";
+import bcrypt from "bcryptjs";
+import dotenv from "dotenv";
+
+dotenv.config();
+const prisma = new PrismaClient();
+
+async function main() {
+  const email = process.env.SEED_ADMIN_EMAIL || "admin@zenstream.local";
+  const existing = await prisma.user.findUnique({ where: { email } });
+
+  if (existing) {
+    console.log("Superadmin already exists:", existing.email);
+    return;
+  }
+
+  const passwordHash = await bcrypt.hash(process.env.SEED_ADMIN_PASSWORD || "adminpass", 10);
+
+  const user = await prisma.user.create({
+    data: {
+      name: "Super Admin",
+      email,
+      password: passwordHash,
+      role: "admin",
+      subscriptionType: "premium",
+      subscriptionActive: true,
+    },
+  });
+
+  console.log("Created superadmin:", user.email);
 }
 
-generator client {
-  provider = "prisma-client-js"
-}
-
-model User {
-  id                String   @id @map("_id") @default(auto()) @db.ObjectId
-  googleId          String?  @unique
-  name              String
-  email             String   @unique
-  password          String?
-  role              String   @default("user")
-  subscriptionType  String   @default("free")
-  subscriptionActive Boolean  @default(false)
-  subscriptionEnd   DateTime?
-  strikes           Int      @default(0)
-  lastLogin         DateTime @default(now())
-  createdAt         DateTime @default(now())
-}
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(() => process.exit(0));
