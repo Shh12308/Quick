@@ -649,6 +649,53 @@ app.post("/upload/music", authMiddleware, async (req, res) => {
   }
 });
 
+// Example in server.js
+
+// Mock shop items (you can move to DB later)
+const SHOP_ITEMS = [
+  { id: 1, name: "Yellow Coin", category: "Coins", price: 100, bonus: 0, svg: "<svg ...yellow coin svg...></svg>" },
+  { id: 2, name: "Dog Paw", category: "Gifts", price: 50, bonus: 0, svg: "<svg ...paw svg...></svg>" },
+  { id: 3, name: "Rocket", category: "Gifts", price: 150, bonus: 0, svg: "<svg ...rocket svg...></svg>" },
+  { id: 4, name: "Blue Coin", category: "Coins", price: 500, bonus: 50, svg: "<svg ...blue coin svg...></svg>" }
+];
+
+// Get shop items
+app.get("/shop/items", async (req, res) => {
+  // Group items by category
+  const sections = {};
+  SHOP_ITEMS.forEach(item => {
+    if (!sections[item.category]) sections[item.category] = [];
+    sections[item.category].push(item);
+  });
+  const result = Object.keys(sections).map(cat => ({ category: cat, items: sections[cat] }));
+  res.json(result);
+});
+
+// Buy item
+app.post("/shop/buy", authMiddleware, async (req, res) => {
+  try {
+    const { itemId } = req.body;
+    const userId = req.user.id;
+
+    const item = SHOP_ITEMS.find(i => i.id === itemId);
+    if (!item) return res.status(400).json({ error: "Item not found" });
+
+    // Check user balance
+    const { rows } = await pool.query("SELECT coins FROM wallets WHERE user_id=$1", [userId]);
+    const balance = rows[0]?.coins || 0;
+    if (balance < item.price) return res.status(400).json({ error: "Insufficient coins" });
+
+    // Deduct coins
+    await pool.query("UPDATE wallets SET coins = coins - $1, last_updated = NOW() WHERE user_id=$2", [item.price, userId]);
+    await pool.query("INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1,$2,'spend', $3)", [userId, -item.price, `Bought ${item.name}`]);
+
+    res.json({ message: `Successfully bought ${item.name}`, item });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Purchase failed" });
+  }
+});
+
 // Profile updates (profile picture, cover photo, bio)
 app.post("/profile/update", authMiddleware, async (req, res) => {
   try {
