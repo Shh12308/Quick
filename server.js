@@ -1,360 +1,794 @@
-// server.js (Prisma + RBAC)
+// server.js
 import express from "express";
+import pg from "pg";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
+import passport from "passport";
+import { Strategy as GoogleStrategy } from "passport-google-oauth20";
+import { Strategy as DiscordStrategy } from "passport-discord";
+import session from "express-session";
+import http from "http";
+import { Server as SocketServer } from "socket.io";
+import { ExpressPeerServer } from "peer";
+
 dotenv.config();
 
-import { PrismaClient } from "@prisma/client";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-import passport from "passport";
-import GoogleStrategy from "passport-google-oauth20";
-import cors from "cors";
-import Stripe from "stripe";
-import bodyParser from "body-parser";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-import morgan from "morgan";
-import winston from "winston";
-import nodemailer from "nodemailer";
+const app = express();
+app.use(express.json());
 
-const prisma = new PrismaClient();
-
-const {
-  DATABASE_URL,
-  JWT_SECRET,
-  GOOGLE_CLIENT_ID,
-  GOOGLE_CLIENT_SECRET,
-  REDIRECT_URI,
-  STRIPE_SECRET_KEY,
-  STRIPE_WEBHOOK_SECRET,
-  SMTP_HOST,
-  SMTP_PORT,
-  SMTP_USER,
-  SMTP_PASS,
-  CORS_ORIGINS,
-  NODE_ENV,
-  PORT
-} = process.env;
-
-const stripe = new Stripe(STRIPE_SECRET_KEY || "", { apiVersion: "2022-11-15" });
-
-/* Logging */
-const logger = winston.createLogger({
-  level: NODE_ENV === "production" ? "info" : "debug",
-  format: winston.format.combine(winston.format.timestamp(), winston.format.json()),
-  transports: [new winston.transports.Console()]
+// PostgreSQL Connection Pool
+const pool = new pg.Pool({
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASS,
+  port: process.env.DB_PORT,
 });
 
-/* App setup */
-const app = express();
-app.use(helmet());
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
-app.use(morgan("combined", { stream: { write: msg => logger.info(msg.trim()) } }));
+// JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 
-const allowed = (CORS_ORIGINS || "http://localhost:3000").split(",");
-app.use(cors({ origin: allowed, credentials: true }));
-
-// rate limit
-app.use(rateLimit({ windowMs: 60*1000, max: 120 }));
-
-/* Passport Google (creates or updates user in DB) */
-passport.use(new GoogleStrategy.Strategy({
-  clientID: GOOGLE_CLIENT_ID,
-  clientSecret: GOOGLE_CLIENT_SECRET,
-  callbackURL: "/api/auth/google/callback"
-}, async (accessToken, refreshToken, profile, done) => {
-  try {
-    const email = profile.emails?.[0]?.value;
-    let user = await prisma.user.findUnique({ where: { email } });
-    if (!user) {
-      user = await prisma.user.create({
-        data: {
-          googleId: profile.id,
-          name: profile.displayName,
-          email,
-          picture: profile.photos?.[0]?.value,
-          subscriptionType: "free"
-        }
-      });
-    } else if (!user.googleId) {
-      // link googleId if same email
-      user = await prisma.user.update({
-        where: { email },
-        data: { googleId: profile.id, picture: profile.photos?.[0]?.value }
-      });
-    }
-    return done(null, user);
-  } catch (err) {
-    logger.error("Google Strategy error", err);
-    return done(err, null);
-  }
-}));
-
+// Express session for OAuth
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || "sessionsecret",
+    resave: false,
+    saveUninitialized: true,
+  })
+);
 app.use(passport.initialize());
+app.use(passport.session());
 
-/* Utility helpers */
-const signToken = (payload, expiresIn = "7d") => jwt.sign(payload, JWT_SECRET || "secret", { expiresIn });
-const verifyToken = (token) => jwt.verify(token, JWT_SECRET || "secret");
-
-/* RBAC middleware; accepts array of allowed roles */
-const requireAuth = async (req, res, next) => {
+// --- Passport Serialization ---
+passport.serializeUser((user, done) => done(null, user.id));
+passport.deserializeUser(async (id, done) => {
   try {
-    const header = req.headers.authorization || req.cookies?.token;
-    if (!header) return res.status(401).json({ error: "Missing token" });
-    const token = header.startsWith("Bearer ") ? header.split(" ")[1] : header;
-    const decoded = verifyToken(token);
-    const user = await prisma.user.findUnique({ where: { id: decoded.id } });
-    if (!user) return res.status(404).json({ error: "User not found" });
-    if (user.isBanned) return res.status(403).json({ error: "Banned" });
-    req.user = user;
+    const res = await pool.query("SELECT * FROM users WHERE id=$1", [id]);
+    done(null, res.rows[0]);
+  } catch (err) {
+    done(err, null);
+  }
+});
+
+// --- OAuth Strategies (Google + Discord) ---
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL: process.env.GOOGLE_CALLBACK_URL,
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      try {
+        const email = profile.emails && profile.emails[0] && profile.emails[0].value;
+        if (!email) return done(new Error("No email from Google"), null);
+
+        const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+        let user = rows[0];
+
+        if (!user) {
+          const r = await pool.query(
+            `INSERT INTO users (username, email, role, subscription_plan, is_musician, is_creator, is_admin, created_at)
+             VALUES ($1, $2, 'free', 'free', false, false, false, NOW())
+             RETURNING *`,
+            [profile.displayName || profile.username || email.split("@")[0], email]
+          );
+          user = r.rows[0];
+        }
+        // ensure creator_stats if creator/musician later
+        await ensureCreatorStats(user.id);
+        done(null, user);
+      } catch (err) {
+        done(err, null);
+      }
+    }
+  )
+);
+
+passport.use(
+  new DiscordStrategy(
+    {
+      clientID: process.env.DISCORD_CLIENT_ID,
+      clientSecret: process.env.DISCORD_CLIENT_SECRET,
+      callbackURL: process.env.DISCORD_CALLBACK_URL,
+      scope: ["identify", "email"],
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      try {
+        const email = profile.email;
+        if (!email) return done(new Error("No email from Discord"), null);
+
+        const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+        let user = rows[0];
+
+        if (!user) {
+          const r = await pool.query(
+            `INSERT INTO users (username, email, role, subscription_plan, is_musician, is_creator, is_admin, created_at)
+             VALUES ($1, $2, 'free', 'free', false, false, false, NOW())
+             RETURNING *`,
+            [profile.username || email.split("@")[0], email]
+          );
+          user = r.rows[0];
+        }
+        await ensureCreatorStats(user.id);
+        done(null, user);
+      } catch (err) {
+        done(err, null);
+      }
+    }
+  )
+);
+
+// --- Helper: auth middleware ---
+function authMiddleware(req, res, next) {
+  try {
+    const token = req.headers.authorization?.split(" ")[1] || req.body.token || req.query.token;
+    if (!token) return res.status(401).json({ error: "No token provided" });
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
     next();
   } catch (err) {
-    logger.warn("Auth error", err.message);
-    return res.status(401).json({ error: "Invalid token" });
+    res.status(401).json({ error: "Unauthorized" });
   }
-};
+}
 
-const requireRoles = (allowedRoles = []) => (req, res, next) => {
-  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-  if (!allowedRoles.includes(req.user.role)) return res.status(403).json({ error: "Forbidden" });
-  next();
-};
-
-/* Email helper */
-const sendMail = async ({ to, subject, text, html }) => {
-  if (!SMTP_HOST) {
-    logger.warn("SMTP not configured, skip sending mail");
-    return;
+// --- Helper: ensure creator_stats exists ---
+async function ensureCreatorStats(userId) {
+  try {
+    await pool.query(
+      `INSERT INTO creator_stats (user_id, total_likes, total_follows, total_views, total_tips, total_merch_sales, earnings, updated_at)
+       VALUES ($1,0,0,0,0,0,0,NOW())
+       ON CONFLICT (user_id) DO NOTHING`,
+      [userId]
+    );
+  } catch (err) {
+    console.error("ensureCreatorStats error:", err);
   }
-  const transporter = nodemailer.createTransport({
-    host: SMTP_HOST, port: Number(SMTP_PORT || 587),
-    secure: Number(SMTP_PORT || 587) === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS }
-  });
-  return transporter.sendMail({ from: SMTP_USER, to, subject, text, html });
+}
+
+// --- Earnings config ---
+const RATES = {
+  per_like: 0.025, // £0.025 per like (10 likes => £0.25)
+  per_follow: 0.0075, // £0.0075 per follow (100 => £0.75)
+  per_view: 0.015, // £0.015 per view (10 views => £0.15)
 };
 
-/* Routes */
+// calculate earnings (from deltas and direct amounts)
+function calculateEarningsFromDeltas({ likesDelta = 0, followsDelta = 0, viewsDelta = 0, tips = 0, merch = 0 }) {
+  const fromLikes = likesDelta * RATES.per_like;
+  const fromFollows = followsDelta * RATES.per_follow;
+  const fromViews = viewsDelta * RATES.per_view;
+  const total = Number((fromLikes + fromFollows + fromViews + Number(tips || 0) + Number(merch || 0)).toFixed(4));
+  return { total, breakdown: { fromLikes, fromFollows, fromViews, tips: Number(tips || 0), merch: Number(merch || 0) } };
+}
 
-// health
-app.get("/", (req, res) => res.json({ message: "ZenStream API (Prisma) up" }));
+// --- Routes ---
 
-// signup (local)
+// Email/Password Signup
 app.post("/signup", async (req, res) => {
   try {
-    const { fullName, email, password } = req.body;
-    if (!fullName || !email || !password) return res.status(400).json({ message: "All fields required" });
-    const existing = await prisma.user.findUnique({ where: { email } });
-    if (existing) return res.status(400).json({ message: "Email in use" });
-    const hash = await bcrypt.hash(password, 10);
-    const user = await prisma.user.create({
-      data: { name: fullName, email, password: hash, role: "user", subscriptionType: "free" }
-    });
-    logger.info("User signup", { userId: user.id });
-    res.status(201).json({ userId: user.id });
+    const { username, email, password } = req.body;
+    if (!username || !email || !password) return res.status(400).json({ error: "Missing fields" });
+    const hashed = await bcrypt.hash(password, 12);
+    const { rows } = await pool.query(
+      `INSERT INTO users (username, email, password_hash, role, subscription_plan, is_musician, is_creator, is_admin, created_at)
+       VALUES ($1, $2, $3, 'free', 'free', false, false, false, NOW())
+       RETURNING *`,
+      [username, email, hashed]
+    );
+    const user = rows[0];
+    await ensureCreatorStats(user.id);
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
+    res.json({ message: "Signed up successfully", user, token });
   } catch (err) {
-    logger.error("Signup error", err);
-    res.status(500).json({ message: "Server error" });
+    console.error(err);
+    res.status(500).json({ error: "Signup failed" });
   }
 });
 
-// login (local)
+// Email/Password Login
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ message: "All fields required" });
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user || !user.password) return res.status(400).json({ message: "Invalid credentials" });
-    const ok = await bcrypt.compare(password, user.password);
-    if (!ok) return res.status(400).json({ message: "Invalid credentials" });
-    const token = signToken({ id: user.id });
-    await prisma.user.update({ where: { id: user.id }, data: { lastLogin: new Date() } });
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role } });
+    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+    const user = rows[0];
+    if (!user) return res.status(400).json({ error: "Invalid credentials" });
+    if (!user.password_hash) return res.status(400).json({ error: "Set a password or use OAuth" });
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(400).json({ error: "Invalid credentials" });
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
+    res.json({ message: "Logged in", user, token });
   } catch (err) {
-    logger.error("Login error", err);
-    res.status(500).json({ message: "Server error" });
+    console.error(err);
+    res.status(500).json({ error: "Login failed" });
   }
 });
 
-// Google OAuth endpoints
-app.get("/api/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
-app.get("/api/auth/google/callback",
-  passport.authenticate("google", { session: false }),
-  async (req, res) => {
-    try {
-      const token = signToken({ id: req.user.id });
-      const isMobile = req.headers["user-agent"]?.includes("Mobile");
-      if (isMobile) return res.redirect(`yourapp://login-success?token=${token}`);
-      return res.redirect(`${REDIRECT_URI || "http://localhost:3000"}/auth-success?token=${token}`);
-    } catch (err) {
-      logger.error("Google callback error", err);
-      res.status(500).send("Auth failed");
-    }
+// Google OAuth
+app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
+app.get(
+  "/auth/google/callback",
+  passport.authenticate("google", { failureRedirect: "/", session: false }),
+  (req, res) => {
+    const token = jwt.sign({ id: req.user.id, email: req.user.email, role: req.user.role }, JWT_SECRET, { expiresIn: "7d" });
+    res.redirect(`/welcome.html?token=${token}`);
   }
 );
 
-// Protected user info
-app.get("/api/user", requireAuth, async (req, res) => {
-  const u = await prisma.user.findUnique({ where: { id: req.user.id }, select: { password: false, _count: true, id: true, name: true, email: true, role: true, subscriptionType: true, subscriptionActive: true, subscriptionEnd: true, createdAt: true, lastLogin: true, isBanned: true } });
-  res.json({ user: u });
-});
+// Discord OAuth
+app.get("/auth/discord", passport.authenticate("discord"));
+app.get(
+  "/auth/discord/callback",
+  passport.authenticate("discord", { failureRedirect: "/", session: false }),
+  (req, res) => {
+    const token = jwt.sign({ id: req.user.id, email: req.user.email, role: req.user.role }, JWT_SECRET, { expiresIn: "7d" });
+    res.redirect(`/welcome.html?token=${token}`);
+  }
+);
 
-// Admin endpoints (RBAC example: superadmin or admin or moderator)
-app.get("/api/admin/users", requireAuth, requireRoles(["admin", "superadmin", "moderator"]), async (req, res) => {
+// Subscription Upgrade
+app.post("/subscribe", authMiddleware, async (req, res) => {
   try {
-    const page = Math.max(1, Number(req.query.page || 1));
-    const limit = Math.min(100, Number(req.query.limit || 50));
-    const users = await prisma.user.findMany({
-      skip: (page - 1) * limit,
-      take: limit,
-      orderBy: { createdAt: "desc" },
-      select: { id: true, name: true, email: true, role: true, subscriptionType: true, subscriptionActive: true, isBanned: true, lastLogin: true, createdAt: true }
-    });
-    const total = await prisma.user.count();
-    res.json({ users, page, total, pages: Math.ceil(total / limit) });
+    const { plan } = req.body;
+    const userId = req.user.id;
+    const expiry = new Date();
+    if (plan === "monthly") expiry.setMonth(expiry.getMonth() + 1);
+    if (plan === "yearly") expiry.setFullYear(expiry.getFullYear() + 1);
+    if (plan === "elite") expiry.setMonth(expiry.getMonth() + 1);
+
+    const { rows } = await pool.query(
+      `UPDATE users SET subscription_plan=$1, subscription_expires=$2, role=$3, updated_at=NOW()
+       WHERE id=$4 RETURNING *`,
+      [plan, expiry, plan === "elite" ? "elite" : "premium", userId]
+    );
+
+    res.json({ message: "Subscription updated", user: rows[0] });
   } catch (err) {
-    logger.error("Admin list error", err);
-    res.status(500).json({ error: "Server error" });
+    console.error(err);
+    res.status(500).json({ error: "Subscription failed" });
   }
 });
 
-// Admin get single user
-app.get("/api/admin/users/:id", requireAuth, requireRoles(["admin", "superadmin", "moderator"]), async (req, res) => {
-  const { id } = req.params;
-  const u = await prisma.user.findUnique({
-    where: { id },
-    include: { watchHistory: { take: 10, orderBy: { playedAt: "desc" } }, adminNotes: true }
-  });
-  if (!u) return res.status(404).json({ error: "User not found" });
-  res.json({ user: u });
-});
-
-// Admin update ban
-app.patch("/api/admin/users/:id/ban", requireAuth, requireRoles(["admin", "superadmin", "moderator"]), async (req, res) => {
+// Creator / Musician Verification
+app.post("/verify-role", authMiddleware, async (req, res) => {
   try {
-    const { id } = req.params;
-    const { isBanned } = req.body;
-    await prisma.user.update({ where: { id }, data: { isBanned } });
-    res.json({ success: true });
+    const { type } = req.body; // type = "musician" or "creator"
+    const userId = req.user.id;
+    const field = type === "musician" ? "is_musician" : "is_creator";
+
+    const { rows } = await pool.query(
+      `UPDATE users SET ${field}=true, updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [userId]
+    );
+    await ensureCreatorStats(userId);
+    res.json({ message: `${type} verified`, user: rows[0] });
   } catch (err) {
-    logger.error("Ban user error", err);
-    res.status(500).json({ error: "Server error" });
+    console.error(err);
+    res.status(500).json({ error: "Verification failed" });
   }
 });
 
-// Admin add note
-app.post("/api/admin/users/:id/note", requireAuth, requireRoles(["admin", "superadmin", "moderator"]), async (req, res) => {
+// --- Wallet & Coins ---
+
+// Get balance
+app.post("/wallet/balance", authMiddleware, async (req, res) => {
   try {
-    const { id } = req.params;
-    const { note } = req.body;
-    await prisma.adminNote.create({ data: { userId: id, by: req.user.email, note } });
-    res.json({ success: true });
+    const userId = req.user.id;
+    const { rows } = await pool.query("SELECT coins FROM wallets WHERE user_id=$1", [userId]);
+    const balance = rows[0]?.coins || 0;
+    res.json({ balance });
   } catch (err) {
-    logger.error("Add note error", err);
-    res.status(500).json({ error: "Server error" });
+    console.error(err);
+    res.status(500).json({ error: "Unable to fetch balance" });
   }
 });
 
-// Export users (admin)
-app.get("/api/admin/users/export", requireAuth, requireRoles(["admin", "superadmin"]), async (req, res) => {
-  const users = await prisma.user.findMany({ select: { id: true, name: true, email: true, role: true, subscriptionType: true, subscriptionActive: true, createdAt: true, lastLogin: true, isBanned: true } });
-  const header = "id,name,email,role,subscriptionType,subscriptionActive,createdAt,lastLogin,isBanned\n";
-  const rows = users.map(u => `${u.id},"${(u.name||'').replace(/"/g,'""')}","${u.email}",${u.role},${u.subscriptionType},${u.subscriptionActive},${u.createdAt?.toISOString()||''},${u.lastLogin?.toISOString()||''},${u.isBanned}`).join("\n");
-  res.setHeader("Content-Type", "text/csv");
-  res.setHeader("Content-Disposition", `attachment; filename="users_${Date.now()}.csv"`);
-  res.send(header + rows);
-});
-
-// Premium content
-app.get("/api/premium-content", requireAuth, async (req, res) => {
-  if (!req.user.subscriptionActive || req.user.subscriptionType !== "premium") return res.status(403).json({ error: "Premium required" });
-  res.json({ content: "Premium content payload (stream URLs etc.)" });
-});
-
-// Create Stripe checkout
-app.post("/create-checkout-session", requireAuth, async (req, res) => {
+// Add coins (admin/webhook/manual)
+app.post("/wallet/add", async (req, res) => {
   try {
-    const { priceId } = req.body;
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      mode: "subscription",
-      line_items: [{ price: priceId, quantity: 1 }],
-      success_url: `${REDIRECT_URI || "https://yourfrontend.com"}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${REDIRECT_URI || "https://yourfrontend.com"}/cancel`,
-      metadata: { userId: req.user.id }
-    });
-    res.json({ sessionId: session.id });
-  } catch (err) {
-    logger.error("Create checkout error", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+    // token optional for webhook; if webhook, permit via secret header
+    const { token, user_id, amount, description } = req.body;
 
-// Stripe webhook route (raw body)
-app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
-  const sig = req.headers["stripe-signature"];
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    logger.error("Stripe webhook signature failed", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-  try {
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      const userId = session.metadata.userId;
-      await prisma.user.update({
-        where: { id: userId },
-        data: { subscriptionType: "premium", subscriptionActive: true, subscriptionEnd: new Date(Date.now() + 30*24*60*60*1000) }
-      });
-      logger.info("Stripe subscription activated", { userId });
+    let userId = user_id;
+    if (token) {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      userId = decoded.id;
     }
-    res.json({ received: true });
+
+    if (!userId || !amount || amount <= 0) return res.status(400).json({ error: "Invalid params" });
+
+    await pool.query(
+      `INSERT INTO wallets (user_id, coins)
+       VALUES ($1, $2)
+       ON CONFLICT (user_id)
+       DO UPDATE SET coins = wallets.coins + EXCLUDED.coins, last_updated = NOW()`,
+      [userId, amount]
+    );
+
+    await pool.query(
+      "INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1, $2, 'purchase', $3)",
+      [userId, amount, description || "Coin credit"]
+    );
+
+    res.json({ message: "Coins added", amount });
   } catch (err) {
-    logger.error("Webhook processing error", err);
-    res.status(500).send("Webhook internal error");
+    console.error(err);
+    res.status(500).json({ error: "Failed to add coins" });
   }
 });
 
-// Password reset: request
-app.post("/request-password-reset", async (req, res) => {
+// Spend coins
+app.post("/wallet/spend", authMiddleware, async (req, res) => {
   try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "Missing email" });
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) return res.json({ message: "If account exists, reset email sent" });
-    const token = signToken({ id: user.id }, "1h");
-    const link = `${REDIRECT_URI || "https://yourfrontend.com"}/reset-password?token=${token}`;
-    await sendMail({ to: email, subject: "Password reset", text: `Reset: ${link}`, html: `<a href="${link}">Reset password</a>` });
-    res.json({ message: "If account exists, reset email sent" });
+    const { amount, description } = req.body;
+    const userId = req.user.id;
+    if (!amount || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+
+    const { rows } = await pool.query("SELECT coins FROM wallets WHERE user_id=$1", [userId]);
+    const balance = rows[0]?.coins || 0;
+    if (balance < amount) return res.status(400).json({ error: "Insufficient balance" });
+
+    await pool.query("UPDATE wallets SET coins = coins - $1, last_updated = NOW() WHERE user_id=$2", [amount, userId]);
+    await pool.query("INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1, $2, 'spend', $3)", [userId, -amount, description || "Spend coins"]);
+
+    res.json({ message: "Coins spent", remaining: balance - amount });
   } catch (err) {
-    logger.error("Request password reset error", err);
-    res.status(500).json({ error: "Server error" });
+    console.error(err);
+    res.status(500).json({ error: "Failed to spend coins" });
   }
 });
 
-// Password reset: set new password
-app.post("/reset-password", async (req, res) => {
+// Tip another user (coins -> increases recipient earnings)
+app.post("/wallet/tip", authMiddleware, async (req, res) => {
   try {
-    const { token, newPassword } = req.body;
-    if (!token || !newPassword) return res.status(400).json({ error: "Missing token or password" });
-    const decoded = verifyToken(token);
-    await prisma.user.update({ where: { id: decoded.id }, data: { password: await bcrypt.hash(newPassword, 10) } });
-    res.json({ message: "Password reset" });
+    const fromId = req.user.id;
+    const { toUserId, amount, message } = req.body;
+    if (!toUserId || !amount || amount <= 0) return res.status(400).json({ error: "Invalid params" });
+
+    // check balance
+    const { rows } = await pool.query("SELECT coins FROM wallets WHERE user_id=$1", [fromId]);
+    const balance = rows[0]?.coins || 0;
+    if (balance < amount) return res.status(400).json({ error: "Insufficient coins" });
+
+    // debit sender
+    await pool.query("UPDATE wallets SET coins = coins - $1, last_updated = NOW() WHERE user_id=$2", [amount, fromId]);
+    await pool.query("INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1, $2, 'tip', $3)", [fromId, -amount, `Tip to ${toUserId}: ${message || ""}`]);
+
+    // credit recipient earnings (and optionally wallet if you let coins be redeemable)
+    // Here we treat tips as earnings (in GBP) for recipient (you might also credit their wallet if you support coin transfers)
+    // Convert coins to GBP if you have a rate; but here we store tip amount as coins in creator_stats.total_tips and later convert
+    await pool.query("UPDATE creator_stats SET total_tips = COALESCE(total_tips,0) + $1, updated_at = NOW() WHERE user_id=$2", [amount, toUserId]);
+    await pool.query("INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1, $2, 'tip_received', $3)", [toUserId, amount, `Tip from ${fromId}: ${message || ""}`]);
+
+    // recalculate earnings for recipient
+    await recalcCreatorEarnings(toUserId);
+
+    res.json({ message: "Tip sent" });
   } catch (err) {
-    logger.error("Reset password error", err);
-    res.status(400).json({ error: "Invalid or expired token" });
+    console.error(err);
+    res.status(500).json({ error: "Tip failed" });
   }
 });
 
-/* Error handling */
-app.use((err, req, res, next) => {
-  logger.error("Unhandled error", err);
-  res.status(500).json({ error: "Internal server error" });
+// Lemon Squeezy / Checkout webhook for coin purchases
+// Expect webhook to POST { email, product_name, ... } or similar payload. Adjust parsing to vendor payload.
+app.post("/webhooks/coins", express.json(), async (req, res) => {
+  try {
+    const event = req.body;
+    // adapt this to your vendor's payload; example expects event.email & event.product_name
+    const email = event?.email || event?.data?.attributes?.customer_email;
+    const product_name = event?.product_name || event?.data?.attributes?.product_name || event?.data?.attributes?.name;
+    if (!email || !product_name) {
+      console.warn("Webhook missing email/product", event);
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    const { rows } = await pool.query("SELECT id FROM users WHERE email=$1", [email]);
+    const user = rows[0];
+    if (!user) return res.status(400).json({ error: "User not found" });
+
+    // map product name to coins (customize as needed)
+    const coinMapping = {
+      "100 Coins": 100,
+      "250 Coins": 275,
+      "500 Coins": 575,
+      "1000 Coins": 1200,
+      "2500 Coins": 3000,
+      "5000 Coins": 6200,
+      "10000 Coins": 13000,
+      "20000 Coins": 27500
+    };
+    const coins = coinMapping[product_name] || parseInt(event?.data?.attributes?.quantity || "0");
+
+    if (coins && coins > 0) {
+      await pool.query(
+        `INSERT INTO wallets (user_id, coins)
+         VALUES ($1, $2)
+         ON CONFLICT (user_id)
+         DO UPDATE SET coins = wallets.coins + EXCLUDED.coins, last_updated = NOW()`,
+        [user.id, coins]
+      );
+      await pool.query("INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1, $2, 'purchase', $3)", [user.id, coins, `Purchase ${product_name}`]);
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("webhooks/coins error:", err);
+    res.status(500).json({ error: "Webhook processing failed" });
+  }
 });
 
-/* Start server */
-const _PORT = Number(PORT || 5000);
-app.listen(_PORT, () => logger.info(`Server running on port ${_PORT}`));
+// Withdraw request (records; process payouts separately)
+app.post("/withdraw", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { amount, methodDetails } = req.body;
+    if (!amount || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+
+    // Ensure user has earnings available (we store earnings GBP in users.earnings or creator_stats.earnings)
+    const { rows } = await pool.query("SELECT earnings FROM users WHERE id=$1", [userId]);
+    const earnings = rows[0]?.earnings || 0;
+    if (amount > earnings) return res.status(400).json({ error: "Insufficient earnings" });
+
+    // create withdrawal request
+    const r = await pool.query(
+      "INSERT INTO withdrawals (user_id, amount, method_details, status, created_at) VALUES ($1,$2,$3,'pending',NOW()) RETURNING *",
+      [userId, amount, methodDetails || null]
+    );
+
+    // reduce earnings pending payout
+    await pool.query("UPDATE users SET earnings = earnings - $1 WHERE id=$2", [amount, userId]);
+
+    res.json({ message: "Withdrawal requested", withdrawal: r.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Withdraw failed" });
+  }
+});
+
+// --- Creator stats & earnings calculation ---
+
+// API to update creator deltas (e.g., when a video gets likes/views/follows)
+app.post("/creator/update-deltas", async (req, res) => {
+  try {
+    // expects { token OR adminKey, userId (optional), likesDelta, followsDelta, viewsDelta, tipsAmount, merchAmount }
+    const { token, adminKey, userId, likesDelta = 0, followsDelta = 0, viewsDelta = 0, tipsAmount = 0, merchAmount = 0 } = req.body;
+
+    let targetUserId = userId;
+    if (token) {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      targetUserId = decoded.id;
+    } else if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    // update creator_stats
+    await pool.query(
+      `INSERT INTO creator_stats (user_id, total_likes, total_follows, total_views, total_tips, total_merch_sales, earnings, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,0,NOW())
+       ON CONFLICT (user_id) DO UPDATE
+         SET total_likes = creator_stats.total_likes + $2,
+             total_follows = creator_stats.total_follows + $3,
+             total_views = creator_stats.total_views + $4,
+             total_tips = creator_stats.total_tips + $5,
+             total_merch_sales = creator_stats.total_merch_sales + $6,
+             updated_at = NOW()
+      `,
+      [targetUserId, likesDelta, followsDelta, viewsDelta, tipsAmount, merchAmount]
+    );
+
+    // Compute earnings delta using rates and amounts
+    const calc = calculateEarningsFromDeltas({ likesDelta, followsDelta, viewsDelta, tips: tipsAmount, merch: merchAmount });
+    const earningsDelta = calc.total;
+
+    // update creator_stats.earnings and users.earnings
+    await pool.query("UPDATE creator_stats SET earnings = COALESCE(earnings,0) + $1 WHERE user_id=$2", [earningsDelta, targetUserId]);
+    await pool.query("UPDATE users SET earnings = COALESCE(earnings,0) + $1 WHERE id=$2", [earningsDelta, targetUserId]);
+
+    res.json({ message: "Creator stats updated", earningsDelta, breakdown: calc.breakdown });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to update creator stats" });
+  }
+});
+
+// Recalculate creator earnings from totals (idempotent)
+app.post("/creator/recalc/:userId", async (req, res) => {
+  try {
+    const targetUserId = req.params.userId;
+    const { rows } = await pool.query("SELECT total_likes, total_follows, total_views, total_tips, total_merch_sales FROM creator_stats WHERE user_id=$1", [targetUserId]);
+    const s = rows[0];
+    if (!s) return res.status(404).json({ error: "Creator stats not found" });
+
+    const calc = calculateEarningsFromDeltas({
+      likesDelta: s.total_likes,
+      followsDelta: s.total_follows,
+      viewsDelta: s.total_views,
+      tips: s.total_tips,
+      merch: s.total_merch_sales,
+    });
+
+    // set earnings in creator_stats and users
+    await pool.query("UPDATE creator_stats SET earnings = $1, updated_at = NOW() WHERE user_id=$2", [calc.total, targetUserId]);
+    await pool.query("UPDATE users SET earnings = $1 WHERE id=$2", [calc.total, targetUserId]);
+
+    res.json({ message: "Recalculated", earnings: calc.total, breakdown: calc.breakdown });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Recalc failed" });
+  }
+});
+
+// Utility that recalc for single user (used internally)
+async function recalcCreatorEarnings(userId) {
+  const { rows } = await pool.query("SELECT total_likes, total_follows, total_views, total_tips, total_merch_sales FROM creator_stats WHERE user_id=$1", [userId]);
+  const s = rows[0];
+  if (!s) return;
+  const calc = calculateEarningsFromDeltas({
+    likesDelta: s.total_likes || 0,
+    followsDelta: s.total_follows || 0,
+    viewsDelta: s.total_views || 0,
+    tips: s.total_tips || 0,
+    merch: s.total_merch_sales || 0,
+  });
+  await pool.query("UPDATE creator_stats SET earnings = $1, updated_at = NOW() WHERE user_id=$2", [calc.total, userId]);
+  await pool.query("UPDATE users SET earnings = $1 WHERE id=$2", [calc.total, userId]);
+}
+
+// --- Messaging (private & group) ---
+// Send private message
+app.post("/messages/send", authMiddleware, async (req, res) => {
+  try {
+    const fromId = req.user.id;
+    const { to_user_id, content } = req.body;
+    if (!to_user_id || !content) return res.status(400).json({ error: "Missing params" });
+
+    const r = await pool.query(
+      "INSERT INTO messages (from_user_id, to_user_id, content, is_group, created_at) VALUES ($1,$2,$3,false,NOW()) RETURNING *",
+      [fromId, to_user_id, content]
+    );
+
+    res.json({ message: "Sent", messageRow: r.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Message send failed" });
+  }
+});
+
+// Send group message
+app.post("/messages/send-group", authMiddleware, async (req, res) => {
+  try {
+    const fromId = req.user.id;
+    const { group_id, content } = req.body;
+    if (!group_id || !content) return res.status(400).json({ error: "Missing params" });
+
+    const r = await pool.query(
+      "INSERT INTO messages (from_user_id, group_id, content, is_group, created_at) VALUES ($1,$2,$3,true,NOW()) RETURNING *",
+      [fromId, group_id, content]
+    );
+
+    res.json({ message: "Group message sent", messageRow: r.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Group message failed" });
+  }
+});
+
+// Get messages between two users
+app.get("/messages/history/:otherUserId", authMiddleware, async (req, res) => {
+  try {
+    const me = req.user.id;
+    const other = req.params.otherUserId;
+    const { rows } = await pool.query(
+      `SELECT * FROM messages WHERE (from_user_id=$1 AND to_user_id=$2) OR (from_user_id=$2 AND to_user_id=$1) ORDER BY created_at ASC`,
+      [me, other]
+    );
+    res.json({ messages: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch messages" });
+  }
+});
+
+// Get group messages
+app.get("/messages/group/:groupId", authMiddleware, async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { rows } = await pool.query("SELECT * FROM messages WHERE group_id=$1 ORDER BY created_at ASC", [groupId]);
+    res.json({ messages: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch group messages" });
+  }
+});
+
+// --- Upload metadata endpoints (video, music, profile images, cover photo) ---
+
+// Upload video metadata
+app.post("/upload/video", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { title, description, video_url, thumbnail_url, tags = [] } = req.body;
+    if (!title || !video_url) return res.status(400).json({ error: "Missing fields" });
+
+    const r = await pool.query(
+      `INSERT INTO videos (user_id, title, description, video_url, thumbnail_url, tags, views, likes, earnings, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,0,0,0,NOW()) RETURNING *`,
+      [userId, title, description || null, video_url, thumbnail_url || null, tags]
+    );
+
+    // ensure creator_stats
+    await ensureCreatorStats(userId);
+
+    res.json({ message: "Video metadata saved", video: r.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+// Upload music metadata
+app.post("/upload/music", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { title, description, music_url, cover_url, duration, tags = [] } = req.body;
+    if (!title || !music_url) return res.status(400).json({ error: "Missing fields" });
+
+    const r = await pool.query(
+      `INSERT INTO music (user_id, title, description, music_url, cover_url, duration, listens, likes, earnings, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,0,0,0,NOW()) RETURNING *`,
+      [userId, title, description || null, music_url, cover_url || null, duration || null]
+    );
+
+    await ensureCreatorStats(userId);
+    res.json({ message: "Music metadata saved", music: r.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+// Profile updates (profile picture, cover photo, bio)
+app.post("/profile/update", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { profile_url, cover_url, bio, social_links } = req.body;
+
+    const r = await pool.query(
+      `UPDATE users SET profile_url=COALESCE($1,profile_url), cover_url=COALESCE($2,cover_url),
+       bio=COALESCE($3,bio), social_links=COALESCE($4,social_links), updated_at=NOW()
+       WHERE id=$5 RETURNING *`,
+      [profile_url || null, cover_url || null, bio || null, social_links ? JSON.stringify(social_links) : null, userId]
+    );
+
+    res.json({ message: "Profile updated", user: r.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Profile update failed" });
+  }
+});
+
+// --- Admin helper: get creator stats ---
+app.get("/admin/creator-stats/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { rows } = await pool.query("SELECT * FROM creator_stats WHERE user_id=$1", [userId]);
+    if (!rows[0]) return res.status(404).json({ error: "Not found" });
+    res.json({ stats: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+// === Livestream management ===
+import { v4 as uuidv4 } from "uuid";
+
+// Start a livestream (creates record + stream key)
+app.post("/livestream/start", authMiddleware, async (req, res) => {
+  try {
+    const { title, description, thumbnail_url } = req.body;
+    const userId = req.user.id;
+    const streamKey = uuidv4();
+
+    const { rows } = await pool.query(
+      `INSERT INTO livestreams (user_id, title, description, stream_key, is_live, thumbnail_url, started_at)
+       VALUES ($1,$2,$3,$4,true,$5,NOW())
+       RETURNING *`,
+      [userId, title, description, streamKey, thumbnail_url || null]
+    );
+
+    res.json({ message: "Livestream started", stream: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to start livestream" });
+  }
+});
+
+// Stop livestream
+app.post("/livestream/stop", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    await pool.query(
+      "UPDATE livestreams SET is_live=false, ended_at=NOW() WHERE user_id=$1 AND is_live=true",
+      [userId]
+    );
+    res.json({ message: "Livestream stopped" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to stop livestream" });
+  }
+});
+
+// List all active livestreams
+app.get("/livestreams", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT l.*, u.username, u.profile_url FROM livestreams l JOIN users u ON l.user_id=u.id WHERE l.is_live=true"
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch livestreams" });
+  }
+});
+
+// --- Basic health ---
+app.get("/", (req, res) => res.send("Server up"));
+
+const server = http.createServer(app);
+const io = new SocketServer(server, {
+  cors: { origin: "*" },
+});
+
+// === PeerJS setup (WebRTC signaling server) ===
+const peerServer = ExpressPeerServer(server, {
+  debug: true,
+  path: "/peerjs",
+});
+app.use("/peerjs", peerServer);
+
+// === Socket.IO for live chat + viewer events ===
+const liveRooms = {};
+
+io.on("connection", (socket) => {
+  console.log("New socket connected:", socket.id);
+
+  // Join livestream room
+  socket.on("join-room", ({ streamId, userId, username }) => {
+    socket.join(streamId);
+    if (!liveRooms[streamId]) liveRooms[streamId] = { viewers: new Set() };
+    liveRooms[streamId].viewers.add(userId);
+
+    // notify others
+    io.to(streamId).emit("viewer-update", {
+      count: liveRooms[streamId].viewers.size,
+    });
+
+    console.log(`${username} joined stream ${streamId}`);
+  });
+
+  // Leave room
+  socket.on("leave-room", ({ streamId, userId }) => {
+    if (liveRooms[streamId]) {
+      liveRooms[streamId].viewers.delete(userId);
+      io.to(streamId).emit("viewer-update", {
+        count: liveRooms[streamId].viewers.size,
+      });
+    }
+  });
+
+  // Live chat messages
+  socket.on("chat-message", ({ streamId, username, message }) => {
+    io.to(streamId).emit("chat-message", { username, message, time: Date.now() });
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Socket disconnected:", socket.id);
+  });
+});
+
+// === Start Express + Socket.IO server ===
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
