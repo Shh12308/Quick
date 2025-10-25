@@ -7,6 +7,7 @@ import dotenv from "dotenv";
 import passport from "passport";
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { Strategy as DiscordStrategy } from "passport-discord";
+import { Strategy as GitHubStrategy } from "passport-github2";
 import session from "express-session";
 import http from "http";
 import { Server as SocketServer } from "socket.io";
@@ -165,6 +166,55 @@ function calculateEarningsFromDeltas({ likesDelta = 0, followsDelta = 0, viewsDe
 
 // --- Routes ---
 
+passport.use(
+  new GitHubStrategy(
+    {
+      clientID: process.env.GITHUB_CLIENT_ID,
+      clientSecret: process.env.GITHUB_CLIENT_SECRET,
+      callbackURL: process.env.GITHUB_CALLBACK_URL,
+      scope: ["user:email"],
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      try {
+        let email = null;
+        if (profile.emails && profile.emails.length > 0) {
+          email = profile.emails[0].value;
+        } else {
+          email = `${profile.username}@github.local`; // fallback
+        }
+
+        const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+        let user = rows[0];
+
+        if (!user) {
+          const r = await pool.query(
+            `INSERT INTO users (username, email, role, subscription_plan, is_musician, is_creator, is_admin, created_at)
+             VALUES ($1, $2, 'free', 'free', false, false, false, NOW())
+             RETURNING *`,
+            [profile.username || email.split("@")[0], email]
+          );
+          user = r.rows[0];
+        }
+
+        await ensureCreatorStats(user.id);
+        done(null, user);
+      } catch (err) {
+        done(err, null);
+      }
+    }
+  )
+);
+
+// GitHub OAuth routes
+app.get("/auth/github", passport.authenticate("github", { scope: ["user:email"] }));
+app.get(
+  "/auth/github/callback",
+  passport.authenticate("github", { failureRedirect: "/", session: false }),
+  (req, res) => {
+    const token = jwt.sign({ id: req.user.id, email: req.user.email, role: req.user.role }, JWT_SECRET, { expiresIn: "7d" });
+    res.redirect(`/welcome.html?token=${token}`);
+  }
+);
 // Email/Password Signup
 app.post("/signup", async (req, res) => {
   try {
