@@ -12,6 +12,9 @@ import session from "express-session";
 import http from "http";
 import { Server as SocketServer } from "socket.io";
 import { ExpressPeerServer } from "peer";
+import { RtcRole, RtcTokenBuilder } from "agora-access-token";
+AGORA_APP_ID=your_agora_app_id
+AGORA_APP_CERTIFICATE=your_agora_app_certificate
 
 dotenv.config();
 
@@ -639,6 +642,77 @@ app.get("/messages/history/:otherUserId", authMiddleware, async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "Failed to fetch messages" });
   }
+});
+
+app.post("/group-call/token", authMiddleware, (req, res) => {
+  try {
+    const { group_id } = req.body;
+    if (!group_id) return res.status(400).json({ error: "Missing group_id" });
+
+    const uid = Math.floor(Math.random() * 100000);
+    const role = RtcRole.PUBLISHER;
+    const expireTime = 3600; // 1 hour
+    const currentTime = Math.floor(Date.now() / 1000);
+    const privilegeExpireTime = currentTime + expireTime;
+
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      AGORA_APP_ID,
+      AGORA_APP_CERTIFICATE,
+      group_id.toString(),
+      uid,
+      role,
+      privilegeExpireTime
+    );
+
+    res.json({
+      appId: AGORA_APP_ID,
+      channelName: group_id.toString(),
+      token,
+      uid,
+      expiresIn: expireTime,
+    });
+  } catch (err) {
+    console.error("Agora token error:", err);
+    res.status(500).json({ error: "Failed to create token" });
+  }
+});
+
+const activeCalls = {}; // { groupId: Set(userIds) }
+
+io.on("connection", (socket) => {
+  console.log("Socket connected:", socket.id);
+
+  socket.on("join-call", ({ groupId, userId, username }) => {
+    socket.join(groupId);
+    if (!activeCalls[groupId]) activeCalls[groupId] = new Set();
+    activeCalls[groupId].add(userId);
+
+    io.to(groupId).emit("call-update", {
+      groupId,
+      participants: Array.from(activeCalls[groupId]),
+      count: activeCalls[groupId].size,
+      joined: username,
+    });
+
+    console.log(`${username} joined Agora group call ${groupId}`);
+  });
+
+  socket.on("leave-call", ({ groupId, userId, username }) => {
+    if (activeCalls[groupId]) {
+      activeCalls[groupId].delete(userId);
+      io.to(groupId).emit("call-update", {
+        groupId,
+        participants: Array.from(activeCalls[groupId]),
+        count: activeCalls[groupId].size,
+        left: username,
+      });
+    }
+    socket.leave(groupId);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("User disconnected:", socket.id);
+  });
 });
 
 // Get group messages
