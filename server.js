@@ -877,6 +877,133 @@ app.post("/livestream/start", authMiddleware, async (req, res) => {
   }
 });
 
+app.post("/livestream/:id/request-join", authMiddleware, async (req, res) => {
+  try {
+    const streamId = req.params.id;
+    const userId = req.user.id;
+
+    const { rows } = await pool.query(
+      `INSERT INTO livestream_requests (stream_id, user_id)
+       VALUES ($1, $2)
+       RETURNING *`,
+      [streamId, userId]
+    );
+
+    // Optionally, notify the creator via Socket.IO
+    const creatorId = (await pool.query("SELECT user_id FROM livestreams WHERE id=$1", [streamId])).rows[0]?.user_id;
+    if (creatorId) io.to(`user-${creatorId}`).emit("join-request", { request: rows[0] });
+
+    res.json({ message: "Request sent", request: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to request join" });
+  }
+});
+
+app.post("/livestream/:id/request/:requestId/respond", authMiddleware, async (req, res) => {
+  try {
+    const streamId = req.params.id;
+    const requestId = req.params.requestId;
+    const { action } = req.body; // "approve" or "reject"
+    const userId = req.user.id;
+
+    // Ensure requester is the stream creator
+    const { rows: streamRows } = await pool.query("SELECT user_id FROM livestreams WHERE id=$1", [streamId]);
+    if (streamRows[0].user_id !== userId) return res.status(403).json({ error: "Not allowed" });
+
+    const status = action === "approve" ? "approved" : "rejected";
+    const { rows } = await pool.query(
+      `UPDATE livestream_requests SET status=$1, responded_at=NOW() WHERE id=$2 RETURNING *`,
+      [status, requestId]
+    );
+
+    res.json({ message: `Request ${status}`, request: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to respond to request" });
+  }
+});
+
+app.post("/livestream/:id/donate", authMiddleware, async (req, res) => {
+  try {
+    const streamId = req.params.id;
+    const { amount, message } = req.body;
+    const userId = req.user.id;
+
+    // 1. Check user balance
+    const { rows } = await pool.query("SELECT coins FROM wallets WHERE user_id=$1", [userId]);
+    const balance = rows[0]?.coins || 0;
+    if (balance < amount) return res.status(400).json({ error: "Insufficient balance" });
+
+    // 2. Deduct coins from viewer
+    await pool.query("UPDATE wallets SET coins = coins - $1, last_updated = NOW() WHERE user_id=$2", [amount, userId]);
+
+    // 3. Record donation
+    // Optionally take a platform cut
+    const PLATFORM_CUT = 0; // e.g., 0.1 = 10%
+    const platformFee = Number((amount * PLATFORM_CUT).toFixed(2));
+    const netAmount = amount - platformFee;
+
+    await pool.query(
+      `INSERT INTO stream_donations (stream_id, user_id, amount, message, platform_fee)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [streamId, userId, netAmount, message || null, platformFee]
+    );
+
+    // 4. Update creator stats (optional, just track total tips)
+    const { rows: streamRows } = await pool.query("SELECT user_id FROM livestreams WHERE id=$1", [streamId]);
+    const creatorId = streamRows[0]?.user_id;
+
+    if (creatorId) {
+      await pool.query(
+        `UPDATE creator_stats SET total_tips = COALESCE(total_tips,0) + $1, updated_at=NOW() WHERE user_id=$2`,
+        [netAmount, creatorId]
+      );
+    }
+
+    res.json({ message: "Donation sent to platform", netAmount, platformFee });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to donate" });
+  }
+});
+
+app.post("/creator/process-donations", authMiddleware, async (req, res) => {
+  try {
+    const creatorId = req.user.id;
+
+    // sum unprocessed donations for this creator
+    const { rows } = await pool.query(
+      `SELECT SUM(amount) as total FROM stream_donations d
+       JOIN livestreams l ON d.stream_id = l.id
+       WHERE l.user_id=$1 AND d.processed=false`,
+      [creatorId]
+    );
+
+    const total = Number(rows[0]?.total || 0);
+    if (total <= 0) return res.json({ message: "No donations to process" });
+
+    // add to creator earnings
+    await pool.query("UPDATE users SET earnings = COALESCE(earnings,0) + $1 WHERE id=$2", [total, creatorId]);
+
+    // mark donations as processed
+    await pool.query(
+      `UPDATE stream_donations d
+       SET processed=true
+       FROM livestreams l
+       WHERE d.stream_id = l.id AND l.user_id=$1 AND d.processed=false`,
+      [creatorId]
+    );
+
+    res.json({ message: "Donations processed", total });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to process donations" });
+  }
+});
+
+
+
 // Stop livestream
 app.post("/livestream/stop", authMiddleware, async (req, res) => {
   try {
