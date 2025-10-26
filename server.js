@@ -17,6 +17,24 @@ AGORA_APP_ID=your_agora_app_id
 AGORA_APP_CERTIFICATE=your_agora_app_certificate
 
 dotenv.config();
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+
+// Create upload folder if missing
+const UPLOAD_DIR = path.join(process.cwd(), "uploads/verification");
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// Multer storage config
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `${Date.now()}-${file.fieldname}${ext}`);
+  }
+});
+
+export const upload = multer({ storage });
 
 const app = express();
 app.use(express.json());
@@ -334,6 +352,66 @@ app.post("/wallet/balance", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Unable to fetch balance" });
+  }
+});
+
+// POST /verify
+// Authenticated route: authMiddleware ensures user is logged in
+app.post("/verify", authMiddleware, upload.single("image"), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const {
+      name,
+      age,
+      dob,
+      address,
+      latitude,
+      longitude,
+      city,
+      postalCode,
+      bio,
+      link,
+      payment_method
+    } = req.body;
+
+    // Validate required fields
+    if (!name || !age || !dob || !address || !bio || !link) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    // Uploaded file
+    const imagePath = req.file ? `/uploads/verification/${req.file.filename}` : null;
+    if (!imagePath) return res.status(400).json({ error: "Profile/ID image required" });
+
+    // Insert or update verification request
+    const result = await pool.query(`
+      INSERT INTO verification_requests (
+        user_id, name, age, dob, address, latitude, longitude, city, postal_code, bio, content_link, payment_method, image_path, status, created_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending',NOW())
+      ON CONFLICT (user_id) DO UPDATE SET
+        name=EXCLUDED.name,
+        age=EXCLUDED.age,
+        dob=EXCLUDED.dob,
+        address=EXCLUDED.address,
+        latitude=EXCLUDED.latitude,
+        longitude=EXCLUDED.longitude,
+        city=EXCLUDED.city,
+        postal_code=EXCLUDED.postal_code,
+        bio=EXCLUDED.bio,
+        content_link=EXCLUDED.content_link,
+        payment_method=EXCLUDED.payment_method,
+        image_path=EXCLUDED.image_path,
+        status='pending',
+        updated_at=NOW()
+      RETURNING *;
+    `, [userId, name, age, dob, address, latitude || null, longitude || null, city || null, postalCode || null, bio, link, payment_method, imagePath]);
+
+    res.json({ message: "Verification submitted successfully", verification: result.rows[0] });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to submit verification" });
   }
 });
 
