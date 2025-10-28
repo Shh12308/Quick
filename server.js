@@ -340,6 +340,82 @@ app.post("/verify-role", authMiddleware, async (req, res) => {
   }
 });
 
+// --- MintZa Chatbot Routes ---
+
+// Dummy orders for refund check (replace with actual DB table)
+const orders = [
+  { orderId: "123", date: "2025-10-22", userId: 1 },
+  { orderId: "456", date: "2025-10-25", userId: 2 },
+];
+
+// Submissions storage (or use DB table)
+const chatbotSubmissions = [];
+
+// Helper: check if refund is within 7 days
+function isRefundEligible(orderDate) {
+  const today = new Date();
+  const order = new Date(orderDate);
+  const diffTime = today - order;
+  const diffDays = diffTime / (1000 * 60 * 60 * 24);
+  return diffDays <= 7;
+}
+
+// Endpoint: check refund eligibility
+app.post("/api/chatbot/check-refund", authMiddleware, async (req, res) => {
+  try {
+    const { orderId } = req.body;
+
+    // Replace with real DB query
+    const order = orders.find(o => o.orderId === orderId);
+    if (!order) return res.json({ eligible: false, message: "Order not found" });
+
+    const eligible = isRefundEligible(order.date);
+    res.json({ eligible, orderDate: order.date });
+  } catch (err) {
+    console.error("Refund check error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Endpoint: receive chatbot submission
+app.post("/api/chatbot/submit", authMiddleware, async (req, res) => {
+  try {
+    const { type, answers } = req.body;
+    if (!type || !answers) return res.status(400).json({ error: "Missing fields" });
+
+    const submission = {
+      type,          // e.g., "refund", "report", "other"
+      answers,       // array/object of Q&A from chatbot
+      userId: req.user.id,
+      date: new Date(),
+    };
+
+    // Store in memory (replace with DB insert if needed)
+    chatbotSubmissions.push(submission);
+
+    console.log("MintZa Chatbot submission:", submission);
+
+    // Optionally: notify admin via socket
+    io.emit("admin-new-chatbot-submission", submission);
+
+    res.json({ success: true, message: "Submission received" });
+  } catch (err) {
+    console.error("Chatbot submission error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Endpoint: get all submissions (for admin dashboard)
+app.get("/api/chatbot/submissions", authMiddleware, async (req, res) => {
+  try {
+    // Optionally restrict to admins: check req.user.role === "admin"
+    res.json(chatbotSubmissions);
+  } catch (err) {
+    console.error("Fetch submissions error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // --- Wallet & Coins ---
 
 // Get balance
