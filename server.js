@@ -16,7 +16,7 @@ AGORA_APP_ID=your_agora_app_id
 AGORA_APP_CERTIFICATE=your_agora_app_certificate
 
 dotenv.config();
-import multer from "multer";
+const multer = require("multer");
 import path from "path";
 import fs from "fs";
 
