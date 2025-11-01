@@ -11,7 +11,6 @@ import { Strategy as GitHubStrategy } from "passport-github2";
 import session from "express-session";
 import http from "http";
 import { Server as SocketServer } from "socket.io";
-import { ExpressPeerServer } from "peer";
 import { RtcRole, RtcTokenBuilder } from "agora-access-token";
 AGORA_APP_ID=your_agora_app_id
 AGORA_APP_CERTIFICATE=your_agora_app_certificate
