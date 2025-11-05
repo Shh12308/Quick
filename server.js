@@ -763,18 +763,6 @@ app.post("/messages/send", authMiddleware, async (req, res) => {
   }
 });
 
-socket.on("reaction", ({ messageId, reaction, userId }) => {
-  io.emit("reaction", { messageId, reaction, userId }); // broadcast to relevant room
-});
-
-socket.on("typing", ({ toUserId, isTyping }) => {
-  socket.to(`user-${toUserId}`).emit("typing", { from: socket.id, isTyping });
-});
-
-socket.on("seen", ({ messageId, userId }) => {
-  io.emit("seen", { messageId, userId });
-});
-
 // Send group message
 app.post("/messages/send-group", authMiddleware, async (req, res) => {
   try {
@@ -792,18 +780,6 @@ app.post("/messages/send-group", authMiddleware, async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "Group message failed" });
   }
-});
-
-socket.on("reaction", ({ messageId, reaction, userId }) => {
-  io.emit("reaction", { messageId, reaction, userId }); // broadcast to relevant room
-});
-
-socket.on("typing", ({ toUserId, isTyping }) => {
-  socket.to(`user-${toUserId}`).emit("typing", { from: socket.id, isTyping });
-});
-
-socket.on("seen", ({ messageId, userId }) => {
-  io.emit("seen", { messageId, userId });
 });
 
 // Get messages between two users
@@ -890,6 +866,111 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
+  });
+});
+
+// === Socket.IO for livestreams, group calls, chat, reactions ===
+const activeCalls = {};   // { groupId: Set(userIds) }
+const liveRooms = {};     // { streamId: { viewers: Set(userIds) } }
+
+io.on("connection", (socket) => {
+  console.log("Socket connected:", socket.id);
+
+  // --- Group Calls (Agora) ---
+  socket.on("join-call", ({ groupId, userId, username }) => {
+    socket.join(groupId);
+    if (!activeCalls[groupId]) activeCalls[groupId] = new Set();
+    activeCalls[groupId].add(userId);
+
+    io.to(groupId).emit("call-update", {
+      groupId,
+      participants: Array.from(activeCalls[groupId]),
+      count: activeCalls[groupId].size,
+      joined: username,
+    });
+
+    console.log(`${username} joined Agora group call ${groupId}`);
+  });
+
+  socket.on("leave-call", ({ groupId, userId, username }) => {
+    if (activeCalls[groupId]) {
+      activeCalls[groupId].delete(userId);
+      io.to(groupId).emit("call-update", {
+        groupId,
+        participants: Array.from(activeCalls[groupId]),
+        count: activeCalls[groupId].size,
+        left: username,
+      });
+    }
+    socket.leave(groupId);
+  });
+
+  // --- Livestream rooms ---
+  socket.on("join-room", ({ streamId, userId, username }) => {
+    socket.join(streamId);
+    if (!liveRooms[streamId]) liveRooms[streamId] = { viewers: new Set() };
+    liveRooms[streamId].viewers.add(userId);
+
+    io.to(streamId).emit("viewer-update", {
+      count: liveRooms[streamId].viewers.size,
+    });
+
+    console.log(`${username} joined livestream ${streamId}`);
+  });
+
+  socket.on("leave-room", ({ streamId, userId }) => {
+    if (liveRooms[streamId]) {
+      liveRooms[streamId].viewers.delete(userId);
+      io.to(streamId).emit("viewer-update", {
+        count: liveRooms[streamId].viewers.size,
+      });
+    }
+    socket.leave(streamId);
+  });
+
+  // --- Live Chat Messages ---
+  socket.on("chat-message", ({ streamId, username, message }) => {
+    io.to(streamId).emit("chat-message", { username, message, time: Date.now() });
+  });
+
+  // --- Reactions / Typing / Seen (works for private or group messages) ---
+  socket.on("reaction", ({ messageId, reaction, userId }) => {
+    io.emit("reaction", { messageId, reaction, userId });
+  });
+
+  socket.on("typing", ({ toUserId, isTyping }) => {
+    socket.to(`user-${toUserId}`).emit("typing", { from: socket.id, isTyping });
+  });
+
+  socket.on("seen", ({ messageId, userId }) => {
+    io.emit("seen", { messageId, userId });
+  });
+
+  // --- Handle disconnect ---
+  socket.on("disconnect", () => {
+    console.log("Socket disconnected:", socket.id);
+
+    // Remove user from all activeCalls
+    for (const [groupId, participants] of Object.entries(activeCalls)) {
+      participants.forEach((uid) => {
+        if (uid === socket.id) participants.delete(uid);
+      });
+      io.to(groupId).emit("call-update", {
+        groupId,
+        participants: Array.from(participants),
+        count: participants.size,
+      });
+    }
+
+    // Remove user from all liveRooms
+    for (const [streamId, room] of Object.entries(liveRooms)) {
+      room.viewers.forEach((uid) => {
+        if (uid === socket.id) room.viewers.delete(uid);
+      });
+      io.to(streamId).emit("viewer-update", {
+        count: room.viewers.size,
+      });
+    }
   });
 });
 
