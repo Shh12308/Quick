@@ -763,6 +763,18 @@ app.post("/messages/send", authMiddleware, async (req, res) => {
   }
 });
 
+socket.on("reaction", ({ messageId, reaction, userId }) => {
+  io.emit("reaction", { messageId, reaction, userId }); // broadcast to relevant room
+});
+
+socket.on("typing", ({ toUserId, isTyping }) => {
+  socket.to(`user-${toUserId}`).emit("typing", { from: socket.id, isTyping });
+});
+
+socket.on("seen", ({ messageId, userId }) => {
+  io.emit("seen", { messageId, userId });
+});
+
 // Send group message
 app.post("/messages/send-group", authMiddleware, async (req, res) => {
   try {
@@ -780,6 +792,18 @@ app.post("/messages/send-group", authMiddleware, async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "Group message failed" });
   }
+});
+
+socket.on("reaction", ({ messageId, reaction, userId }) => {
+  io.emit("reaction", { messageId, reaction, userId }); // broadcast to relevant room
+});
+
+socket.on("typing", ({ toUserId, isTyping }) => {
+  socket.to(`user-${toUserId}`).emit("typing", { from: socket.id, isTyping });
+});
+
+socket.on("seen", ({ messageId, userId }) => {
+  io.emit("seen", { messageId, userId });
 });
 
 // Get messages between two users
