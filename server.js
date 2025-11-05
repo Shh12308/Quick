@@ -578,6 +578,41 @@ app.post("/wallet/tip", authMiddleware, async (req, res) => {
   }
 });
 
+const io = require("socket.io")(server, {
+  cors: {
+    origin: "*",
+  },
+});
+
+io.on("connection", (socket) => {
+  console.log("New socket connected:", socket.id);
+
+  // Join a private call room
+  socket.on("join-call", ({ roomId, userId }) => {
+    socket.join(roomId);
+    socket.to(roomId).emit("user-joined", { userId, socketId: socket.id });
+  });
+
+  // Forward SDP offer
+  socket.on("webrtc-offer", ({ targetSocketId, offer }) => {
+    io.to(targetSocketId).emit("webrtc-offer", { offer, from: socket.id });
+  });
+
+  // Forward SDP answer
+  socket.on("webrtc-answer", ({ targetSocketId, answer }) => {
+    io.to(targetSocketId).emit("webrtc-answer", { answer, from: socket.id });
+  });
+
+  // Forward ICE candidates
+  socket.on("webrtc-ice-candidate", ({ targetSocketId, candidate }) => {
+    io.to(targetSocketId).emit("webrtc-ice-candidate", { candidate, from: socket.id });
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Socket disconnected:", socket.id);
+  });
+});
+
 // Lemon Squeezy / Checkout webhook for coin purchases
 // Expect webhook to POST { email, product_name, ... } or similar payload. Adjust parsing to vendor payload.
 app.post("/webhooks/coins", express.json(), async (req, res) => {
