@@ -416,6 +416,85 @@ app.get("/api/chatbot/submissions", authMiddleware, async (req, res) => {
   }
 });
 
+ app = express();
+app.use(bodyParser.json());
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || "postgresql://user:password@localhost:5432/chatdb",
+});
+
+/**
+ * Middleware: check if sender/receiver are banned or blocked
+ */
+async function checkBlockAndBan(req, res, next) {
+  const senderId = req.user.id; // assuming you have auth middleware
+  const { to_user_id } = req.body;
+  if (!to_user_id) return res.status(400).json({ error: "Missing to_user_id" });
+
+  try {
+    // Fetch sender & receiver status
+    const userRes = await pool.query(
+      `SELECT id, status FROM users WHERE id IN ($1, $2);`,
+      [senderId, to_user_id]
+    );
+    if (userRes.rows.length < 2) return res.status(404).json({ error: "User not found" });
+
+    const sender = userRes.rows.find(u => u.id === senderId);
+    const receiver = userRes.rows.find(u => u.id == to_user_id);
+
+    if (sender.status === "banned") return res.status(403).json({ error: "You are banned from sending messages" });
+    if (receiver.status === "banned") return res.status(403).json({ error: "User is banned" });
+
+    // Check block table
+    const blockRes = await pool.query(
+      `SELECT
+         EXISTS(SELECT 1 FROM blocked_users WHERE blocker_id=$1 AND blocked_id=$2) AS sender_blocked,
+         EXISTS(SELECT 1 FROM blocked_users WHERE blocker_id=$2 AND blocked_id=$1) AS receiver_blocked`,
+      [senderId, to_user_id]
+    );
+
+    const { sender_blocked, receiver_blocked } = blockRes.rows[0];
+    if (sender_blocked) return res.status(403).json({ error: "You have blocked this user" });
+    if (receiver_blocked) return res.status(403).json({ error: "User has blocked you" });
+
+    next();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Database error" });
+  }
+}
+
+/**
+ * Mock auth middleware
+ */
+function authMiddleware(req, res, next) {
+  // Example: attach current user id
+  req.user = { id: 1, name: "Alice" };
+  next();
+}
+
+/**
+ * Route: send message
+ */
+app.post("/messages/send", authMiddleware, checkBlockAndBan, async (req, res) => {
+  const { to_user_id, content } = req.body;
+  const senderId = req.user.id;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO messages (sender_id, receiver_id, content)
+       VALUES ($1, $2, $3)
+       RETURNING id, sender_id, receiver_id, content, created_at;`,
+      [senderId, to_user_id, content]
+    );
+
+    res.json({ messageRow: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to send message" });
+  }
+});
+
 // --- Wallet & Coins ---
 
 // Get balance
