@@ -29,8 +29,8 @@ const transporter = nodemailer.createTransport({
 import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
 const { RtcRole, RtcTokenBuilder } = pkg;
-AGORA_APP_ID=your_agora_app_id
-AGORA_APP_CERTIFICATE=your_agora_app_certificate
+const AGORA_APP_ID=your_agora_app_id
+const AGORA_APP_CERTIFICATE=your_agora_app_certificate
 
 dotenv.config();
 const multer = require("multer");
