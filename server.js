@@ -10,6 +10,22 @@ import { Strategy as DiscordStrategy } from "passport-discord";
 import { Strategy as GitHubStrategy } from "passport-github2";
 import session from "express-session";
 import http from "http";
+import nodemailer from "nodemailer";
+
+const EMAIL_HOST = process.env.EMAIL_HOST; // e.g., smtp.gmail.com
+const EMAIL_PORT = process.env.EMAIL_PORT || 587;
+const EMAIL_USER = process.env.EMAIL_USER;
+const EMAIL_PASS = process.env.EMAIL_PASS;
+
+const transporter = nodemailer.createTransport({
+  host: EMAIL_HOST,
+  port: EMAIL_PORT,
+  secure: EMAIL_PORT == 465, // true for 465, false for other ports
+  auth: {
+    user: EMAIL_USER,
+    pass: EMAIL_PASS,
+  },
+});
 import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
 const { RtcRole, RtcTokenBuilder } = pkg;
@@ -142,6 +158,25 @@ passport.use(
   )
 );
 
+async function sendEmail({ to, subject, html, text }) {
+  try {
+    const info = await transporter.sendMail({
+      from: `"Your App Name" <${EMAIL_USER}>`,
+      to,
+      subject,
+      text: text || undefined,
+      html: html || undefined,
+    });
+    console.log("Email sent:", info.messageId);
+    return true;
+  } catch (err) {
+    console.error("Email failed:", err);
+    return false;
+  }
+}
+
+
+
 // --- Helper: auth middleware ---
 function authMiddleware(req, res, next) {
   try {
@@ -240,22 +275,69 @@ app.get(
 app.post("/signup", async (req, res) => {
   try {
     const { username, email, password } = req.body;
-    if (!username || !email || !password) return res.status(400).json({ error: "Missing fields" });
+
+    // 1. Basic validation
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    // 2. Check if email already exists
+    const existingUser = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({ error: "Email already registered" });
+    }
+
+    // 3. Hash the password
     const hashed = await bcrypt.hash(password, 12);
+
+    // 4. Insert the new user
     const { rows } = await pool.query(
-      `INSERT INTO users (username, email, password_hash, role, subscription_plan, is_musician, is_creator, is_admin, created_at)
+      `INSERT INTO users 
+       (username, email, password_hash, role, subscription_plan, is_musician, is_creator, is_admin, created_at)
        VALUES ($1, $2, $3, 'free', 'free', false, false, false, NOW())
-       RETURNING *`,
+       RETURNING id, username, email, role, subscription_plan, is_musician, is_creator, is_admin, created_at`,
       [username, email, hashed]
     );
+
     const user = rows[0];
+
+    // 5. Ensure creator stats (your existing helper function)
     await ensureCreatorStats(user.id);
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
+
+    // 6. Generate JWT token
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    // 7. Respond with user info + token
     res.json({ message: "Signed up successfully", user, token });
+
   } catch (err) {
-    console.error(err);
+    console.error("Signup error:", err);
     res.status(500).json({ error: "Signup failed" });
   }
+});
+
+app.post("/password-reset", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email required" });
+
+  const { rows } = await pool.query("SELECT id, username FROM users WHERE email=$1", [email]);
+  const user = rows[0];
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  const resetToken = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "1h" });
+  const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
+
+  await sendEmail({
+    to: email,
+    subject: "Password Reset Request",
+    html: `<p>Hi ${user.username},</p><p>Click <a href="${resetLink}">here</a> to reset your password. This link expires in 1 hour.</p>`
+  });
+
+  res.json({ message: "Password reset email sent" });
 });
 
 // Email/Password Login
