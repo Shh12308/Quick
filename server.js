@@ -1158,6 +1158,41 @@ io.on("connection", (socket) => {
       });
     }
 
+    const client = new OneSignal.Client({
+  userAuthKey: 'YOUR_USER_AUTH_KEY',     // OneSignal REST API key
+  app: { appAuthKey: 'YOUR_APP_AUTH_KEY', appId: 'YOUR_APP_ID' }
+});
+
+// In-memory store to simulate online users
+const onlineUsers = {}; // { playerId: true/false }
+
+// Endpoint to mark user online/offline
+app.post('/status', (req, res) => {
+  const { playerId, online } = req.body;
+  onlineUsers[playerId] = online;
+  res.sendStatus(200);
+});
+
+// Endpoint for typing event
+app.post('/typing', (req, res) => {
+  const { typingUser, recipientPlayerId } = req.body;
+
+  // Send push ONLY if recipient is offline
+  if (!onlineUsers[recipientPlayerId]) {
+    const notification = {
+      contents: { en: `${typingUser} is typing...` },
+      include_player_ids: [recipientPlayerId]
+    };
+
+    client.createNotification(notification)
+      .then(response => console.log('Typing push sent:', response.body))
+      .catch(err => console.error(err));
+  }
+
+  res.sendStatus(200);
+});
+
+
     // Remove user from all liveRooms
     for (const [streamId, room] of Object.entries(liveRooms)) {
       room.viewers.forEach((uid) => {
