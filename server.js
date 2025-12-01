@@ -22,8 +22,8 @@ const transporter = nodemailer.createTransport({
   port: EMAIL_PORT,
   secure: EMAIL_PORT == 465, // true for 465, false for other ports
   auth: {
-    user: EMAIL_USER,
-    pass: EMAIL_PASS,
+  user: EMAIL_USER,
+  pass: EMAIL_PASS,
   },
 });
 import { Server as SocketServer } from "socket.io";
