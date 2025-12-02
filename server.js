@@ -24,47 +24,51 @@ const { RtcRole, RtcTokenBuilder } = pkg;
 import dotenv from "dotenv";
 dotenv.config();
 
-// Database
-const DB_USER = process.env.DB_USER;
-const DB_HOST = process.env.DB_HOST;
-const DB_NAME = process.env.DB_NAME;
-const DB_PASS = process.env.DB_PASS;
-const DB_PORT = process.env.DB_PORT || 5432;
+const {
+  DB_USER,
+  DB_HOST,
+  DB_NAME,
+  DB_PASS,
+  DB_PORT,
 
-// App / Server
-const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
-const SESSION_SECRET = process.env.SESSION_SECRET || "sessionsecret";
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
-const ADMIN_KEY = process.env.ADMIN_KEY || "adminkey";
+  JWT_SECRET = "supersecretkey",
+  SESSION_SECRET = "sessionsecret",
 
-// Email
-const EMAIL_HOST = process.env.EMAIL_HOST;
-const EMAIL_PORT = process.env.EMAIL_PORT ? Number(process.env.EMAIL_PORT) : 587;
-const EMAIL_USER = process.env.EMAIL_USER;
-const EMAIL_PASS = process.env.EMAIL_PASS;
+  EMAIL_HOST,
+  EMAIL_PORT,
+  EMAIL_USER,
+  EMAIL_PASS,
 
-// OAuth: Google
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const GOOGLE_CALLBACK_URL = process.env.GOOGLE_CALLBACK_URL;
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  GOOGLE_CALLBACK_URL,
+  DISCORD_CLIENT_ID,
+  DISCORD_CLIENT_SECRET,
+  DISCORD_CALLBACK_URL,
+  GITHUB_CLIENT_ID,
+  GITHUB_CLIENT_SECRET,
+  GITHUB_CALLBACK_URL,
 
-// OAuth: Discord
-const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
-const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
-const DISCORD_CALLBACK_URL = process.env.DISCORD_CALLBACK_URL;
+  FRONTEND_URL,
+  ADMIN_KEY,
+  PORT = 5000,
 
-// OAuth: GitHub
-const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID;
-const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
-const GITHUB_CALLBACK_URL = process.env.GITHUB_CALLBACK_URL;
+  AGORA_APP_ID,
+  AGORA_APP_CERTIFICATE,
 
-// Agora
-const AGORA_APP_ID = process.env.AGORA_APP_ID;
-const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE;
+  // AWS VARS (fixed — DO NOT write AWS_REGION= anything)
+  AWS_REGION,
+  AWS_ACCESS_KEY_ID,
+  AWS_SECRET_ACCESS_KEY,
+  S3_BUCKET_NAME,
 
-// AWS (if needed)
-const AWS_REGION = process.env.AWS_REGION || "us-east-1";
+  // MediaConvert (fixed — removed invalid "=" syntax)
+  MEDIACONVERT_ROLE_ARN,
+  MEDIACONVERT_ENDPOINT
+} = process.env;
+
+// SAFE fallback without redeclaring AWS_REGION
+const region = AWS_REGION || "us-east-1";
 
 // Setup PostgreSQL pool
 const pool = new pg.Pool({
