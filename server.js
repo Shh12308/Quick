@@ -12,6 +12,7 @@ import http from "http";
 import nodemailer from "nodemailer";
 import multer from "multer";
 import path from "path";
+import dayjs from "dayjs";
 import fs from "fs";
 import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
@@ -677,6 +678,341 @@ app.post("/creator/update-deltas", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to update creator stats" });
+  }
+});
+
+// -------------------------
+// Helper: Ban / Suspension utilities
+// -------------------------
+async function refreshSuspensionIfExpired(userRow) {
+  // userRow is a DB row object (from users table)
+  if (!userRow) return userRow;
+  if (userRow.status === "suspended" && userRow.suspend_until) {
+    // if suspension expired, reset
+    if (dayjs().isAfter(dayjs(userRow.suspend_until))) {
+      await pool.query(
+        `UPDATE users SET status='active', suspend_until=NULL, suspension_reason=NULL WHERE id=$1`,
+        [userRow.id]
+      );
+      userRow.status = "active";
+      userRow.suspend_until = null;
+      userRow.suspension_reason = null;
+    }
+  }
+  return userRow;
+}
+
+function isUserBlocked(userRow, deviceIdFromClient) {
+  if (!userRow) return { blocked: false };
+
+  // Permanent device / account ban checks (status 'banned' or banType)
+  if (userRow.status === "banned") {
+    return { blocked: true, type: "banned", reason: userRow.suspension_reason || "Permanent ban" };
+  }
+
+  // Suspended check (suspend_until handled by refreshSuspensionIfExpired)
+  if (userRow.status === "suspended") {
+    return { blocked: true, type: "suspended", until: userRow.suspend_until, reason: userRow.suspension_reason || "Temporary suspension" };
+  }
+
+  // Optional device mismatch block: if user row has a device_id and it differs from the client (this is stricter)
+  if (userRow.device_id && deviceIdFromClient && userRow.device_id !== deviceIdFromClient) {
+    // This check is optional — some implementations avoid blocking on mismatch to allow multiple devices.
+    return { blocked: true, type: "device_mismatch", reason: "Device not recognized" };
+  }
+
+  return { blocked: false };
+}
+
+// -------------------------
+// Replace /signup (supports phone & device_id)
+// -------------------------
+app.post("/signup", async (req, res) => {
+  try {
+    const { username, email, password, phone, device_id } = req.body;
+    if (!username || !email || !password) return res.status(400).json({ error: "Missing fields" });
+
+    const existingUser = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+    if (existingUser.rows.length > 0) return res.status(400).json({ error: "Email already registered" });
+
+    const hashed = await bcrypt.hash(password, 12);
+    const { rows } = await pool.query(
+      `INSERT INTO users 
+       (username, email, password_hash, phone, device_id, role, subscription_plan, is_musician, is_creator, is_admin, status, created_at)
+       VALUES ($1,$2,$3,$4,$5,'free','free',false,false,false,'active',NOW())
+       RETURNING id, username, email, phone, device_id, role, subscription_plan, is_musician, is_creator, is_admin, status, created_at`,
+      [username, email, hashed, phone || null, device_id || null]
+    );
+
+    const user = rows[0];
+    await ensureCreatorStats(user.id);
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
+    res.json({ message: "Signed up successfully", user, token });
+  } catch (err) {
+    console.error("Signup error:", err);
+    res.status(500).json({ error: "Signup failed" });
+  }
+});
+
+// -------------------------
+// Replace /login (email/password) — supports device_id field and ban checks
+// -------------------------
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password, device_id } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "Missing fields" });
+
+    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+    const userRow = rows[0];
+    if (!userRow) return res.status(400).json({ error: "Invalid credentials" });
+
+    // Refresh suspension if expired (auto-unsuspend)
+    await refreshSuspensionIfExpired(userRow);
+
+    // Re-fetch to reflect possible update
+    const refreshed = (await pool.query("SELECT * FROM users WHERE id=$1", [userRow.id])).rows[0];
+
+    // Block checks
+    const block = isUserBlocked(refreshed, device_id);
+    if (block.blocked) {
+      if (block.type === "suspended") return res.status(403).json({ error: "Account suspended", until: refreshed.suspend_until, reason: refreshed.suspension_reason });
+      if (block.type === "banned") return res.status(403).json({ error: "Account banned", reason: refreshed.suspension_reason });
+      if (block.type === "device_mismatch") return res.status(403).json({ error: "Device mismatch", reason: block.reason });
+    }
+
+    if (!refreshed.password_hash) return res.status(400).json({ error: "Set a password or use OAuth" });
+    const valid = await bcrypt.compare(password, refreshed.password_hash);
+    if (!valid) return res.status(400).json({ error: "Invalid credentials" });
+
+    // Save device_id if not set (optional) — won't overwrite if already present
+    if (!refreshed.device_id && device_id) {
+      await pool.query("UPDATE users SET device_id=$1 WHERE id=$2", [device_id, refreshed.id]);
+      refreshed.device_id = device_id;
+    }
+
+    const token = jwt.sign({ id: refreshed.id, email: refreshed.email, role: refreshed.role }, JWT_SECRET, { expiresIn: "7d" });
+    res.json({ message: "Logged in", user: refreshed, token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Login failed" });
+  }
+});
+
+// -------------------------
+// OAuth callbacks: ensure we enforce bans after provider returns user data
+// Replace your existing redirect handlers for Google/Discord/Github with these patterns
+// -------------------------
+
+// Helper: create-or-update user after OAuth profile received
+async function findOrCreateOAuthUser({ email, username, provider, device_id = null, phone = null }) {
+  const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+  let user = rows[0];
+  if (!user) {
+    const r = await pool.query(
+      `INSERT INTO users (username, email, phone, device_id, auth_provider, role, subscription_plan, is_musician, is_creator, is_admin, status, created_at)
+       VALUES ($1,$2,$3,$4,$5,'free','free',false,false,false,'active',NOW())
+       RETURNING *`,
+      [username || email.split("@")[0], email, phone || null, device_id || null, provider]
+    );
+    user = r.rows[0];
+    await ensureCreatorStats(user.id);
+  } else {
+    // update device_id/phone if missing
+    const toUpdate = {};
+    if (!user.device_id && device_id) toUpdate.device_id = device_id;
+    if (!user.phone && phone) toUpdate.phone = phone;
+    if (Object.keys(toUpdate).length > 0) {
+      await pool.query(
+        `UPDATE users SET phone=COALESCE($1,phone), device_id=COALESCE($2,device_id), updated_at=NOW() WHERE id=$3`,
+        [toUpdate.phone || null, toUpdate.device_id || null, user.id]
+      );
+      const refreshed = (await pool.query("SELECT * FROM users WHERE id=$1", [user.id])).rows[0];
+      user = refreshed;
+    }
+  }
+  return user;
+}
+
+// Google callback finalizer (used in your /auth/google/callback route)
+async function completeOAuthLogin(req, res, oauthUser) {
+  try {
+    // oauthUser should contain: email, username, provider, device_id (if provided by client)
+    let userRow = await findOrCreateOAuthUser(oauthUser);
+
+    // refresh suspension if expired
+    await refreshSuspensionIfExpired(userRow);
+    userRow = (await pool.query("SELECT * FROM users WHERE id=$1", [userRow.id])).rows[0];
+
+    // enforce bans/suspensions
+    const block = isUserBlocked(userRow, oauthUser.device_id);
+    if (block.blocked) {
+      // do not issue token; notify client
+      return res.status(403).send(`<h1>Access denied</h1><p>${block.reason || "Account blocked"}</p>`);
+    }
+
+    // optionally set device_id if missing
+    if (!userRow.device_id && oauthUser.device_id) {
+      await pool.query("UPDATE users SET device_id=$1 WHERE id=$2", [oauthUser.device_id, userRow.id]);
+      userRow.device_id = oauthUser.device_id;
+    }
+
+    // Issue JWT and redirect back to frontend with token
+    const token = jwt.sign({ id: userRow.id, email: userRow.email, role: userRow.role }, JWT_SECRET, { expiresIn: "7d" });
+    // Adjust the redirect target to fit your app (welcome.html previously used)
+    return res.redirect(`${FRONTEND_URL}/welcome.html?token=${token}`);
+  } catch (err) {
+    console.error("completeOAuthLogin error:", err);
+    return res.status(500).send("OAuth failed");
+  }
+}
+
+// Example: modify your existing passport callbacks to call completeOAuthLogin
+// In your Google callback route you currently do:
+// passport.authenticate("google", { failureRedirect: "/", session: false }), (req, res) => { const token = jwt.sign(...); res.redirect(...); }
+// Replace final handler with a wrapper that passes device_id (client should send device_id via cookie/query state or saved earlier)
+app.get(
+  "/auth/google/callback",
+  passport.authenticate("google", { failureRedirect: "/", session: false }),
+  async (req, res) => {
+    // `req.user` is the user returned by your passport strategy function (you already insert/find the user there).
+    // However to centralize ban checking we re-fetch and complete login
+    // Try to get device_id from query or cookie (client should include it)
+    const device_id = req.query.device_id || req.cookies?.device_id || null;
+    const phone = req.query.phone || null;
+    // If passport stored profile in req.user (from your strategy), use it; otherwise fetch by email
+    const email = req.user?.email;
+    await completeOAuthLogin(res.req, res, { email, username: req.user?.username || req.user?.displayName, provider: "google", device_id, phone });
+  }
+);
+
+// Similarly update Discord and GitHub callbacks:
+app.get(
+  "/auth/discord/callback",
+  passport.authenticate("discord", { failureRedirect: "/", session: false }),
+  async (req, res) => {
+    const device_id = req.query.device_id || req.cookies?.device_id || null;
+    const phone = req.query.phone || null;
+    const email = req.user?.email;
+    await completeOAuthLogin(res.req, res, { email, username: req.user?.username, provider: "discord", device_id, phone });
+  }
+);
+
+app.get(
+  "/auth/github/callback",
+  passport.authenticate("github", { failureRedirect: "/", session: false }),
+  async (req, res) => {
+    const device_id = req.query.device_id || req.cookies?.device_id || null;
+    const phone = req.query.phone || null;
+    const email = req.user?.email || `${req.user?.username}@github.local`;
+    await completeOAuthLogin(res.req, res, { email, username: req.user?.username, provider: "github", device_id, phone });
+  }
+);
+
+// -------------------------
+// POST /user/update-contact (auth users update phone/device)
+// -------------------------
+app.post("/user/update-contact", authMiddleware, async (req, res) => {
+  try {
+    const { phone, device_id } = req.body;
+    const userId = req.user.id;
+    const { rows } = await pool.query(
+      `UPDATE users SET phone=$1, device_id=$2, updated_at=NOW() WHERE id=$3 RETURNING phone, device_id`,
+      [phone || null, device_id || null, userId]
+    );
+    res.json({ message: "Contact info updated", user: rows[0] });
+  } catch (err) {
+    console.error("update-contact failed:", err);
+    res.status(500).json({ error: "Failed to update" });
+  }
+});
+
+// -------------------------
+// Admin actions: suspend (6 months), device-ban (permanent), unsuspend, view banned
+// -------------------------
+app.post("/api/admin/users/:id/suspend", async (req, res) => {
+  try {
+    const adminKey = req.headers["x-admin-key"] || req.body.adminKey || req.query.adminKey;
+    if (!adminKey || adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
+
+    const userId = req.params.id;
+    const reason = req.body.reason || "Violation";
+    const suspendUntil = dayjs().add(6, "month").toISOString();
+
+    // Update user status and create BannedRecord (if you use a banned_records table)
+    await pool.query("UPDATE users SET status='suspended', suspend_until=$1, suspension_reason=$2 WHERE id=$3", [suspendUntil, reason, userId]);
+    // optional: insert into banned_records table for email/phone/device
+    await pool.query(
+      `INSERT INTO banned_records (user_id, email, phone, device_id, expires, permanent, reason, created_at)
+       SELECT id, email, phone, device_id, $1, false, $2, NOW() FROM users WHERE id=$3`,
+      [suspendUntil, reason, userId]
+    );
+
+    res.json({ suspendUntil });
+  } catch (err) {
+    console.error("suspend user error:", err);
+    res.status(500).json({ error: "Suspend failed" });
+  }
+});
+
+app.post("/api/admin/users/:id/device-ban", async (req, res) => {
+  try {
+    const adminKey = req.headers["x-admin-key"] || req.body.adminKey || req.query.adminKey;
+    if (!adminKey || adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
+
+    const userId = req.params.id;
+    const reason = req.body.reason || "Severe violation";
+
+    // fetch user's device_id / email / phone
+    const { rows } = await pool.query("SELECT email, phone, device_id FROM users WHERE id=$1", [userId]);
+    const user = rows[0];
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    // mark user as permanently banned
+    await pool.query("UPDATE users SET status='banned', suspension_reason=$1 WHERE id=$2", [reason, userId]);
+
+    // create or update banned_records as permanent
+    await pool.query(
+      `INSERT INTO banned_records (user_id, email, phone, device_id, expires, permanent, reason, created_at)
+       VALUES ($1,$2,$3,$4,NULL,true,$5,NOW())
+       ON CONFLICT (device_id) DO UPDATE SET permanent=true, expires=NULL, reason=$5`,
+      [userId, user.email || null, user.phone || null, user.device_id || null, reason]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("device ban error:", err);
+    res.status(500).json({ error: "Device ban failed" });
+  }
+});
+
+app.post("/api/admin/users/:id/unsuspend", async (req, res) => {
+  try {
+    const adminKey = req.headers["x-admin-key"] || req.body.adminKey || req.query.adminKey;
+    if (!adminKey || adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
+
+    const userId = req.params.id;
+    await pool.query("UPDATE users SET status='active', suspend_until=NULL, suspension_reason=NULL WHERE id=$1", [userId]);
+
+    // optional: remove/expire banned_records for that user
+    await pool.query("UPDATE banned_records SET expires=NOW() WHERE user_id=$1 AND permanent=false", [userId]);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("unsuspend error:", err);
+    res.status(500).json({ error: "Unsuspend failed" });
+  }
+});
+
+app.get("/api/admin/users/status", async (req, res) => {
+  try {
+    const adminKey = req.headers["x-admin-key"] || req.query.adminKey;
+    if (!adminKey || adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
+
+    const { rows } = await pool.query("SELECT id, username, email, phone, device_id, status, suspend_until, suspension_reason FROM users WHERE status != 'active'");
+    res.json({ users: rows });
+  } catch (err) {
+    console.error("fetch banned users error:", err);
+    res.status(500).json({ error: "Failed" });
   }
 });
 
