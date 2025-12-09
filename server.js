@@ -283,6 +283,170 @@ function calculateEarningsFromDeltas({ likesDelta = 0, followsDelta = 0, viewsDe
   return { total, breakdown: { fromLikes, fromFollows, fromViews, tips: Number(tips), merch: Number(merch) } };
 }
 
+// moderationPipelineFull.js
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import fs from "fs/promises";
+import path from "path";
+import os from "os";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegPath from "ffmpeg-static";
+import { v4 as uuidv4 } from "uuid";
+import axios from "axios";
+import OpenAI from "openai";
+import FormData from "form-data";
+
+// Configure ffmpeg
+ffmpeg.setFfmpegPath(ffmpegPath);
+
+// AWS S3 client
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+
+// OpenAI client
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// AssemblyAI key
+const assemblyKey = process.env.ASSEMBLYAI_KEY;
+
+/**
+ * Download S3 object to temp file
+ */
+async function downloadS3ToTempFile(key) {
+  const cmd = new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key });
+  const resp = await s3.send(cmd);
+  const tmpPath = path.join(os.tmpdir(), `upload-${Date.now()}-${path.basename(key)}`);
+  await new Promise((resolve, reject) => {
+    const writeStream = require("fs").createWriteStream(tmpPath);
+    resp.Body.pipe(writeStream);
+    writeStream.on("finish", resolve);
+    writeStream.on("error", reject);
+  });
+  return tmpPath;
+}
+
+/**
+ * Extract N thumbnails using ffmpeg
+ */
+async function extractThumbnails(filePath, count = 3) {
+  const tmpFramesDir = path.join(path.dirname(filePath), "frames-" + uuidv4());
+  await fs.mkdir(tmpFramesDir, { recursive: true });
+
+  // get video duration
+  const duration = await new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err) return reject(err);
+      resolve(metadata.format.duration || 0);
+    });
+  });
+
+  const interval = Math.max(1, Math.floor(duration / (count + 1)));
+  const thumbFiles = [];
+
+  for (let i = 1; i <= count; i++) {
+    const t = Math.min(Math.floor(i * interval), Math.max(1, Math.floor(duration - 1)));
+    const outFile = path.join(tmpFramesDir, `thumb_${i}.jpg`);
+    await new Promise((resolve, reject) => {
+      ffmpeg(filePath)
+        .screenshots({ timestamps: [t], filename: path.basename(outFile), folder: tmpFramesDir, size: "1280x720" })
+        .on("end", () => resolve())
+        .on("error", reject);
+    });
+    thumbFiles.push(outFile);
+  }
+
+  // read buffers
+  const buffers = await Promise.all(thumbFiles.map(f => fs.readFile(f)));
+
+  // cleanup
+  for (const f of thumbFiles) await fs.rm(f, { force: true });
+  await fs.rmdir(tmpFramesDir, { recursive: true }).catch(() => {});
+
+  return buffers;
+}
+
+/**
+ * Upload file to AssemblyAI
+ */
+async function uploadToAssembly(filePath) {
+  const readStream = require("fs").createReadStream(filePath);
+  const resp = await axios({
+    method: "post",
+    url: "https://api.assemblyai.com/v2/upload",
+    headers: { "authorization": assemblyKey, "transfer-encoding": "chunked" },
+    data: readStream,
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
+  });
+  return resp.data.upload_url;
+}
+
+/**
+ * Create transcription and poll until completed
+ */
+async function transcribeWithAssembly(filePath) {
+  const uploadUrl = await uploadToAssembly(filePath);
+  const createResp = await axios.post("https://api.assemblyai.com/v2/transcript", {
+    audio_url: uploadUrl,
+    language_code: "en",
+  }, { headers: { authorization: assemblyKey } });
+
+  const id = createResp.data.id;
+
+  while (true) {
+    await new Promise(r => setTimeout(r, 3000));
+    const statusResp = await axios.get(`https://api.assemblyai.com/v2/transcript/${id}`, {
+      headers: { authorization: assemblyKey }
+    });
+    if (statusResp.data.status === "completed") return statusResp.data.text;
+    if (statusResp.data.status === "failed") throw new Error("AssemblyAI transcription failed");
+  }
+}
+
+/**
+ * OpenAI text moderation
+ */
+async function moderateTextWithOpenAI(text) {
+  const resp = await openai.moderations.create({ model: "omni-moderation-latest", input: text });
+  const result = resp.results?.[0] || {};
+  const categories = result.categories || {};
+  const trueCount = Object.values(categories).filter(Boolean).length;
+  const categoryCount = Object.keys(categories).length || 1;
+  const toxicityScore = trueCount / categoryCount;
+  return { flagged: result.flagged || false, categories, toxicityScore, raw: result };
+}
+
+/**
+ * Full moderation pipeline
+ */
+export async function moderateVideoPipeline({ key, isForKids }) {
+  const tmpFile = await downloadS3ToTempFile(key);
+  try {
+    // 1) Extract thumbnails
+    const thumbnails = await extractThumbnails(tmpFile, 3);
+
+    // 2) TODO: Image moderation (SightEngine / DeepAI / Rekognition)
+    // For now we skip image moderation in this snippet; implement as needed
+
+    // 3) Transcribe audio
+    const transcript = await transcribeWithAssembly(tmpFile);
+
+    // 4) Text moderation
+    const textMod = await moderateTextWithOpenAI(transcript);
+
+    if (textMod.flagged && textMod.toxicityScore > 0.5) {
+      return { safe: false, reason: "text_flagged", transcript, textMod, thumbnails };
+    }
+
+    // 5) Kids stricter logic
+    if (isForKids) {
+      // add stricter thresholds if needed
+    }
+
+    return { safe: true, autoPublish: true, transcript, textMod, thumbnails };
+  } finally {
+    await fs.rm(tmpFile, { force: true }).catch(() => {});
+  }
+}
+
 // --- Signup/Login routes ---
 
 app.post("/signup", async (req, res) => {
