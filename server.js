@@ -459,6 +459,13 @@ app.post("/signup", async (req, res) => {
     if (existingUser.rows.length > 0) {
       return res.status(400).json({ error: "Email already registered" });
     }
+    const existingUserByName = await pool.query(
+  "SELECT id FROM users WHERE username = $1",
+  [username]
+);
+if (existingUserByName.rows.length > 0) {
+  return res.status(400).json({ error: "Username already taken" });
+}
     const hashed = await bcrypt.hash(password, 12);
     const { rows } = await pool.query(
       `INSERT INTO users 
