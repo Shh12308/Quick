@@ -323,6 +323,146 @@ async function downloadS3ToTempFile(key) {
   return tmpPath;
 }
 
+const sequelize = new Sequelize(process.env.DATABASE_URL, {
+  dialect: "postgres",
+  logging: false,
+});
+
+// -------------------- MODELS --------------------
+const User = sequelize.define("User", {
+  username: { type: DataTypes.STRING, unique: true },
+  displayName: DataTypes.STRING,
+  profilePicture: DataTypes.STRING,
+  coverPhoto: DataTypes.STRING,
+  isLive: { type: DataTypes.BOOLEAN, defaultValue: false },
+  liveStreamId: DataTypes.STRING,
+  followers: { type: DataTypes.ARRAY(DataTypes.INTEGER), defaultValue: [] },
+  following: { type: DataTypes.ARRAY(DataTypes.INTEGER), defaultValue: [] },
+});
+
+const Story = sequelize.define("Story", {
+  media: DataTypes.STRING, // S3 URL
+  expiresAt: DataTypes.DATE,
+  reactions: { type: DataTypes.JSONB, defaultValue: [] },
+});
+
+const Highlight = sequelize.define("Highlight", {
+  title: DataTypes.STRING,
+  cover: DataTypes.STRING,
+});
+
+User.hasMany(Story);
+Story.belongsTo(User);
+
+User.hasMany(Highlight);
+Highlight.belongsTo(User);
+
+Highlight.hasMany(Story);
+Story.belongsTo(Highlight, { as: "highlight" });
+
+// Sync DB
+await sequelize.sync({ alter: true });
+console.log("Database synced");
+
+// -------------------- AWS S3 --------------------
+const s3 = new AWS.S3({
+  accessKeyId: process.env.AWS_ACCESS_KEY,
+  secretAccessKey: process.env.AWS_SECRET_KEY,
+  region: process.env.AWS_REGION,
+});
+
+const upload = multer({
+  storage: multerS3({
+    s3,
+    bucket: process.env.AWS_BUCKET,
+    acl: "public-read",
+    key: (req, file, cb) => {
+      const filename = `stories/${Date.now()}_${file.originalname}`;
+      cb(null, filename);
+    },
+  }),
+});
+
+// -------------------- ROUTES --------------------
+
+// Get user profile
+app.get("/api/users/:username", async (req, res) => {
+  const user = await User.findOne({ where: { username: req.params.username } });
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  const stories = await Story.findAll({
+    where: { UserId: user.id, expiresAt: { [Op.gt]: new Date() } },
+  });
+
+  const highlights = await Highlight.findAll({
+    where: { UserId: user.id },
+    include: Story,
+  });
+
+  res.json({
+    user,
+    stories,
+    highlights,
+    followers: user.followers,
+    following: user.following,
+  });
+});
+
+// Follow / unfollow user
+app.post("/api/users/:id/follow", async (req, res) => {
+  const { currentUserId } = req.body;
+  const user = await User.findByPk(req.params.id);
+  const currentUser = await User.findByPk(currentUserId);
+  if (!user || !currentUser) return res.status(404).json({ error: "User not found" });
+
+  if (!user.followers.includes(currentUserId)) user.followers.push(currentUserId);
+  if (!currentUser.following.includes(user.id)) currentUser.following.push(user.id);
+
+  await user.save();
+  await currentUser.save();
+
+  res.json({ success: true });
+});
+
+// Upload story
+app.post("/api/stories", upload.single("media"), async (req, res) => {
+  const { userId } = req.body;
+  const story = await Story.create({
+    media: req.file.location,
+    UserId: userId,
+    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24h expiration
+  });
+  res.json(story);
+});
+
+// React to story
+app.post("/api/stories/:id/react", async (req, res) => {
+  const { emoji, userId } = req.body;
+  const story = await Story.findByPk(req.params.id);
+  if (!story) return res.status(404).json({ error: "Story not found" });
+
+  story.reactions.push({ emoji, userId });
+  await story.save();
+
+  res.json(story);
+});
+
+// Add highlight
+app.post("/api/highlights", async (req, res) => {
+  const { userId, title, cover, storyIds } = req.body;
+  const highlight = await Highlight.create({ title, cover, UserId: userId });
+  if (storyIds && storyIds.length > 0) {
+    const stories = await Story.findAll({ where: { id: storyIds } });
+    await highlight.setStories(stories);
+  }
+  res.json(highlight);
+});
+
+// Auto-delete expired stories every hour
+setInterval(async () => {
+  await Story.destroy({ where: { expiresAt: { [Op.lt]: new Date() } } });
+}, 60 * 60 * 1000);
+
 /**
  * Extract N thumbnails using ffmpeg
  */
