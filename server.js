@@ -285,8 +285,6 @@ function calculateEarningsFromDeltas({ likesDelta = 0, followsDelta = 0, viewsDe
 
 // moderationPipelineFull.js
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
-import fs from "fs/promises";
-import path from "path";
 import os from "os";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
