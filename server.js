@@ -585,59 +585,73 @@ export async function moderateVideoPipeline({ key, isForKids }) {
   }
 }
 
-// --- Signup/Login routes ---
+const liveStreams = {};
 
-app.post("/signup", async (req, res) => {
-  try {
-    const { username, email, password } = req.body;
-    if (!username || !email || !password) {
-      return res.status(400).json({ error: "Missing fields" });
-    }
-    const existingUser = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
-    if (existingUser.rows.length > 0) {
-      return res.status(400).json({ error: "Email already registered" });
-    }
-    const existingUserByName = await pool.query(
-  "SELECT id FROM users WHERE username = $1",
-  [username]
-);
-if (existingUserByName.rows.length > 0) {
-  return res.status(400).json({ error: "Username already taken" });
-}
-    const hashed = await bcrypt.hash(password, 12);
-    const { rows } = await pool.query(
-      `INSERT INTO users 
-       (username, email, password_hash, role, subscription_plan, is_musician, is_creator, is_admin, created_at)
-       VALUES ($1, $2, $3, 'free', 'free', false, false, false, NOW())
-       RETURNING id, username, email, role, subscription_plan, is_musician, is_creator, is_admin, created_at`,
-      [username, email, hashed]
-    );
-    const user = rows[0];
-    await ensureCreatorStats(user.id);
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
-    res.json({ message: "Signed up successfully", user, token });
-  } catch (err) {
-    console.error("Signup error:", err);
-    res.status(500).json({ error: "Signup failed" });
-  }
-});
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.id);
 
-app.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-    const user = rows[0];
-    if (!user) return res.status(400).json({ error: "Invalid credentials" });
-    if (!user.password_hash) return res.status(400).json({ error: "Set a password or use OAuth" });
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(400).json({ error: "Invalid credentials" });
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
-    res.json({ message: "Logged in", user, token });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Login failed" });
-  }
-});
+  // ───────── Join Stream ─────────
+  socket.on("join-stream", (streamId) => {
+    socket.join(streamId);
+
+    if (!liveStreams[streamId]) liveStreams[streamId] = { viewers: new Set(), joinRequests: [] };
+    liveStreams[streamId].viewers.add(socket.id);
+
+    // broadcast viewer count
+    io.to(streamId).emit("viewer-count", liveStreams[streamId].viewers.size);
+  });
+
+  // ───────── Chat ─────────
+  socket.on("chat-message", ({ streamId, text, user }) => {
+    io.to(streamId).emit("chat-message", { user, text });
+  });
+
+  // ───────── Reactions ─────────
+  socket.on("reaction", ({ streamId, emoji }) => {
+    io.to(streamId).emit("reaction", emoji);
+  });
+
+  // ───────── Gifts ─────────
+  socket.on("gift-received", (gift) => {
+    const { streamId } = gift;
+    io.to(streamId).emit("gift-received", gift);
+  });
+
+  // ───────── Viewer Join Requests ─────────
+  socket.on("join-request", ({ streamId, user }) => {
+    if (!liveStreams[streamId]) liveStreams[streamId] = { viewers: new Set(), joinRequests: [] };
+
+    liveStreams[streamId].joinRequests.push({ socketId: socket.id, username: user.username, userId: user.id });
+    io.to(streamId).emit("join-request", { socketId: socket.id, username: user.username, userId: user.id });
+  });
+
+  socket.on("accept-join", ({ streamId, userId }) => {
+    const reqIndex = liveStreams[streamId].joinRequests.findIndex(r => r.userId === userId);
+    if (reqIndex !== -1) {
+      const req = liveStreams[streamId].joinRequests[reqIndex];
+      io.to(req.socketId).emit("join-accepted");
+      liveStreams[streamId].joinRequests.splice(reqIndex, 1);
+    }
+  });
+
+  socket.on("reject-join", ({ streamId, userId }) => {
+    const reqIndex = liveStreams[streamId].joinRequests.findIndex(r => r.userId === userId);
+    if (reqIndex !== -1) {
+      const req = liveStreams[streamId].joinRequests[reqIndex];
+      io.to(req.socketId).emit("join-rejected");
+      liveStreams[streamId].joinRequests.splice(reqIndex, 1);
+    }
+  });
+
+  // ───────── Disconnect ─────────
+  socket.on("disconnect", () => {
+    console.log("User disconnected:", socket.id);
+    for (const streamId in liveStreams) {
+      liveStreams[streamId].viewers.delete(socket.id);
+      io.to(streamId).emit("viewer-count", liveStreams[streamId].viewers.size);
+    }
+  });
+})
 
 // OAuth routes: Google
 app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
@@ -710,17 +724,34 @@ app.post("/subscribe", authMiddleware, async (req, res) => {
   }
 });
 
-// Creator/Musician role verification
+// POST /api/verify-role
 app.post("/verify-role", authMiddleware, async (req, res) => {
   try {
     const { type } = req.body; // "musician" or "creator"
     const userId = req.user.id;
+
+    // Fetch DOB to ensure 18+
+    const { rows: userRows } = await pool.query(
+      `SELECT dob FROM users WHERE id=$1`,
+      [userId]
+    );
+
+    if (!userRows[0] || !userRows[0].dob) {
+      return res.status(400).json({ error: "DOB not provided" });
+    }
+
+    const birthDate = new Date(userRows[0].dob);
+    const age = new Date().getFullYear() - birthDate.getFullYear();
+    if (age < 18) return res.status(403).json({ error: "Must be 18 or older to verify role" });
+
     const field = type === "musician" ? "is_musician" : "is_creator";
     const { rows } = await pool.query(
       `UPDATE users SET ${field}=true, updated_at=NOW() WHERE id=$1 RETURNING *`,
       [userId]
     );
-    await ensureCreatorStats(userId);
+
+    await ensureCreatorStats(userId); // your existing helper
+
     res.json({ message: `${type} verified`, user: rows[0] });
   } catch (err) {
     console.error(err);
