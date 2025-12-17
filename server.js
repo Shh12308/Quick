@@ -1,7 +1,7 @@
 // server.js
 import express from "express";
 import pg from "pg";
-import bcrypt from "bcryptjs";
+import argon2 from "argon2";
 import jwt from "jsonwebtoken";
 import passport from "passport";
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
@@ -18,6 +18,13 @@ import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
 import { v4 as uuidv4 } from "uuid";
 import { ExpressPeerServer } from "peer";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import os from "os";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegPath from "ffmpeg-static";
+import axios from "axios";
+import OpenAI from "openai";
+import FormData from "form-data";
 
 const { RtcRole, RtcTokenBuilder } = pkg;
 
@@ -283,16 +290,6 @@ function calculateEarningsFromDeltas({ likesDelta = 0, followsDelta = 0, viewsDe
   return { total, breakdown: { fromLikes, fromFollows, fromViews, tips: Number(tips), merch: Number(merch) } };
 }
 
-// moderationPipelineFull.js
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
-import os from "os";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";
-import { v4 as uuidv4 } from "uuid";
-import axios from "axios";
-import OpenAI from "openai";
-import FormData from "form-data";
-
 // Configure ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -320,146 +317,6 @@ async function downloadS3ToTempFile(key) {
   });
   return tmpPath;
 }
-
-const sequelize = new Sequelize(process.env.DATABASE_URL, {
-  dialect: "postgres",
-  logging: false,
-});
-
-// -------------------- MODELS --------------------
-const User = sequelize.define("User", {
-  username: { type: DataTypes.STRING, unique: true },
-  displayName: DataTypes.STRING,
-  profilePicture: DataTypes.STRING,
-  coverPhoto: DataTypes.STRING,
-  isLive: { type: DataTypes.BOOLEAN, defaultValue: false },
-  liveStreamId: DataTypes.STRING,
-  followers: { type: DataTypes.ARRAY(DataTypes.INTEGER), defaultValue: [] },
-  following: { type: DataTypes.ARRAY(DataTypes.INTEGER), defaultValue: [] },
-});
-
-const Story = sequelize.define("Story", {
-  media: DataTypes.STRING, // S3 URL
-  expiresAt: DataTypes.DATE,
-  reactions: { type: DataTypes.JSONB, defaultValue: [] },
-});
-
-const Highlight = sequelize.define("Highlight", {
-  title: DataTypes.STRING,
-  cover: DataTypes.STRING,
-});
-
-User.hasMany(Story);
-Story.belongsTo(User);
-
-User.hasMany(Highlight);
-Highlight.belongsTo(User);
-
-Highlight.hasMany(Story);
-Story.belongsTo(Highlight, { as: "highlight" });
-
-// Sync DB
-await sequelize.sync({ alter: true });
-console.log("Database synced");
-
-// -------------------- AWS S3 --------------------
-const s3 = new AWS.S3({
-  accessKeyId: process.env.AWS_ACCESS_KEY,
-  secretAccessKey: process.env.AWS_SECRET_KEY,
-  region: process.env.AWS_REGION,
-});
-
-const upload = multer({
-  storage: multerS3({
-    s3,
-    bucket: process.env.AWS_BUCKET,
-    acl: "public-read",
-    key: (req, file, cb) => {
-      const filename = `stories/${Date.now()}_${file.originalname}`;
-      cb(null, filename);
-    },
-  }),
-});
-
-// -------------------- ROUTES --------------------
-
-// Get user profile
-app.get("/api/users/:username", async (req, res) => {
-  const user = await User.findOne({ where: { username: req.params.username } });
-  if (!user) return res.status(404).json({ error: "User not found" });
-
-  const stories = await Story.findAll({
-    where: { UserId: user.id, expiresAt: { [Op.gt]: new Date() } },
-  });
-
-  const highlights = await Highlight.findAll({
-    where: { UserId: user.id },
-    include: Story,
-  });
-
-  res.json({
-    user,
-    stories,
-    highlights,
-    followers: user.followers,
-    following: user.following,
-  });
-});
-
-// Follow / unfollow user
-app.post("/api/users/:id/follow", async (req, res) => {
-  const { currentUserId } = req.body;
-  const user = await User.findByPk(req.params.id);
-  const currentUser = await User.findByPk(currentUserId);
-  if (!user || !currentUser) return res.status(404).json({ error: "User not found" });
-
-  if (!user.followers.includes(currentUserId)) user.followers.push(currentUserId);
-  if (!currentUser.following.includes(user.id)) currentUser.following.push(user.id);
-
-  await user.save();
-  await currentUser.save();
-
-  res.json({ success: true });
-});
-
-// Upload story
-app.post("/api/stories", upload.single("media"), async (req, res) => {
-  const { userId } = req.body;
-  const story = await Story.create({
-    media: req.file.location,
-    UserId: userId,
-    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24h expiration
-  });
-  res.json(story);
-});
-
-// React to story
-app.post("/api/stories/:id/react", async (req, res) => {
-  const { emoji, userId } = req.body;
-  const story = await Story.findByPk(req.params.id);
-  if (!story) return res.status(404).json({ error: "Story not found" });
-
-  story.reactions.push({ emoji, userId });
-  await story.save();
-
-  res.json(story);
-});
-
-// Add highlight
-app.post("/api/highlights", async (req, res) => {
-  const { userId, title, cover, storyIds } = req.body;
-  const highlight = await Highlight.create({ title, cover, UserId: userId });
-  if (storyIds && storyIds.length > 0) {
-    const stories = await Story.findAll({ where: { id: storyIds } });
-    await highlight.setStories(stories);
-  }
-  res.json(highlight);
-});
-
-// Auto-delete expired stories every hour
-setInterval(async () => {
-  await Story.destroy({ where: { expiresAt: { [Op.lt]: new Date() } } });
-}, 60 * 60 * 1000);
 
 /**
  * Extract N thumbnails using ffmpeg
@@ -586,72 +443,6 @@ export async function moderateVideoPipeline({ key, isForKids }) {
 }
 
 const liveStreams = {};
-
-io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
-
-  // ───────── Join Stream ─────────
-  socket.on("join-stream", (streamId) => {
-    socket.join(streamId);
-
-    if (!liveStreams[streamId]) liveStreams[streamId] = { viewers: new Set(), joinRequests: [] };
-    liveStreams[streamId].viewers.add(socket.id);
-
-    // broadcast viewer count
-    io.to(streamId).emit("viewer-count", liveStreams[streamId].viewers.size);
-  });
-
-  // ───────── Chat ─────────
-  socket.on("chat-message", ({ streamId, text, user }) => {
-    io.to(streamId).emit("chat-message", { user, text });
-  });
-
-  // ───────── Reactions ─────────
-  socket.on("reaction", ({ streamId, emoji }) => {
-    io.to(streamId).emit("reaction", emoji);
-  });
-
-  // ───────── Gifts ─────────
-  socket.on("gift-received", (gift) => {
-    const { streamId } = gift;
-    io.to(streamId).emit("gift-received", gift);
-  });
-
-  // ───────── Viewer Join Requests ─────────
-  socket.on("join-request", ({ streamId, user }) => {
-    if (!liveStreams[streamId]) liveStreams[streamId] = { viewers: new Set(), joinRequests: [] };
-
-    liveStreams[streamId].joinRequests.push({ socketId: socket.id, username: user.username, userId: user.id });
-    io.to(streamId).emit("join-request", { socketId: socket.id, username: user.username, userId: user.id });
-  });
-
-  socket.on("accept-join", ({ streamId, userId }) => {
-    const reqIndex = liveStreams[streamId].joinRequests.findIndex(r => r.userId === userId);
-    if (reqIndex !== -1) {
-      const req = liveStreams[streamId].joinRequests[reqIndex];
-      io.to(req.socketId).emit("join-accepted");
-      liveStreams[streamId].joinRequests.splice(reqIndex, 1);
-    }
-  });
-
-  socket.on("reject-join", ({ streamId, userId }) => {
-    const reqIndex = liveStreams[streamId].joinRequests.findIndex(r => r.userId === userId);
-    if (reqIndex !== -1) {
-      const req = liveStreams[streamId].joinRequests[reqIndex];
-      io.to(req.socketId).emit("join-rejected");
-      liveStreams[streamId].joinRequests.splice(reqIndex, 1);
-    }
-  });
-
-  // ───────── Disconnect ─────────
-  socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
-    for (const streamId in liveStreams) {
-      liveStreams[streamId].viewers.delete(socket.id);
-      io.to(streamId).emit("viewer-count", liveStreams[streamId].viewers.size);
-    }
-  });
-})
 
 // OAuth routes: Google
 app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
@@ -1055,7 +846,7 @@ function isUserBlocked(userRow, deviceIdFromClient) {
     return { blocked: true, type: "suspended", until: userRow.suspend_until, reason: userRow.suspension_reason || "Temporary suspension" };
   }
 
-  // Optional device mismatch block: if user row has a device_id and it differs from the client (this is stricter)
+  // Optional device mismatch block: if user row has a device_id and it differs from client (this is stricter)
   if (userRow.device_id && deviceIdFromClient && userRow.device_id !== deviceIdFromClient) {
     // This check is optional — some implementations avoid blocking on mismatch to allow multiple devices.
     return { blocked: true, type: "device_mismatch", reason: "Device not recognized" };
@@ -1075,7 +866,14 @@ app.post("/signup", async (req, res) => {
     const existingUser = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
     if (existingUser.rows.length > 0) return res.status(400).json({ error: "Email already registered" });
 
-    const hashed = await bcrypt.hash(password, 12);
+    // Using argon2 instead of bcrypt
+    const hashed = await argon2.hash(password, {
+      type: argon2.argon2id,
+      memoryCost: 2 ** 16,
+      timeCost: 3,
+      parallelism: 1,
+    });
+    
     const { rows } = await pool.query(
       `INSERT INTO users 
        (username, email, password_hash, phone, device_id, role, subscription_plan, is_musician, is_creator, is_admin, status, created_at)
@@ -1121,7 +919,9 @@ app.post("/login", async (req, res) => {
     }
 
     if (!refreshed.password_hash) return res.status(400).json({ error: "Set a password or use OAuth" });
-    const valid = await bcrypt.compare(password, refreshed.password_hash);
+    
+    // Using argon2 instead of bcrypt
+    const valid = await argon2.verify(refreshed.password_hash, password);
     if (!valid) return res.status(400).json({ error: "Invalid credentials" });
 
     // Save device_id if not set (optional) — won't overwrite if already present
@@ -1198,7 +998,7 @@ async function completeOAuthLogin(req, res, oauthUser) {
 
     // Issue JWT and redirect back to frontend with token
     const token = jwt.sign({ id: userRow.id, email: userRow.email, role: userRow.role }, JWT_SECRET, { expiresIn: "7d" });
-    // Adjust the redirect target to fit your app (welcome.html previously used)
+    // Adjust redirect target to fit your app (welcome.html previously used)
     return res.redirect(`${FRONTEND_URL}/welcome.html?token=${token}`);
   } catch (err) {
     console.error("completeOAuthLogin error:", err);
@@ -1214,14 +1014,14 @@ app.get(
   "/auth/google/callback",
   passport.authenticate("google", { failureRedirect: "/", session: false }),
   async (req, res) => {
-    // `req.user` is the user returned by your passport strategy function (you already insert/find the user there).
+    // `req.user` is user returned by your passport strategy function (you already insert/find user there).
     // However to centralize ban checking we re-fetch and complete login
     // Try to get device_id from query or cookie (client should include it)
     const device_id = req.query.device_id || req.cookies?.device_id || null;
     const phone = req.query.phone || null;
     // If passport stored profile in req.user (from your strategy), use it; otherwise fetch by email
     const email = req.user?.email;
-    await completeOAuthLogin(res.req, res, { email, username: req.user?.username || req.user?.displayName, provider: "google", device_id, phone });
+    await completeOAuthLogin(req, res, { email, username: req.user?.username || req.user?.displayName, provider: "google", device_id, phone });
   }
 );
 
@@ -1233,7 +1033,7 @@ app.get(
     const device_id = req.query.device_id || req.cookies?.device_id || null;
     const phone = req.query.phone || null;
     const email = req.user?.email;
-    await completeOAuthLogin(res.req, res, { email, username: req.user?.username, provider: "discord", device_id, phone });
+    await completeOAuthLogin(req, res, { email, username: req.user?.username, provider: "discord", device_id, phone });
   }
 );
 
@@ -1244,7 +1044,7 @@ app.get(
     const device_id = req.query.device_id || req.cookies?.device_id || null;
     const phone = req.query.phone || null;
     const email = req.user?.email || `${req.user?.username}@github.local`;
-    await completeOAuthLogin(res.req, res, { email, username: req.user?.username, provider: "github", device_id, phone });
+    await completeOAuthLogin(req, res, { email, username: req.user?.username, provider: "github", device_id, phone });
   }
 );
 
