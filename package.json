@@ -18,7 +18,7 @@
     "express-session": "^1.17.3",
     "ffmpeg-static": "^5.1.0",
     "fluent-ffmpeg": "^2.1.2",
-    "form-data": "^4.1.0",
+    "form-data": "^4.0.0",
     "passport-google-oauth20": "^2.0.0",
     "github2": "^0.1.12",
     "jsonwebtoken": "^9.0.2",
