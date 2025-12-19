@@ -1193,6 +1193,211 @@ async function recalcCreatorEarnings(userId) {
   await pool.query("UPDATE users SET earnings = $1 WHERE id=$2", [calc.total, userId]);
 }
 
+# ===============================
+# PROFILE / USER
+# ===============================
+
+@app.get("/api/users/{username}")
+async def get_user_profile(username: str):
+    user = await db.fetch_one(
+        "SELECT * FROM users WHERE username=:u",
+        {"u": username}
+    )
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    stories = await db.fetch_all(
+        "SELECT * FROM stories WHERE user_id=:id ORDER BY created_at DESC",
+        {"id": user["id"]}
+    )
+
+    highlights = await db.fetch_all(
+        "SELECT * FROM highlights WHERE user_id=:id",
+        {"id": user["id"]}
+    )
+
+    followers = await db.fetch_all(
+        "SELECT u.* FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.following_id=:id",
+        {"id": user["id"]}
+    )
+
+    following = await db.fetch_all(
+        "SELECT u.* FROM follows f JOIN users u ON u.id=f.following_id WHERE f.follower_id=:id",
+        {"id": user["id"]}
+    )
+
+    return {
+        "user": dict(user),
+        "stories": stories,
+        "highlights": highlights,
+        "followers": followers,
+        "following": following
+    }
+
+
+# ===============================
+# FOLLOW / UNFOLLOW
+# ===============================
+
+@app.post("/api/follow/{user_id}")
+async def follow_user(
+    user_id: str,
+    action: str = Body(...),
+    current=Depends(get_current_user)
+):
+    if action == "follow":
+        await db.execute(
+            "INSERT INTO follows VALUES (:f,:t) ON CONFLICT DO NOTHING",
+            {"f": current.id, "t": user_id}
+        )
+    else:
+        await db.execute(
+            "DELETE FROM follows WHERE follower_id=:f AND following_id=:t",
+            {"f": current.id, "t": user_id}
+        )
+    return {"status": "ok"}
+
+
+# ===============================
+# STORIES
+# ===============================
+
+@app.post("/api/stories")
+async def create_story(
+    media: str = Body(...),
+    type: str = Body(...),
+    current=Depends(get_current_user)
+):
+    await db.execute(
+        "INSERT INTO stories (id,user_id,media,type) VALUES (gen_random_uuid(),:u,:m,:t)",
+        {"u": current.id, "m": media, "t": type}
+    )
+    return {"status": "created"}
+
+
+@app.post("/api/stories/{story_id}/react")
+async def react_story(
+    story_id: str,
+    emoji: str = Body(...),
+    current=Depends(get_current_user)
+):
+    await db.execute(
+        """
+        INSERT INTO story_reactions (story_id,user_id,emoji)
+        VALUES (:s,:u,:e)
+        ON CONFLICT DO NOTHING
+        """,
+        {"s": story_id, "u": current.id, "e": emoji}
+    )
+    return {"status": "reacted"}
+
+
+@app.delete("/api/stories/{story_id}")
+async def delete_story(
+    story_id: str,
+    current=Depends(get_current_user)
+):
+    await db.execute(
+        "DELETE FROM stories WHERE id=:s AND user_id=:u",
+        {"s": story_id, "u": current.id}
+    )
+    return {"status": "deleted"}
+
+
+# ===============================
+# HIGHLIGHTS
+# ===============================
+
+@app.post("/api/highlights")
+async def create_highlight(
+    title: str = Body(...),
+    storyIds: list[str] = Body(...),
+    cover: str = Body(...),
+    current=Depends(get_current_user)
+):
+    hid = str(uuid4())
+
+    await db.execute(
+        "INSERT INTO highlights VALUES (:i,:u,:t,:c)",
+        {"i": hid, "u": current.id, "t": title, "c": cover}
+    )
+
+    for sid in storyIds:
+        await db.execute(
+            "INSERT INTO highlight_stories VALUES (:h,:s)",
+            {"h": hid, "s": sid}
+        )
+
+    return {"status": "created"}
+
+
+# ===============================
+# CONTENT TABS
+# ===============================
+
+@app.get("/api/users/{username}/videos")
+async def user_videos(username: str):
+    return await db.fetch_all(
+        "SELECT * FROM videos WHERE username=:u",
+        {"u": username}
+    )
+
+
+@app.get("/api/users/{username}/shorts")
+async def user_shorts(username: str):
+    return await db.fetch_all(
+        "SELECT * FROM shorts WHERE username=:u",
+        {"u": username}
+    )
+
+
+@app.get("/api/users/{username}/music")
+async def user_music(username: str):
+    return await db.fetch_all(
+        "SELECT * FROM music WHERE username=:u",
+        {"u": username}
+    )
+
+
+# ===============================
+# LIVE STREAM
+# ===============================
+
+@app.post("/api/live/start")
+async def start_live(current=Depends(get_current_user)):
+    lid = str(uuid4())
+    await db.execute(
+        "INSERT INTO live_streams VALUES (:l,:u,TRUE)",
+        {"l": lid, "u": current.id}
+    )
+    return {"liveStreamId": lid}
+
+
+@app.post("/api/live/end")
+async def end_live(current=Depends(get_current_user)):
+    await db.execute(
+        "UPDATE live_streams SET active=FALSE WHERE user_id=:u",
+        {"u": current.id}
+    )
+    return {"status": "ended"}
+
+
+# ===============================
+# ACCOUNT SWITCHER
+# ===============================
+
+@app.get("/api/accounts")
+async def get_accounts(current=Depends(get_current_user)):
+    return await db.fetch_all(
+        "SELECT * FROM accounts WHERE owner_id=:u",
+        {"u": current.owner_id}
+    )
+
+
+@app.post("/api/accounts/switch")
+async def switch_account(accountId: str = Body(...)):
+    return {"activeAccount": accountId}
+
 // --- Verification upload ---
 
 app.post("/verify", authMiddleware, upload.single("image"), async (req, res) => {
