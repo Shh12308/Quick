@@ -1193,210 +1193,248 @@ async function recalcCreatorEarnings(userId) {
   await pool.query("UPDATE users SET earnings = $1 WHERE id=$2", [calc.total, userId]);
 }
 
-# ===============================
-# PROFILE / USER
-# ===============================
+app.get("/api/users/:username", async (req, res) => {
+  try {
+    const { username } = req.params;
 
-@app.get("/api/users/{username}")
-async def get_user_profile(username: str):
-    user = await db.fetch_one(
-        "SELECT * FROM users WHERE username=:u",
-        {"u": username}
-    )
-    if not user:
-        raise HTTPException(404, "User not found")
+    const user = await db.oneOrNone(
+      "SELECT * FROM users WHERE username = $1",
+      [username]
+    );
 
-    stories = await db.fetch_all(
-        "SELECT * FROM stories WHERE user_id=:id ORDER BY created_at DESC",
-        {"id": user["id"]}
-    )
+    if (!user) return res.status(404).json({ error: "User not found" });
 
-    highlights = await db.fetch_all(
-        "SELECT * FROM highlights WHERE user_id=:id",
-        {"id": user["id"]}
-    )
+    const stories = await db.any(
+      "SELECT * FROM stories WHERE user_id = $1 ORDER BY created_at DESC",
+      [user.id]
+    );
 
-    followers = await db.fetch_all(
-        "SELECT u.* FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.following_id=:id",
-        {"id": user["id"]}
-    )
+    const highlights = await db.any(
+      "SELECT * FROM highlights WHERE user_id = $1",
+      [user.id]
+    );
 
-    following = await db.fetch_all(
-        "SELECT u.* FROM follows f JOIN users u ON u.id=f.following_id WHERE f.follower_id=:id",
-        {"id": user["id"]}
-    )
+    const followers = await db.any(
+      `SELECT u.* FROM follows f
+       JOIN users u ON u.id = f.follower_id
+       WHERE f.following_id = $1`,
+      [user.id]
+    );
 
-    return {
-        "user": dict(user),
-        "stories": stories,
-        "highlights": highlights,
-        "followers": followers,
-        "following": following
+    const following = await db.any(
+      `SELECT u.* FROM follows f
+       JOIN users u ON u.id = f.following_id
+       WHERE f.follower_id = $1`,
+      [user.id]
+    );
+
+    res.json({
+      user,
+      stories,
+      highlights,
+      followers,
+      following
+    });
+  } catch (e) {
+    res.status(500).json({ error: "profile_failed" });
+  }
+});
+
+/* ===============================
+   FOLLOW / UNFOLLOW
+=============================== */
+app.post("/api/follow/:userId", authMiddleware, async (req, res) => {
+  const { userId } = req.params;
+  const { action } = req.body;
+  const current = req.user;
+
+  try {
+    if (action === "follow") {
+      await db.none(
+        "INSERT INTO follows (follower_id, following_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+        [current.id, userId]
+      );
+    } else {
+      await db.none(
+        "DELETE FROM follows WHERE follower_id=$1 AND following_id=$2",
+        [current.id, userId]
+      );
     }
 
+    res.json({ status: "ok" });
+  } catch {
+    res.status(500).json({ error: "follow_failed" });
+  }
+});
 
-# ===============================
-# FOLLOW / UNFOLLOW
-# ===============================
+/* ===============================
+   STORIES
+=============================== */
+/* --- OLD STORY ENDPOINT (optional for legacy frontend) --- */
+app.post("/api/stories", authMiddleware, async (req, res) => {
+  const { media, type } = req.body;
+  const current = req.user;
 
-@app.post("/api/follow/{user_id}")
-async def follow_user(
-    user_id: str,
-    action: str = Body(...),
-    current=Depends(get_current_user)
-):
-    if action == "follow":
-        await db.execute(
-            "INSERT INTO follows VALUES (:f,:t) ON CONFLICT DO NOTHING",
-            {"f": current.id, "t": user_id}
-        )
-    else:
-        await db.execute(
-            "DELETE FROM follows WHERE follower_id=:f AND following_id=:t",
-            {"f": current.id, "t": user_id}
-        )
-    return {"status": "ok"}
+  await db.none(
+    "INSERT INTO stories (id, user_id, media, type) VALUES (gen_random_uuid(), $1, $2, $3)",
+    [current.id, media, type]
+  );
 
+  res.json({ status: "created" });
+});
 
-# ===============================
-# STORIES
-# ===============================
+/* --- REACT TO STORY --- */
+app.post("/api/stories/:storyId/react", authMiddleware, async (req, res) => {
+  const { storyId } = req.params;
+  const { emoji } = req.body;
+  const current = req.user;
 
-@app.post("/api/stories")
-async def create_story(
-    media: str = Body(...),
-    type: str = Body(...),
-    current=Depends(get_current_user)
-):
-    await db.execute(
-        "INSERT INTO stories (id,user_id,media,type) VALUES (gen_random_uuid(),:u,:m,:t)",
-        {"u": current.id, "m": media, "t": type}
-    )
-    return {"status": "created"}
+  await db.none(
+    `INSERT INTO story_reactions (story_id, user_id, emoji)
+     VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+    [storyId, current.id, emoji]
+  );
 
+  res.json({ status: "reacted" });
+});
 
-@app.post("/api/stories/{story_id}/react")
-async def react_story(
-    story_id: str,
-    emoji: str = Body(...),
-    current=Depends(get_current_user)
-):
-    await db.execute(
-        """
-        INSERT INTO story_reactions (story_id,user_id,emoji)
-        VALUES (:s,:u,:e)
-        ON CONFLICT DO NOTHING
-        """,
-        {"s": story_id, "u": current.id, "e": emoji}
-    )
-    return {"status": "reacted"}
+/* --- DELETE STORY --- */
+app.delete("/api/stories/:storyId", authMiddleware, async (req, res) => {
+  const { storyId } = req.params;
+  const current = req.user;
 
+  await db.none(
+    "DELETE FROM stories WHERE id=$1 AND user_id=$2",
+    [storyId, current.id]
+  );
 
-@app.delete("/api/stories/{story_id}")
-async def delete_story(
-    story_id: str,
-    current=Depends(get_current_user)
-):
-    await db.execute(
-        "DELETE FROM stories WHERE id=:s AND user_id=:u",
-        {"s": story_id, "u": current.id}
-    )
-    return {"status": "deleted"}
+  res.json({ status: "deleted" });
+});
 
+/* --- UPLOAD STORY TO AWS S3 --- */
+app.post(
+  "/api/stories/upload",
+  authMiddleware,
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-# ===============================
-# HIGHLIGHTS
-# ===============================
+      const current = req.user;
+      const ext = path.extname(req.file.originalname);
+      const fileKey = `stories/${current.id}/${uuidv4()}${ext}`;
 
-@app.post("/api/highlights")
-async def create_highlight(
-    title: str = Body(...),
-    storyIds: list[str] = Body(...),
-    cover: str = Body(...),
-    current=Depends(get_current_user)
-):
-    hid = str(uuid4())
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: process.env.AWS_S3_BUCKET,
+          Key: fileKey,
+          Body: req.file.buffer,
+          ContentType: req.file.mimetype,
+          ACL: "public-read",
+        })
+      );
 
-    await db.execute(
-        "INSERT INTO highlights VALUES (:i,:u,:t,:c)",
-        {"i": hid, "u": current.id, "t": title, "c": cover}
-    )
+      const mediaUrl = `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileKey}`;
+      const type = req.file.mimetype.startsWith("video") ? "video" : "image";
 
-    for sid in storyIds:
-        await db.execute(
-            "INSERT INTO highlight_stories VALUES (:h,:s)",
-            {"h": hid, "s": sid}
-        )
+      const story = await db.one(
+        "INSERT INTO stories (id, user_id, media, type) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING *",
+        [current.id, mediaUrl, type]
+      );
 
-    return {"status": "created"}
+      res.json({ status: "uploaded", story });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "upload_failed" });
+    }
+  }
+);
 
+/* ===============================
+   HIGHLIGHTS
+=============================== */
+app.post("/api/highlights", authMiddleware, async (req, res) => {
+  const { title, storyIds, cover } = req.body;
+  const current = req.user;
 
-# ===============================
-# CONTENT TABS
-# ===============================
+  const highlight = await db.one(
+    "INSERT INTO highlights (user_id, title, cover) VALUES ($1,$2,$3) RETURNING id",
+    [current.id, title, cover]
+  );
 
-@app.get("/api/users/{username}/videos")
-async def user_videos(username: str):
-    return await db.fetch_all(
-        "SELECT * FROM videos WHERE username=:u",
-        {"u": username}
-    )
+  for (const sid of storyIds) {
+    await db.none(
+      "INSERT INTO highlight_stories (highlight_id, story_id) VALUES ($1,$2)",
+      [highlight.id, sid]
+    );
+  }
 
+  res.json({ status: "created" });
+});
 
-@app.get("/api/users/{username}/shorts")
-async def user_shorts(username: str):
-    return await db.fetch_all(
-        "SELECT * FROM shorts WHERE username=:u",
-        {"u": username}
-    )
+/* ===============================
+   CONTENT TABS
+=============================== */
+app.get("/api/users/:username/videos", async (req, res) => {
+  const { username } = req.params;
+  const data = await db.any("SELECT * FROM videos WHERE username=$1", [username]);
+  res.json(data);
+});
 
+app.get("/api/users/:username/shorts", async (req, res) => {
+  const { username } = req.params;
+  const data = await db.any("SELECT * FROM shorts WHERE username=$1", [username]);
+  res.json(data);
+});
 
-@app.get("/api/users/{username}/music")
-async def user_music(username: str):
-    return await db.fetch_all(
-        "SELECT * FROM music WHERE username=:u",
-        {"u": username}
-    )
+app.get("/api/users/:username/music", async (req, res) => {
+  const { username } = req.params;
+  const data = await db.any("SELECT * FROM music WHERE username=$1", [username]);
+  res.json(data);
+});
 
+/* ===============================
+   LIVE STREAM
+=============================== */
+app.post("/api/live/start", authMiddleware, async (req, res) => {
+  const current = req.user;
 
-# ===============================
-# LIVE STREAM
-# ===============================
+  const live = await db.one(
+    "INSERT INTO live_streams (user_id, active) VALUES ($1,true) RETURNING id",
+    [current.id]
+  );
 
-@app.post("/api/live/start")
-async def start_live(current=Depends(get_current_user)):
-    lid = str(uuid4())
-    await db.execute(
-        "INSERT INTO live_streams VALUES (:l,:u,TRUE)",
-        {"l": lid, "u": current.id}
-    )
-    return {"liveStreamId": lid}
+  res.json({ liveStreamId: live.id });
+});
 
+app.post("/api/live/end", authMiddleware, async (req, res) => {
+  const current = req.user;
 
-@app.post("/api/live/end")
-async def end_live(current=Depends(get_current_user)):
-    await db.execute(
-        "UPDATE live_streams SET active=FALSE WHERE user_id=:u",
-        {"u": current.id}
-    )
-    return {"status": "ended"}
+  await db.none(
+    "UPDATE live_streams SET active=false WHERE user_id=$1",
+    [current.id]
+  );
 
+  res.json({ status: "ended" });
+});
 
-# ===============================
-# ACCOUNT SWITCHER
-# ===============================
+/* ===============================
+   ACCOUNT SWITCHER
+=============================== */
+app.get("/api/accounts", authMiddleware, async (req, res) => {
+  const current = req.user;
 
-@app.get("/api/accounts")
-async def get_accounts(current=Depends(get_current_user)):
-    return await db.fetch_all(
-        "SELECT * FROM accounts WHERE owner_id=:u",
-        {"u": current.owner_id}
-    )
+  const accounts = await db.any(
+    "SELECT * FROM accounts WHERE owner_id=$1",
+    [current.owner_id]
+  );
 
+  res.json(accounts);
+});
 
-@app.post("/api/accounts/switch")
-async def switch_account(accountId: str = Body(...)):
-    return {"activeAccount": accountId}
+app.post("/api/accounts/switch", authMiddleware, async (req, res) => {
+  res.json({ activeAccount: req.body.accountId });
+});
 
 // --- Verification upload ---
 
