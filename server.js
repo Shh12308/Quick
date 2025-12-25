@@ -1156,6 +1156,61 @@ app.get("/api/admin/users/status", async (req, res) => {
   }
 });
 
+app.post("/api/history/record", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { contentType, contentId, title, thumbnailUrl } = req.body;
+
+    if (!contentType || !contentId || !title) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO watch_history (user_id, content_type, content_id, title, thumbnail_url)
+      VALUES ($1,$2,$3,$4,$5)
+      `,
+      [userId, contentType, contentId, title, thumbnailUrl || null]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("History record error:", err);
+    res.status(500).json({ error: "Failed to record history" });
+  }
+});
+
+app.get("/api/history", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { rows } = await pool.query(
+      `
+      SELECT id, content_type, content_id, title, thumbnail_url, watched_at
+      FROM watch_history
+      WHERE user_id = $1
+      ORDER BY watched_at DESC
+      LIMIT 500
+      `,
+      [userId]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error("Fetch history error:", err);
+    res.status(500).json({ error: "Failed to load history" });
+  }
+});
+
+app.delete("/api/history", authMiddleware, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM watch_history WHERE user_id=$1", [req.user.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to clear history" });
+  }
+});
+
 app.post("/creator/recalc/:userId", async (req, res) => {
   try {
     const targetUserId = req.params.userId;
