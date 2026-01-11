@@ -26,6 +26,31 @@ import axios from "axios";
 import OpenAI from "openai";
 import FormData from "form-data";
 
+import session from "express-session";
+import RedisStore from "connect-redis";
+import { createClient } from "redis";
+
+const redisClient = createClient({
+  url: process.env.REDIS_URL
+});
+
+redisClient.connect();
+
+app.use(
+  session({
+    store: new RedisStore({ client: redisClient }),
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: true,       // HTTPS REQUIRED
+      sameSite: "none",   // Cross-domain auth
+      maxAge: 1000 * 60 * 60 * 24 * 7 // 7 days
+    }
+  })
+);
+
 const { RtcRole, RtcTokenBuilder } = pkg;
 
 import dotenv from "dotenv";
