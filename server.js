@@ -7,7 +7,6 @@ import passport from "passport";
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { Strategy as DiscordStrategy } from "passport-discord";
 import { Strategy as GitHubStrategy } from "passport-github2";
-import session from "express-session";
 import http from "http";
 import nodemailer from "nodemailer";
 import multer from "multer";
