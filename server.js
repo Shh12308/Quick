@@ -133,7 +133,6 @@ const storage = multer.diskStorage({
 });
 export const upload = multer({ storage });
 
-const app = express();
 app.use(express.json());
 app.use(
   session({
