@@ -29,11 +29,14 @@ import session from "express-session";
 import RedisStore from "connect-redis";
 import { createClient } from "redis";
 
+const app = express();               // ✅ FIRST
+app.use(express.json());
+
 const redisClient = createClient({
   url: process.env.REDIS_URL
 });
 
-redisClient.connect();
+await redisClient.connect();
 
 app.use(
   session({
@@ -43,9 +46,9 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: true,       // HTTPS REQUIRED
-      sameSite: "none",   // Cross-domain auth
-      maxAge: 1000 * 60 * 60 * 24 * 7 // 7 days
+      secure: true,
+      sameSite: "none",
+      maxAge: 1000 * 60 * 60 * 24 * 7
     }
   })
 );
