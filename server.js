@@ -17,7 +17,7 @@ import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
 import { v4 as uuidv4 } from "uuid";
 import { ExpressPeerServer } from "peer";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import os from "os";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
@@ -112,6 +112,64 @@ const pool = new pg.Pool({
   password: DB_PASS,
   port: DB_PORT,
 });
+
+// Create tables if they don't exist
+async function initializeTables() {
+  try {
+    // Products table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS products (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        price DECIMAL(10, 2) NOT NULL,
+        type VARCHAR(20) NOT NULL CHECK (type IN ('physical', 'digital')),
+        crypto VARCHAR(10), -- For digital products (ETH, BTC, etc.)
+        sizes JSON, -- For physical products
+        colors JSON, -- For physical products
+        stock INTEGER, -- For physical products
+        images JSON, -- Array of image URLs
+        tags JSON, -- Array of tags
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Orders table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        items JSON, -- Array of order items
+        total DECIMAL(10, 2) NOT NULL,
+        payment_method VARCHAR(50), -- 'bank' or crypto type
+        shipping_address JSON, -- For physical products
+        status VARCHAR(20) NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'shipped', 'delivered', 'cancelled', 'refunded')),
+        tracking_number VARCHAR(100),
+        delivery_date DATE,
+        cancel_reason TEXT,
+        refund_date DATE,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Add total_stripe_sales and total_crypto_sales to creator_stats if not exists
+    await pool.query(`
+      ALTER TABLE creator_stats 
+      ADD COLUMN IF NOT EXISTS total_stripe_sales DECIMAL(10, 2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS total_crypto_sales DECIMAL(10, 2) DEFAULT 0
+    `);
+
+    console.log("Database tables initialized successfully");
+  } catch (error) {
+    console.error("Error initializing database tables:", error);
+  }
+}
+
+// Initialize tables on server start
+initializeTables();
 
 // Email transporter
 const transporter = nodemailer.createTransport({
@@ -2114,6 +2172,450 @@ io.on("connection", (socket) => {
 
 // --- Basic health check ---
 app.get("/", (req, res) => res.send("Server up"));
+
+// --- Product Management Endpoints ---
+
+// Get all products
+app.get("/api/products", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT p.*, u.username as creator_name FROM products p JOIN users u ON p.user_id = u.id ORDER BY p.created_at DESC"
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch products" });
+  }
+});
+
+// Get product by ID
+app.get("/api/products/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query(
+      "SELECT p.*, u.username as creator_name FROM products p JOIN users u ON p.user_id = u.id WHERE p.id = $1",
+      [id]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+    res.json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch product" });
+  }
+});
+
+// Create product (for creators and musicians)
+app.post("/api/products", authMiddleware, upload.array("images", 5), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const {
+      name,
+      description,
+      price,
+      type, // 'physical' or 'digital'
+      crypto, // for digital products (ETH, BTC, etc.)
+      sizes, // for physical products
+      colors, // for physical products
+      stock, // for physical products
+      tags
+    } = req.body;
+    
+    if (!name || !description || !price || !type) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+    
+    // Upload images to S3 and get URLs
+    const imageUrls = [];
+    if (req.files && req.files.length > 0) {
+      for (const file of req.files) {
+        const ext = path.extname(file.originalname);
+        const fileKey = `products/${userId}/${uuidv4()}${ext}`;
+        
+        await s3.send(
+          new PutObjectCommand({
+            Bucket: process.env.S3_BUCKET_NAME,
+            Key: fileKey,
+            Body: file.buffer,
+            ContentType: file.mimetype,
+            ACL: "public-read",
+          })
+        );
+        
+        const imageUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileKey}`;
+        imageUrls.push(imageUrl);
+      }
+    }
+    
+    // Insert product into database
+    const { rows } = await pool.query(
+      `INSERT INTO products 
+       (user_id, name, description, price, type, crypto, sizes, colors, stock, images, tags, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+       RETURNING *`,
+      [
+        userId,
+        name,
+        description,
+        price,
+        type,
+        crypto || null,
+        sizes ? JSON.stringify(sizes) : null,
+        colors ? JSON.stringify(colors) : null,
+        stock || null,
+        JSON.stringify(imageUrls),
+        tags ? JSON.stringify(tags) : null
+      ]
+    );
+    
+    await ensureCreatorStats(userId);
+    res.json({ message: "Product created successfully", product: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to create product" });
+  }
+});
+
+// Update product
+app.put("/api/products/:id", authMiddleware, upload.array("images", 5), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const {
+      name,
+      description,
+      price,
+      type,
+      crypto,
+      sizes,
+      colors,
+      stock,
+      tags
+    } = req.body;
+    
+    // Check if product exists and belongs to user
+    const { rows: productRows } = await pool.query(
+      "SELECT * FROM products WHERE id = $1 AND user_id = $2",
+      [id, userId]
+    );
+    
+    if (productRows.length === 0) {
+      return res.status(404).json({ error: "Product not found or you don't have permission" });
+    }
+    
+    // Handle image updates
+    let imageUrls = JSON.parse(productRows[0].images || "[]");
+    
+    if (req.files && req.files.length > 0) {
+      // Upload new images
+      for (const file of req.files) {
+        const ext = path.extname(file.originalname);
+        const fileKey = `products/${userId}/${uuidv4()}${ext}`;
+        
+        await s3.send(
+          new PutObjectCommand({
+            Bucket: process.env.S3_BUCKET_NAME,
+            Key: fileKey,
+            Body: file.buffer,
+            ContentType: file.mimetype,
+            ACL: "public-read",
+          })
+        );
+        
+        const imageUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileKey}`;
+        imageUrls.push(imageUrl);
+      }
+    }
+    
+    // Update product in database
+    const { rows } = await pool.query(
+      `UPDATE products 
+       SET name = COALESCE($1, name),
+           description = COALESCE($2, description),
+           price = COALESCE($3, price),
+           type = COALESCE($4, type),
+           crypto = COALESCE($5, crypto),
+           sizes = COALESCE($6, sizes),
+           colors = COALESCE($7, colors),
+           stock = COALESCE($8, stock),
+           images = COALESCE($9, images),
+           tags = COALESCE($10, tags),
+           updated_at = NOW()
+       WHERE id = $11 AND user_id = $12
+       RETURNING *`,
+      [
+        name,
+        description,
+        price,
+        type,
+        crypto || null,
+        sizes ? JSON.stringify(sizes) : null,
+        colors ? JSON.stringify(colors) : null,
+        stock || null,
+        JSON.stringify(imageUrls),
+        tags ? JSON.stringify(tags) : null,
+        id,
+        userId
+      ]
+    );
+    
+    res.json({ message: "Product updated successfully", product: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to update product" });
+  }
+});
+
+// Delete product
+app.delete("/api/products/:id", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    
+    // Check if product exists and belongs to user
+    const { rows } = await pool.query(
+      "SELECT * FROM products WHERE id = $1 AND user_id = $2",
+      [id, userId]
+    );
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Product not found or you don't have permission" });
+    }
+    
+    // Delete product
+    await pool.query("DELETE FROM products WHERE id = $1 AND user_id = $2", [id, userId]);
+    
+    res.json({ message: "Product deleted successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to delete product" });
+  }
+});
+
+// Get products by user
+app.get("/api/users/:userId/products", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { rows } = await pool.query(
+      "SELECT * FROM products WHERE user_id = $1 ORDER BY created_at DESC",
+      [userId]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch user products" });
+  }
+});
+
+// Order endpoints
+app.post("/api/orders", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { items, paymentMethod, shippingAddress } = req.body;
+    
+    if (!items || items.length === 0) {
+      return res.status(400).json({ error: "No items in order" });
+    }
+    
+    let total = 0;
+    const orderItems = [];
+    
+    // Calculate total and validate items
+    for (const item of items) {
+      const { rows: productRows } = await pool.query(
+        "SELECT * FROM products WHERE id = $1",
+        [item.productId]
+      );
+      
+      if (productRows.length === 0) {
+        return res.status(404).json({ error: `Product ${item.productId} not found` });
+      }
+      
+      const product = productRows[0];
+      const itemTotal = product.price * item.quantity;
+      total += itemTotal;
+      
+      orderItems.push({
+        product_id: item.productId,
+        quantity: item.quantity,
+        price: product.price
+      });
+      
+      // Update stock for physical products
+      if (product.type === 'physical' && product.stock) {
+        await pool.query(
+          "UPDATE products SET stock = stock - $1 WHERE id = $2",
+          [item.quantity, item.productId]
+        );
+      }
+    }
+    
+    // Create order
+    const { rows } = await pool.query(
+      `INSERT INTO orders 
+       (user_id, items, total, payment_method, shipping_address, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'processing', NOW())
+       RETURNING *`,
+      [
+        userId,
+        JSON.stringify(orderItems),
+        total,
+        paymentMethod,
+        JSON.stringify(shippingAddress)
+      ]
+    );
+    
+    // Update creator stats for physical products
+    for (const item of items) {
+      const { rows: productRows } = await pool.query(
+        "SELECT * FROM products WHERE id = $1",
+        [item.productId]
+      );
+      
+      if (productRows.length > 0 && productRows[0].type === 'physical') {
+        const product = productRows[0];
+        const itemTotal = product.price * item.quantity;
+        
+        await pool.query(
+          `UPDATE creator_stats 
+           SET total_stripe_sales = COALESCE(total_stripe_sales, 0) + $1,
+               earnings = COALESCE(earnings, 0) + $1,
+               updated_at = NOW()
+           WHERE user_id = $2`,
+          [itemTotal, product.user_id]
+        );
+      } else if (productRows.length > 0 && productRows[0].type === 'digital') {
+        const product = productRows[0];
+        const itemTotal = product.price * item.quantity;
+        
+        await pool.query(
+          `UPDATE creator_stats 
+           SET total_crypto_sales = COALESCE(total_crypto_sales, 0) + $1,
+               earnings = COALESCE(earnings, 0) + $1,
+               updated_at = NOW()
+           WHERE user_id = $2`,
+          [itemTotal, product.user_id]
+        );
+      }
+    }
+    
+    res.json({ message: "Order created successfully", order: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to create order" });
+  }
+});
+
+// Get user orders
+app.get("/api/orders", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { rows } = await pool.query(
+      "SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC",
+      [userId]
+    );
+    
+    // Parse items JSON for each order
+    const ordersWithItems = rows.map(order => ({
+      ...order,
+      items: JSON.parse(order.items || "[]"),
+      shipping_address: JSON.parse(order.shipping_address || "{}")
+    }));
+    
+    res.json(ordersWithItems);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch orders" });
+  }
+});
+
+// Update order status
+app.put("/api/orders/:id/status", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    
+    // Check if order exists
+    const { rows: orderRows } = await pool.query(
+      "SELECT * FROM orders WHERE id = $1",
+      [id]
+    );
+    
+    if (orderRows.length === 0) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+    
+    // Update order status
+    const { rows } = await pool.query(
+      "UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
+      [status, id]
+    );
+    
+    res.json({ message: "Order status updated", order: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to update order status" });
+  }
+});
+
+// Cancel order
+app.post("/api/orders/:id/cancel", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { reason } = req.body;
+    
+    // Check if order exists and belongs to user
+    const { rows: orderRows } = await pool.query(
+      "SELECT * FROM orders WHERE id = $1 AND user_id = $2",
+      [id, userId]
+    );
+    
+    if (orderRows.length === 0) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+    
+    const order = orderRows[0];
+    
+    // Check if order can be cancelled (only processing orders)
+    if (order.status !== 'processing') {
+      return res.status(400).json({ error: "Order cannot be cancelled" });
+    }
+    
+    // Update order status
+    const { rows } = await pool.query(
+      `UPDATE orders 
+       SET status = 'cancelled', 
+           cancel_reason = $1, 
+           refund_date = NOW(),
+           updated_at = NOW() 
+       WHERE id = $2 RETURNING *`,
+      [reason, id]
+    );
+    
+    // Restore stock for physical products
+    const items = JSON.parse(order.items || "[]");
+    for (const item of items) {
+      const { rows: productRows } = await pool.query(
+        "SELECT * FROM products WHERE id = $1",
+        [item.product_id]
+      );
+      
+      if (productRows.length > 0 && productRows[0].type === 'physical') {
+        await pool.query(
+          "UPDATE products SET stock = stock + $1 WHERE id = $2",
+          [item.quantity, item.product_id]
+        );
+      }
+    }
+    
+    res.json({ message: "Order cancelled successfully", order: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to cancel order" });
+  }
+});
 
 // --- Start server ---
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
