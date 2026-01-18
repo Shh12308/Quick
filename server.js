@@ -804,34 +804,120 @@ app.post("/wallet/tip", authMiddleware, async (req, res) => {
 
 // --- Creator stats update & recalc ---
 
+function calculateEarningsFromDeltas({
+  likesDelta = 0,
+  followsDelta = 0,
+  viewsDelta = 0,
+  tips = 0,
+  merch = 0,
+  stripeSales = 0,
+  cryptoSales = 0
+}) {
+  // Updated rates
+  const likeRate = 0.025;   // $0.025 per like
+  const followRate = 0;     // followers do not generate earnings
+  const viewRate = 0.02;    // $0.02 per view
+
+  const platformCut = 0.05; // 5% platform fee
+
+  // Calculate earnings
+  const likesEarnings = likesDelta * likeRate;
+  const followsEarnings = followsDelta * followRate; // 0
+  const viewsEarnings = viewsDelta * viewRate;
+  const tipsEarnings = tips;    // already in USD
+  const merchEarnings = merch;  // already in USD
+
+  const stripeEarnings = stripeSales * (1 - platformCut);
+  const cryptoEarnings = cryptoSales * (1 - platformCut);
+
+  const total = likesEarnings + followsEarnings + viewsEarnings +
+                tipsEarnings + merchEarnings + stripeEarnings + cryptoEarnings;
+
+  const breakdown = {
+    likes: likesEarnings,
+    follows: followsEarnings,
+    views: viewsEarnings,
+    tips: tipsEarnings,
+    merch: merchEarnings,
+    stripe: stripeEarnings,
+    crypto: cryptoEarnings
+  };
+
+  return { total, breakdown };
+}
+
+// =======================
+// Update Creator Stats Endpoint
+// =======================
 app.post("/creator/update-deltas", async (req, res) => {
   try {
-    const { token, adminKey, userId, likesDelta = 0, followsDelta = 0, viewsDelta = 0, tipsAmount = 0, merchAmount = 0 } = req.body;
+    const {
+      token,
+      adminKey,
+      userId,
+      likesDelta = 0,
+      followsDelta = 0,
+      viewsDelta = 0,
+      tipsAmount = 0,
+      merchAmount = 0,
+      stripeSales = 0, // physical product sales
+      cryptoSales = 0  // digital product sales
+    } = req.body;
+
     let targetUserId = userId;
+
+    // Verify token or admin key
     if (token) {
       const decoded = jwt.verify(token, JWT_SECRET);
       targetUserId = decoded.id;
     } else if (!adminKey || adminKey !== ADMIN_KEY) {
       return res.status(401).json({ error: "Unauthorized" });
     }
+
+    // Update cumulative stats in creator_stats
     await pool.query(
-      `INSERT INTO creator_stats (user_id, total_likes, total_follows, total_views, total_tips, total_merch_sales, earnings, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,0,NOW())
-       ON CONFLICT (user_id) DO UPDATE
-         SET total_likes = creator_stats.total_likes + $2,
-             total_follows = creator_stats.total_follows + $3,
-             total_views = creator_stats.total_views + $4,
-             total_tips = creator_stats.total_tips + $5,
-             total_merch_sales = creator_stats.total_merch_sales + $6,
-             updated_at = NOW()
+      `INSERT INTO creator_stats (
+        user_id, total_likes, total_follows, total_views, total_tips,
+        total_merch_sales, total_stripe_sales, total_crypto_sales, earnings, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,NOW())
+      ON CONFLICT (user_id) DO UPDATE
+        SET total_likes = creator_stats.total_likes + $2,
+            total_follows = creator_stats.total_follows + $3,
+            total_views = creator_stats.total_views + $4,
+            total_tips = creator_stats.total_tips + $5,
+            total_merch_sales = creator_stats.total_merch_sales + $6,
+            total_stripe_sales = creator_stats.total_stripe_sales + $7,
+            total_crypto_sales = creator_stats.total_crypto_sales + $8,
+            updated_at = NOW()
       `,
-      [targetUserId, likesDelta, followsDelta, viewsDelta, tipsAmount, merchAmount]
+      [targetUserId, likesDelta, followsDelta, viewsDelta, tipsAmount, merchAmount, stripeSales, cryptoSales]
     );
-    const calc = calculateEarningsFromDeltas({ likesDelta, followsDelta, viewsDelta, tips: tipsAmount, merch: merchAmount });
+
+    // Calculate earnings including sales after 5% platform cut
+    const calc = calculateEarningsFromDeltas({
+      likesDelta,
+      followsDelta,
+      viewsDelta,
+      tips: tipsAmount,
+      merch: merchAmount,
+      stripeSales,
+      cryptoSales
+    });
+
     const earningsDelta = calc.total;
-    await pool.query("UPDATE creator_stats SET earnings = COALESCE(earnings,0) + $1 WHERE user_id=$2", [earningsDelta, targetUserId]);
-    await pool.query("UPDATE users SET earnings = COALESCE(earnings,0) + $1 WHERE id=$2", [earningsDelta, targetUserId]);
+
+    // Update earnings in creator_stats and users table
+    await pool.query(
+      "UPDATE creator_stats SET earnings = COALESCE(earnings,0) + $1 WHERE user_id=$2",
+      [earningsDelta, targetUserId]
+    );
+    await pool.query(
+      "UPDATE users SET earnings = COALESCE(earnings,0) + $1 WHERE id=$2",
+      [earningsDelta, targetUserId]
+    );
+
     res.json({ message: "Creator stats updated", earningsDelta, breakdown: calc.breakdown });
+
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to update creator stats" });
