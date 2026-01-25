@@ -1,8 +1,9 @@
-import { PrismaClient } from "@prisma/client";
-import bcrypt from "bcryptjs";
-import dotenv from "dotenv";
+// prisma/seed.js
 
-dotenv.config();
+const { PrismaClient } = require("@prisma/client");
+const { argon2 } = require("argon2"); // 1. Import argon2
+require("dotenv").config();
+
 const prisma = new PrismaClient();
 
 async function main() {
@@ -14,7 +15,9 @@ async function main() {
     return;
   }
 
-  const passwordHash = await bcrypt.hash(process.env.SEED_ADMIN_PASSWORD || "adminpass", 10);
+  // 2. Hash the password using argon2.hash()
+  // Argon2 automatically handles salt generation and is much more secure.
+  const passwordHash = await argon2.hash(process.env.SEED_ADMIN_PASSWORD || "adminpass");
 
   const user = await prisma.user.create({
     data: {
