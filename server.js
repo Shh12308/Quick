@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import pg from "pg";
 import argon2 from "argon2";
@@ -17,7 +16,7 @@ import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
 import { v4 as uuidv4 } from "uuid";
 import { ExpressPeerServer } from "peer";
-import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import os from "os";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
@@ -95,10 +94,14 @@ const {
   AWS_ACCESS_KEY_ID,
   AWS_SECRET_ACCESS_KEY,
   S3_BUCKET_NAME,
+  AWS_S3_BUCKET, // Added for video uploads
 
   // MediaConvert (fixed — removed invalid "=" syntax)
   MEDIACONVERT_ROLE_ARN,
-  MEDIACONVERT_ENDPOINT
+  MEDIACONVERT_ENDPOINT,
+
+  // OpenAI for Whisper
+  OPENAI_API_KEY
 } = process.env;
 
 // SAFE fallback without redeclaring AWS_REGION
@@ -160,6 +163,88 @@ async function initializeTables() {
       ALTER TABLE creator_stats 
       ADD COLUMN IF NOT EXISTS total_stripe_sales DECIMAL(10, 2) DEFAULT 0,
       ADD COLUMN IF NOT EXISTS total_crypto_sales DECIMAL(10, 2) DEFAULT 0
+    `);
+
+    // Video processing tables for ProUploadStudio
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS video_processing_jobs (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
+        job_type VARCHAR(50) NOT NULL,
+        parameters JSON,
+        status VARCHAR(20) DEFAULT 'pending',
+        result JSON,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS video_audio_tracks (
+        id SERIAL PRIMARY KEY,
+        video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        audio_url VARCHAR(500) NOT NULL,
+        gain DECIMAL(3,2) DEFAULT 1,
+        mute BOOLEAN DEFAULT false,
+        solo BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS video_captions (
+        id SERIAL PRIMARY KEY,
+        video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
+        start_time DECIMAL(10,2) NOT NULL,
+        end_time DECIMAL(10,2) NOT NULL,
+        text TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS video_caption_styles (
+        id SERIAL PRIMARY KEY,
+        video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE UNIQUE,
+        font_size INTEGER DEFAULT 16,
+        color VARCHAR(7) DEFAULT '#FFFFFF',
+        background_color VARCHAR(20) DEFAULT 'rgba(0,0,0,0.5)',
+        position VARCHAR(10) DEFAULT 'bottom',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS video_export_settings (
+        id SERIAL PRIMARY KEY,
+        video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE UNIQUE,
+        resolution VARCHAR(10) DEFAULT '1080p',
+        format VARCHAR(10) DEFAULT 'mp4',
+        quality VARCHAR(10) DEFAULT 'high',
+        fps INTEGER DEFAULT 30,
+        bitrate INTEGER DEFAULT 5000,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS uploaded_files (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        filename VARCHAR(255) NOT NULL,
+        original_name VARCHAR(255) NOT NULL,
+        mime_type VARCHAR(100) NOT NULL,
+        size INTEGER NOT NULL,
+        s3_key VARCHAR(255) NOT NULL,
+        s3_url VARCHAR(500) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
     `);
 
     console.log("Database tables initialized successfully");
@@ -2614,6 +2699,523 @@ app.post("/api/orders/:id/cancel", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to cancel order" });
+  }
+});
+
+// --- Video Processing and Upload Endpoints for ProUploadStudioPage ---
+
+// Generate presigned URL for S3 upload
+app.post("/api/s3-upload-url", authMiddleware, async (req, res) => {
+  try {
+    const { filename, filetype } = req.body;
+    if (!filename || !filetype) {
+      return res.status(400).json({ error: "Filename and filetype are required" });
+    }
+
+    const fileKey = `uploads/${req.user.id}/${Date.now()}-${filename}`;
+    
+    const s3Params = {
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: fileKey,
+      Expires: 60, // URL expires in 60 seconds
+      ContentType: filetype
+    };
+
+    const uploadUrl = await s3.getSignedUrlPromise('putObject', s3Params);
+    const publicUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileKey}`;
+
+    // Record the file in the database
+    await pool.query(
+      `INSERT INTO uploaded_files (user_id, filename, original_name, mime_type, s3_key, s3_url, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [req.user.id, filename, filename, filetype, fileKey, publicUrl]
+    );
+
+    res.json({ url: uploadUrl, publicUrl, fileKey });
+  } catch (err) {
+    console.error("Error generating S3 upload URL:", err);
+    res.status(500).json({ error: "Failed to generate upload URL" });
+  }
+});
+
+// Process and save video metadata
+app.post("/api/videos/save", authMiddleware, async (req, res) => {
+  try {
+    const {
+      title,
+      description,
+      videoUrl,
+      thumbnailUrl,
+      duration,
+      tags,
+      category,
+      isPublic = true
+    } = req.body;
+
+    if (!title || !videoUrl) {
+      return res.status(400).json({ error: "Title and video URL are required" });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO videos 
+       (user_id, title, description, video_url, thumbnail_url, duration, tags, category, is_public, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+       RETURNING *`,
+      [
+        req.user.id,
+        title,
+        description || null,
+        videoUrl,
+        thumbnailUrl || null,
+        duration || 0,
+        tags ? JSON.stringify(tags) : null,
+        category || null,
+        isPublic
+      ]
+    );
+
+    // Update creator stats
+    await ensureCreatorStats(req.user.id);
+    await pool.query(
+      `UPDATE creator_stats 
+       SET total_videos = COALESCE(total_videos, 0) + 1, updated_at = NOW()
+       WHERE user_id = $1`,
+      [req.user.id]
+    );
+
+    res.json({ message: "Video saved successfully", video: rows[0] });
+  } catch (err) {
+    console.error("Error saving video:", err);
+    res.status(500).json({ error: "Failed to save video" });
+  }
+});
+
+// --- AI-Powered Caption Generation with Whisper ---
+
+// Generate captions using Whisper API
+app.post("/api/whisper", authMiddleware, upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    // Check if OpenAI API key is available
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "Whisper service not configured" });
+    }
+
+    // Create a FormData object to send to OpenAI
+    const formData = new FormData();
+    formData.append("file", req.file.buffer, req.file.originalname);
+    formData.append("model", "whisper-1");
+    formData.append("response_format", "verbose_json");
+
+    // Send to OpenAI Whisper API
+    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+      },
+      body: formData
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`Whisper API error: ${error}`);
+    }
+
+    const transcriptionData = await response.json();
+    
+    // Process segments into caption format
+    const segments = transcriptionData.segments || [];
+    const captions = segments.map((segment, index) => ({
+      id: index + 1,
+      start: segment.start,
+      end: segment.end,
+      text: segment.text.trim()
+    }));
+
+    res.json({ segments: captions });
+  } catch (err) {
+    console.error("Error generating captions:", err);
+    res.status(500).json({ error: "Failed to generate captions" });
+  }
+});
+
+// --- Video Editing Endpoints ---
+
+// Apply video edits (trim, filters, etc.)
+app.post("/api/videos/edit", authMiddleware, async (req, res) => {
+  try {
+    const { videoId, edits } = req.body;
+    
+    if (!videoId || !edits) {
+      return res.status(400).json({ error: "Video ID and edits are required" });
+    }
+
+    // Get video details
+    const { rows: videoRows } = await pool.query(
+      "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
+      [videoId, req.user.id]
+    );
+
+    if (videoRows.length === 0) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    const video = videoRows[0];
+    
+    // Create a job for video processing
+    const { rows: jobRows } = await pool.query(
+      `INSERT INTO video_processing_jobs 
+       (user_id, video_id, job_type, parameters, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING *`,
+      [
+        req.user.id,
+        videoId,
+        "edit",
+        JSON.stringify(edits),
+        "pending"
+      ]
+    );
+
+    // In a real implementation, you would add this job to a queue
+    // For now, we'll just return the job ID
+    res.json({ 
+      message: "Video edit job created", 
+      jobId: jobRows[0].id,
+      status: "pending"
+    });
+  } catch (err) {
+    console.error("Error creating video edit job:", err);
+    res.status(500).json({ error: "Failed to create video edit job" });
+  }
+});
+
+// Get video processing job status
+app.get("/api/videos/jobs/:jobId", authMiddleware, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    
+    const { rows } = await pool.query(
+      "SELECT * FROM video_processing_jobs WHERE id = $1 AND user_id = $2",
+      [jobId, req.user.id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("Error fetching job status:", err);
+    res.status(500).json({ error: "Failed to fetch job status" });
+  }
+});
+
+// --- Audio Track Management ---
+
+// Add audio track to video
+app.post("/api/videos/:videoId/audio-tracks", authMiddleware, upload.single("audio"), async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const { name, gain = 1, mute = false, solo = false } = req.body;
+    
+    if (!req.file) {
+      return res.status(400).json({ error: "No audio file uploaded" });
+    }
+
+    // Check if video exists and belongs to user
+    const { rows: videoRows } = await pool.query(
+      "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
+      [videoId, req.user.id]
+    );
+
+    if (videoRows.length === 0) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    // Upload audio to S3
+    const audioKey = `audio/${req.user.id}/${Date.now()}-${req.file.originalname}`;
+    const audioUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${audioKey}`;
+    
+    await s3.send(new PutObjectCommand({
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: audioKey,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype
+    }));
+
+    // Save audio track to database
+    const { rows } = await pool.query(
+      `INSERT INTO video_audio_tracks 
+       (video_id, user_id, name, audio_url, gain, mute, solo, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       RETURNING *`,
+      [videoId, req.user.id, name || req.file.originalname, audioUrl, gain, mute, solo]
+    );
+
+    res.json({ message: "Audio track added", track: rows[0] });
+  } catch (err) {
+    console.error("Error adding audio track:", err);
+    res.status(500).json({ error: "Failed to add audio track" });
+  }
+});
+
+// Get audio tracks for a video
+app.get("/api/videos/:videoId/audio-tracks", authMiddleware, async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    
+    // Check if video exists and belongs to user
+    const { rows: videoRows } = await pool.query(
+      "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
+      [videoId, req.user.id]
+    );
+
+    if (videoRows.length === 0) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    const { rows } = await pool.query(
+      "SELECT * FROM video_audio_tracks WHERE video_id = $1 ORDER BY created_at",
+      [videoId]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error("Error fetching audio tracks:", err);
+    res.status(500).json({ error: "Failed to fetch audio tracks" });
+  }
+});
+
+// Update audio track
+app.put("/api/audio-tracks/:trackId", authMiddleware, async (req, res) => {
+  try {
+    const { trackId } = req.params;
+    const { name, gain, mute, solo } = req.body;
+    
+    // Check if track exists and belongs to user
+    const { rows: trackRows } = await pool.query(
+      `SELECT at.* FROM video_audio_tracks at
+       JOIN videos v ON at.video_id = v.id
+       WHERE at.id = $1 AND v.user_id = $2`,
+      [trackId, req.user.id]
+    );
+
+    if (trackRows.length === 0) {
+      return res.status(404).json({ error: "Audio track not found" });
+    }
+
+    // Update track
+    const { rows } = await pool.query(
+      `UPDATE video_audio_tracks 
+       SET name = COALESCE($1, name),
+           gain = COALESCE($2, gain),
+           mute = COALESCE($3, mute),
+           solo = COALESCE($4, solo),
+           updated_at = NOW()
+       WHERE id = $5
+       RETURNING *`,
+      [name, gain, mute, solo, trackId]
+    );
+
+    res.json({ message: "Audio track updated", track: rows[0] });
+  } catch (err) {
+    console.error("Error updating audio track:", err);
+    res.status(500).json({ error: "Failed to update audio track" });
+  }
+});
+
+// Delete audio track
+app.delete("/api/audio-tracks/:trackId", authMiddleware, async (req, res) => {
+  try {
+    const { trackId } = req.params;
+    
+    // Check if track exists and belongs to user
+    const { rows: trackRows } = await pool.query(
+      `SELECT at.* FROM video_audio_tracks at
+       JOIN videos v ON at.video_id = v.id
+       WHERE at.id = $1 AND v.user_id = $2`,
+      [trackId, req.user.id]
+    );
+
+    if (trackRows.length === 0) {
+      return res.status(404).json({ error: "Audio track not found" });
+    }
+
+    const track = trackRows[0];
+    
+    // Delete from S3
+    try {
+      const audioKey = track.audio_url.split('/').pop();
+      await s3.send(new DeleteObjectCommand({
+        Bucket: process.env.S3_BUCKET_NAME,
+        Key: `audio/${req.user.id}/${audioKey}`
+      }));
+    } catch (s3Err) {
+      console.error("Error deleting audio from S3:", s3Err);
+      // Continue even if S3 deletion fails
+    }
+
+    // Delete from database
+    await pool.query("DELETE FROM video_audio_tracks WHERE id = $1", [trackId]);
+
+    res.json({ message: "Audio track deleted successfully" });
+  } catch (err) {
+    console.error("Error deleting audio track:", err);
+    res.status(500).json({ error: "Failed to delete audio track" });
+  }
+});
+
+// --- Caption Management ---
+
+// Save captions for a video
+app.post("/api/videos/:videoId/captions", authMiddleware, async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const { captions, style } = req.body;
+    
+    if (!captions || !Array.isArray(captions)) {
+      return res.status(400).json({ error: "Captions array is required" });
+    }
+
+    // Check if video exists and belongs to user
+    const { rows: videoRows } = await pool.query(
+      "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
+      [videoId, req.user.id]
+    );
+
+    if (videoRows.length === 0) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    // Delete existing captions
+    await pool.query("DELETE FROM video_captions WHERE video_id = $1", [videoId]);
+
+    // Insert new captions
+    for (const caption of captions) {
+      await pool.query(
+        `INSERT INTO video_captions 
+         (video_id, start_time, end_time, text, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [videoId, caption.start, caption.end, caption.text]
+      );
+    }
+
+    // Save caption style if provided
+    if (style) {
+      await pool.query(
+        `INSERT INTO video_caption_styles 
+         (video_id, font_size, color, background_color, position, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
+         ON CONFLICT (video_id) DO UPDATE
+         SET font_size = EXCLUDED.font_size,
+             color = EXCLUDED.color,
+             background_color = EXCLUDED.background_color,
+             position = EXCLUDED.position,
+             updated_at = NOW()`,
+        [videoId, style.fontSize, style.color, style.backgroundColor, style.position]
+      );
+    }
+
+    res.json({ message: "Captions saved successfully" });
+  } catch (err) {
+    console.error("Error saving captions:", err);
+    res.status(500).json({ error: "Failed to save captions" });
+  }
+});
+
+// Get captions for a video
+app.get("/api/videos/:videoId/captions", authMiddleware, async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    
+    // Check if video exists and belongs to user
+    const { rows: videoRows } = await pool.query(
+      "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
+      [videoId, req.user.id]
+    );
+
+    if (videoRows.length === 0) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    // Get captions
+    const { rows: captionRows } = await pool.query(
+      "SELECT * FROM video_captions WHERE video_id = $1 ORDER BY start_time",
+      [videoId]
+    );
+
+    // Get caption style
+    const { rows: styleRows } = await pool.query(
+      "SELECT * FROM video_caption_styles WHERE video_id = $1",
+      [videoId]
+    );
+
+    const captions = captionRows.map(row => ({
+      id: row.id,
+      start: row.start_time,
+      end: row.end_time,
+      text: row.text
+    }));
+
+    const style = styleRows.length > 0 ? {
+      fontSize: styleRows[0].font_size,
+      color: styleRows[0].color,
+      backgroundColor: styleRows[0].background_color,
+      position: styleRows[0].position
+    } : null;
+
+    res.json({ captions, style });
+  } catch (err) {
+    console.error("Error fetching captions:", err);
+    res.status(500).json({ error: "Failed to fetch captions" });
+  }
+});
+
+// --- Export Settings ---
+
+// Save export settings for a video
+app.post("/api/videos/:videoId/export-settings", authMiddleware, async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const { settings } = req.body;
+    
+    if (!settings) {
+      return res.status(400).json({ error: "Export settings are required" });
+    }
+
+    // Check if video exists and belongs to user
+    const { rows: videoRows } = await pool.query(
+      "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
+      [videoId, req.user.id]
+    );
+
+    if (videoRows.length === 0) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    // Save export settings
+    await pool.query(
+      `INSERT INTO video_export_settings 
+       (video_id, resolution, format, quality, fps, bitrate, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       ON CONFLICT (video_id) DO UPDATE
+       SET resolution = EXCLUDED.resolution,
+           format = EXCLUDED.format,
+           quality = EXCLUDED.quality,
+           fps = EXCLUDED.fps,
+           bitrate = EXCLUDED.bitrate,
+           updated_at = NOW()`,
+      [videoId, settings.resolution, settings.format, settings.quality, settings.fps, settings.bitrate]
+    );
+
+    res.json({ message: "Export settings saved successfully" });
+  } catch (err) {
+    console.error("Error saving export settings:", err);
+    res.status(500).json({ error: "Failed to save export settings" });
   }
 });
 
