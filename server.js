@@ -1840,6 +1840,668 @@ app.post("/webhooks/coins", express.json(), async (req, res) => {
   }
 });
 
+/ Add these endpoints to your server.js file
+
+// --- Admin Monitoring System ---
+
+// Admin authentication middleware
+function adminAuthMiddleware(req, res, next) {
+  try {
+    const adminKey = req.headers["x-admin-key"] || req.body.adminKey || req.query.adminKey;
+    if (!adminKey || adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
+    req.admin = { key: adminKey };
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Authentication failed" });
+  }
+}
+
+// --- Communication Logging Tables ---
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS communication_logs (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    chat_id INTEGER REFERENCES chats(id) ON DELETE CASCADE,
+    message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+    call_id INTEGER REFERENCES calls(id) ON DELETE CASCADE,
+    action VARCHAR(20) NOT NULL,
+    previous_data JSONB,
+    new_data JSONB,
+    created_at TIMESTAMP DEFAULT NOW(),
+    admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE
+  )
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS deleted_content (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    content_type VARCHAR(20) NOT NULL,
+    content_id VARCHAR(255) NOT NULL,
+    original_content TEXT,
+    deleted_at TIMESTAMP DEFAULT NOW(),
+    deleted_by INTEGER REFERENCES users(id) ON DELETE CASCADE
+  )
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS call_logs (
+    id SERIAL PRIMARY KEY,
+    caller_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    call_id INTEGER REFERENCES calls(id) ON DELETE CASCADE,
+    recording_url VARCHAR(500),
+    status VARCHAR(20) DEFAULT 'initiated',
+    duration_seconds INTEGER,
+    started_at TIMESTAMP DEFAULT NOW(),
+    ended_at TIMESTAMP,
+    admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE
+  )
+`);
+
+// --- Message Logging ---
+
+// Log all message events
+async function logMessageEvent(userId, chatId, messageId, action, data = {}) {
+  try {
+    await pool.query(`
+      INSERT INTO communication_logs 
+      (user_id, chat_id, message_id, action, previous_data, new_data, admin_id, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+    `, [userId, chatId, messageId, action, JSON.stringify(data.previousData || {}), JSON.stringify(data.newData || {}), req.admin.id]);
+  } catch (err) {
+    console.error("Failed to log message event:", err);
+  }
+}
+
+// Enhanced send message with logging
+app.post("/api/messages", authMiddleware, async (req, res) => {
+  try {
+    const { to_user_id, content, reply_to_id, type = 'text' } = req.body;
+    const fromId = req.user.id;
+    
+    // Create message in database
+    const { rows } = await pool.query(
+      `INSERT INTO messages (from_user_id, to_user_id, content, type, reply_to_id, created_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
+      RETURNING *`,
+      [fromId, to_user_id, content, type, reply_to_id]
+    );
+    
+    const message = rows[0];
+    
+    // Log the message creation
+    await logMessageEvent(fromId, message.chat_id, "create", { content, type, reply_to_id });
+    
+    // Send to recipient via socket
+    if (req.body.realtime !== false) {
+      const io = req.app.get("io");
+      if (io) {
+        io.to(`user-${to_user_id}`).emit("new_message", {
+          id: message.id,
+          chatId: message.chat_id,
+          message,
+          sender: {
+            id: req.user.id,
+            username: req.user.username
+          }
+        });
+      }
+    }
+    
+    res.json({ message });
+  } catch (err) {
+    console.error("Failed to send message:", err);
+    res.status(500).json({ error: "Failed to send message" });
+  }
+});
+
+// Enhanced delete message with logging
+app.delete("/api/messages/:messageId", authMiddleware, async (logMessageDeleteMessage(req, res) {
+  try {
+    const { messageId } = req.params;
+    const userId = req.user.id;
+    
+    // Get message before deletion
+    const { rows } = await pool.query("SELECT * FROM messages WHERE id = $1", [messageId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+    
+    const message = rows[0];
+    
+    // Store deleted content in deleted_content table
+    await pool.query(`
+      INSERT INTO deleted_content (user_id, content_type, content_id, original_content, deleted_at, deleted_by)
+      VALUES ($1, $2, $3, $4, NOW(), $5)
+    `, [userId, message.type, message.id, message.content, req.admin.id]);
+    
+    // Log the deletion
+    await logMessageEvent(userId, message.chat_id, "delete", { 
+      content: message.content,
+      type: message.type,
+      reply_to_id: message.reply_to_id
+    });
+    
+    // Actually delete the message
+    await pool.query("DELETE FROM messages WHERE id = $1", [messageId]);
+    
+    res.json({ message: "Message deleted successfully" });
+  } catch (err) {
+    console.error("Failed to delete message:", err);
+    res.status(500).json({ error: "Failed to delete message" });
+  }
+});
+
+// Enhanced edit message with logging
+app.put("/api/messages/:messageId", authMiddleware, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const { content } = req.body;
+    const userId = req.user.id;
+    
+    // Get message before editing
+    const { rows } = await pool.query("SELECT * FROM messages WHERE id = $1", [messageId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+    
+    const message = rows[0];
+    
+    // Store previous content in deleted_content table if not already there
+    const { rows: existingDeleted } = await pool.query(
+      "SELECT id FROM deleted_content WHERE content_id = $1 AND content_type = 'message' AND content_id = $1",
+      [messageId]
+    );
+    
+    if (existingDeleted.length === 0) {
+      await pool.query(`
+        INSERT INTO deleted_content (user_id, content_type, content_id, original_content, deleted_at, deleted_by)
+        VALUES ($1, 'message', $2, $3, NOW(), $4)
+      `, [userId, messageId, message.content, req.admin.id]);
+    }
+    
+    // Log the edit
+    await logMessageEvent(userId, message.chat_id, "edit", { 
+      previous_content: message.content,
+      new_content: content,
+      type: message.type,
+      reply_to_id: message.reply_to_id
+    });
+    
+    // Actually update the message
+    await pool.query("UPDATE messages SET content = $1, edited = true, edited_at = NOW() WHERE id = $2", [content, messageId]);
+    
+    res.json({ message: "Message updated successfully" });
+  } catch (err) {
+    console.error("Failed to edit message:", err);
+    res.status(500).json({ error: "Failed to edit message" });
+  }
+});
+
+// --- Call Recording and Logging ---
+
+// Start call with logging
+app.post("/api/calls", authMiddleware, async (req, {
+  try {
+    const { recipientId, callType = "voice" } = req.body;
+    const callerId = req.user.id;
+    
+    // Create call record
+    const { rows } = await pool.query(`
+      INSERT INTO calls (caller_id, receiver_id, type, status, created_at)
+      VALUES ($1, $2, $3, 'initiated', NOW())
+      RETURNING *
+    `, [callerId, recipientId, callType]);
+    
+    const call = rows[0];
+    
+    // Log the call initiation
+    await logMessageEvent(callerId, call.id, "initiate", { 
+      callType,
+      recipientId
+    });
+    
+    // Create a room for the call
+    const { rows: roomRows } = await pool.query(`
+      INSERT INTO call_rooms (call_id, created_at)
+      VALUES ($1, NOW())
+      RETURNING *
+    `, [call.id]);
+    
+    const room = roomRows[0];
+    
+    // Join the room for signaling
+    const agoraToken = generateAgoraToken(room.id, callerId, "publisher");
+    
+    res.json({ 
+      roomId: room.id, 
+      agoraToken, 
+      channelName: room.id,
+      uid: callerId
+    });
+  } catch (err) {
+    console.error("Failed to initiate call:", err);
+    res.status(500).json({ error: "Failed to initiate call" });
+  }
+});
+
+// End call with logging
+app.post("/api/calls/:callId/end", authMiddleware, async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const adminId = req.user.id;
+    
+    // Get call details
+    const { rows } = await pool.query("SELECT * FROM calls WHERE id = $1", [callId]);
+    if (callRows.length === 0) {
+      return res.status(404).json({ error: "Call not found" });
+    }
+    
+    const call = callRows[0];
+    
+    // Log the call end
+    await logMessageEvent(call.caller_id, call.id, "end", { 
+      status: call.status,
+      duration: call.duration_seconds
+    });
+    
+    // Update call status
+    await pool.query("UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = $1", [callId]);
+    
+    res.json({ message: "Call ended" });
+  } catch (err) {
+    console.error("Failed to end call:", err);
+    res.status(500).json({ error: "Failed to end call" });
+  }
+});
+
+// Store call recording
+app.post("/api/calls/:callId/recording", authMiddleware, async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const adminId = req.user.id;
+    
+    // Get call details
+    const { rows } = await pool.query("SELECT * FROM calls WHERE id = $1", [callId]);
+    if (call.status !== 'active') {
+      return res.status(400).json({ error: "Call is not active" });
+    }
+    
+    const call = rows[0];
+    
+    // Store recording in S3
+    const recordingUrl = await uploadToS3(req.body.recording, `recordings/${callId}.webm`);
+    
+    // Log the recording storage
+    await logMessageEvent(call.caller_id, call.id, "record", { 
+      recordingUrl,
+      duration: call.duration_seconds
+    });
+    
+    // Update call with recording URL
+    await pool.query("UPDATE calls SET recording_url = $1 WHERE id = $1", [recordingUrl]);
+    
+    res.json({ recordingUrl });
+  } catch (err) {
+    console.error("Failed to store call recording:", err);
+    res.status(500).json({ error: "Failed to store recording" });
+  }
+});
+
+// Helper function to upload to S3
+async function uploadToS3(file, key) {
+  const s3 = new S3Client({ region: process.env.AWS_REGION });
+  
+  const params = {
+    Bucket: process.env.S3_BUCKET_NAME,
+    Key: key,
+    Body: file,
+    ContentType: file.type
+  };
+  
+  const result = await s3.send(new PutObjectCommand(params));
+  return `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+}
+
+// --- Image and Media Upload with Logging ---
+
+// Upload image with logging
+app.post("/api/media/upload", authMiddleware, upload.single("file"), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const file = req.file;
+    
+    // Upload to S3
+    const fileKey = `media/${userId}/${Date.now()}-${file.originalname}`;
+    const fileUrl = await uploadToS3(file, fileKey);
+    
+    // Log the upload
+    await logMessageEvent(userId, null, "media_upload", { 
+      fileName: file.originalname,
+      fileSize: file.size,
+      fileType: file.type,
+      fileUrl
+    });
+    
+    // Save to database
+    const { rows } = await pool.query(`
+      INSERT INTO media (user_id, filename, original_name, file_size, file_type, s3_key, s3_url, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, NOW())
+      RETURNING *
+    `, [userId, file.originalname, file.size, file.type, fileKey, fileUrl]);
+    
+    res.json({ 
+      message: "Media uploaded successfully", 
+      media: rows[0] 
+    });
+  } catch (err) {
+    console.error("Error uploading media:", err);
+    res.status(500).json({ error: "Failed to upload media" });
+  }
+});
+
+// Delete media with logging
+app.delete("/api/media/:mediaId", authMiddleware, async (req, const res) => {
+  try {
+    const { mediaId } = req.params;
+    const userId = req.user.id;
+    
+    // Get media details
+    const { rows } = await pool.query("SELECT * FROM media WHERE id = $1", [mediaId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Media not found" });
+    }
+    
+    const media = rows[0];
+    
+    // Store deleted content in deleted_content table
+    await pool.query(`
+      INSERT INTO deleted_content (user_id, content_type, content_id, original_content, deleted_at, deleted_by)
+      VALUES ($1, 'media', $2, $3, $4, NOW(), $5)
+    `, [userId, media.id, media.url]);
+    
+    // Log the deletion
+    await logMessageEvent(userId, null, "media_delete", { 
+      fileName: media.original_name,
+      fileType: media.type,
+      s3_key: media.s3_key
+    });
+    
+    // Delete from database
+    await pool.query("DELETE FROM media WHERE id = $1", [mediaId]);
+    
+    res.json({ message: "Media deleted successfully" });
+  } catch (err) {
+    console.error("Error deleting media:", err);
+    res.status(500).json({ error: "Failed to delete media" });
+  }
+});
+
+// --- Voice Message Recording and Transcription ---
+
+// Store voice message with logging
+app.post("/api/messages/voice", authMiddleware, upload.single("audio"), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.body;
+    const file = req.file;
+    
+    // Upload to S3
+    const fileKey = `voice/${userId}/${Date.now()}-${file.originalname}`;
+    const audioUrl = await uploadToS3(file, fileKey);
+    
+    // Log the voice message
+    await logMessageEvent(userId, chatId, "voice_message", { 
+      fileName: file.originalname,
+      duration: req.body.duration,
+      audioUrl
+    });
+    
+    // Save to database
+    const { rows } = await pool.query(`
+      INSERT INTO messages (from_user_id, to_user_id, content, type, chat_id, created_at)
+      VALUES ($1, $2, $3, 'voice', $4, NOW())
+      RETURNING *
+    `, [userId, chatId, audioUrl, req.body.duration]);
+    
+    res.json({ message: rows[0] });
+  } catch (err) {
+    console.error("Error sending voice message:", err);
+    res.status(500).json({ error: "Failed to send voice message" });
+  }
+});
+
+// Transcribe voice message with logging
+app.post("/api/messages/:messageId/transcribe", authMiddleware, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const adminId = req.user.id;
+    
+    // Get message details
+    const { rows } = await pool.query("SELECT * FROM messages WHERE id = $1", [messageId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+    
+    const message = rows[0];
+    
+    // Get the audio file from S3
+    const { rows: audioRows } = await pool.query("SELECT * FROM messages WHERE id = $1", [messageId]);
+    if (audioRows.length === 0 || !audioRows[0].content) {
+      return res.status(404).json({ error: "Audio message not found" });
+    }
+    
+    const audioUrl = audioRows[0].content;
+    const fileKey = audioUrl.split('/').pop();
+    
+    // Download from S3
+    const audioBuffer = await downloadFromS3(fileKey);
+    
+    // Transcribe with Whisper API
+    const formData = new FormData();
+    formData.append("file", new Blob([audioBuffer], { type: "audio/webm" }));
+    formData.append("model", "whisper-1");
+    formData.append("response_format", "verbose_json");
+    
+    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+      },
+      body: formData
+    });
+    
+    if (!response.ok) {
+      const transcriptionData = await response.json();
+      
+      // Log the transcription
+      await logMessageEvent(req.user.id, null, "transcription", { 
+        messageId,
+        transcript: transcriptionData.text,
+        language: transcriptionData.language
+      });
+      
+      // Save transcription
+      await pool.query(`
+        UPDATE messages 
+        SET transcription = $1, transcribed = true, transcribed_text = $2
+        WHERE id = $3
+      `, [transcriptionData.text, messageId]);
+      
+      res.json({ 
+        message: "Message transcribed successfully", 
+        transcription: transcriptionData 
+      });
+    } else {
+      res.status(500).json({ error: "Failed to transcribe message" });
+    }
+  } catch (err) {
+    console.error("Error transcribing message:", err);
+    res.status(500).json({ error: "Failed to transcribe message" });
+  }
+});
+
+// --- Search for Admins ---
+
+// Search messages for admins
+app.get("/api/admin/messages/search", adminAuthMiddleware, async (req, res) => {
+  try {
+    const { query = req.query.q;
+    const { page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    
+    const { rows } = await pool.query(`
+      SELECT m.*, u.username, u.email, u.avatar_url
+      FROM messages m
+      JOIN users u ON m.from_user_id = u.id
+      WHERE m.content ILIKE $1 OR m.content ILIKE $2 OR u.username ILIKE $3 OR u.email ILIKE $4 OR m.content ILIKE $5
+      ORDER BY m.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [`%${query}%`, limit, offset]);
+    
+    res.json({ messages: rows });
+  } catch (err) {
+    console.error("Error searching messages:", err);
+    res.status(500).json({ error: "Failed to search messages" });
+  }
+});
+
+// Search deleted content for admins
+app.get("/api/admin/deleted-content", adminAuthMiddleware, async (req, res) => {
+  try {
+    const { type = req.query.type || 'all';
+    const { page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    
+    let query = `
+      SELECT dc.*, u.username, u.email, u.avatar_url
+      FROM deleted_content dc
+      JOIN users u ON dc.user_id = u.id
+    `;
+    
+    if (type !== 'all') {
+      query += ` WHERE dc.content_type = $1`;
+    }
+    
+    query += ` ORDER BY dc.deleted_at DESC LIMIT $2 OFFSET $3`;
+    
+    const { rows } = await pool.query(query);
+    res.json({ deletedContent: rows });
+  } catch (err) {
+    console.error("Error searching deleted content:", err);
+    res.status(500).json({ error: "Failed to search deleted content" });
+  }
+});
+
+// Search call recordings for admins
+app.get("/api/admin/calls", adminAuthMiddleware, async (req, res) => {
+  try {
+    const { page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    
+    const { rows } = await pool.query(`
+      SELECT c.*, u.username, u.avatar_url
+      FROM calls c
+      JOIN users u ON c.caller_id = u.id
+      ORDER BY c.created_at DESC
+      LIMIT $2 OFFSET $3
+    `);
+    
+    res.json({ calls: rows });
+  } catch (err) {
+    console.error("Error searching calls:", err);
+    res.status(500).json({ error: "Failed to search calls" });
+  }
+});
+
+// Get all deleted content for admins
+app.get("/api/admin/deleted-content", adminAuthMiddleware, async (req, res) => {
+  try {
+    const { type = req.query.type || 'all';
+    
+    let query = `
+      SELECT dc.*, u.username, u.email, u.avatar_url
+      FROM deleted_content dc
+      JOIN users u ON dc.user_id = u.id
+    `;
+    
+    if (type !== 'all') {
+      query += ` WHERE dc.content_type = $1`;
+    }
+    
+    query += ` ORDER BY dc.deleted_at DESC`;
+    
+    const { rows } = await pool.query(query);
+    res.json({ deletedContent: rows });
+  } catch (err) {
+    console.error("Error fetching deleted content:", err);
+    res.status(500).json({ error: "Failed to fetch deleted content" });
+  }
+});
+
+// Get deleted content details
+app.get("/api/admin/deleted-content/:id", adminAuthMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const { rows } = await pool.query(`
+      SELECT dc.*, u.username, u.email, u.avatar_url
+      FROM deleted_content dc
+      JOIN users u ON dc.user_id = u.id
+      WHERE dc.id = $1
+    `, [id]);
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Content not found" });
+    }
+    
+    const content = rows[0];
+    
+    // Get original content if available
+    let originalContent = content.original_content;
+    if (!originalContent && content.content_type !== 'text') {
+      try {
+        originalContent = await downloadFromS3(content.s3_key);
+        originalContent = await originalContent.text();
+      } catch (err) {
+        console.error("Failed to download original content:", err);
+      }
+    }
+    
+    res.json({ 
+      content: {
+        ...content,
+        originalContent
+      } 
+    });
+  } catch (err) {
+    console.error("Error fetching deleted content details:", err);
+    res.status(500).json({ error: "Failed to fetch content details" });
+  }
+});
+
+// Helper function to download from S3
+async function downloadFromS3(key) {
+  const getObjectCommand = new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: key });
+  const response = await s3.send(getObjectCommand);
+  return Buffer.from(response.Body);
+}
+
+// Helper function to upload to S3
+async function uploadToS3(file, key) {
+  const s3 = new S3Client({ region: process.env.AWS_REGION });
+  const putObjectCommand = new PutObjectCommand({
+    Bucket: process.env.S3_BUCKET_NAME,
+    Key: key,
+    Body: file
+  });
+  await s3.send(putObjectCommand);
+  return `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+}
 // --- Withdraw request ---
 
 app.post("/withdraw", authMiddleware, async (req, res) => {
