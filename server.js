@@ -4945,6 +4945,332 @@ io.on("connection", (socket) => {
         "UPDATE wallets SET coins = coins - $1, last_updated = NOW() WHERE user_id = $2",
         [amount, socket.userId]
       );
+
+      // Add these routes to your existing codebase
+
+// --- Account Confirmation ---
+
+// Send confirmation email
+app.post("/api/send-confirmation", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Get user details
+    const { rows } = await pool.query(
+      "SELECT * FROM users WHERE id = $1",
+      [userId]
+    );
+    
+    if (rows.length === 0) return res.status(404).json({ error: "User not found" });
+    
+    const user = rows[0];
+    
+    // If already verified, return success
+    if (user.is_verified) {
+      return res.json({ message: "Account already verified" });
+    }
+    
+    // Generate confirmation token
+    const confirmationToken = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: "24h" });
+    
+    // Create confirmation URL
+    const confirmUrl = `${FRONTEND_URL}/confirm-email?token=${confirmationToken}`;
+    
+    // Send confirmation email
+    await sendEmail({
+      to: user.email,
+      subject: "Confirm Your Email Address",
+      html: `<p>Hi ${user.username},</p>
+             <p>Please click the link below to confirm your email address:</p>
+             <p><a href="${confirmUrl}">Confirm Email</a></p>
+             <p>This link will expire in 24 hours.</p>`
+    });
+    
+    res.json({ message: "Confirmation email sent" });
+  } catch (err) {
+    console.error("Send confirmation email error:", err);
+    res.status(500).json({ error: "Failed to send confirmation email" });
+  }
+});
+
+// Confirm email
+app.post("/api/confirm-email", async (req, res) => {
+  try {
+    const { token } = req.body;
+    
+    if (!token) return res.status(400).json({ error: "Confirmation token is required" });
+    
+    // Verify token
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // Get user details
+    const { rows } = await pool.query(
+      "SELECT * FROM users WHERE id = $1",
+      [decoded.id]
+    );
+    
+    if (rows.length === 0) return res.status(404).json({ error: "User not found" });
+    
+    const user = rows[0];
+    
+    // Update user as verified
+    await pool.query(
+      "UPDATE users SET is_verified = true, updated_at = NOW() WHERE id = $1",
+      [user.id]
+    );
+    
+    res.json({ message: "Email confirmed successfully" });
+  } catch (err) {
+    console.error("Confirm email error:", err);
+    res.status(500).json({ error: "Failed to confirm email" });
+  }
+});
+
+// --- Dislike Functionality ---
+
+// Dislike/undislike video
+app.post("/api/videos/:id/dislike", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { action } = req.body; // 'dislike' or 'undislike'
+    
+    // Check if video exists
+    const { rows: videoRows } = await pool.query(
+      "SELECT * FROM videos WHERE id = $1",
+      [id]
+    );
+    
+    if (videoRows.length === 0) return res.status(404).json({ error: "Video not found" });
+    
+    const video = videoRows[0];
+    
+    // Check if user already disliked this video
+    const { rows: dislikeRows } = await pool.query(
+      "SELECT * FROM dislikes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+      [userId, id]
+    );
+    
+    const alreadyDisliked = dislikeRows.length > 0;
+    
+    if (action === 'dislike' && !alreadyDisliked) {
+      // Add dislike
+      await pool.query(
+        "INSERT INTO dislikes (user_id, content_type, content_id, created_at) VALUES ($1, 'video', $2, NOW())",
+        [userId, id]
+      );
+      
+      // Update video dislikes count
+      await pool.query(
+        "UPDATE videos SET dislikes = dislikes + 1 WHERE id = $1",
+        [id]
+      );
+      
+      // If user had previously liked, remove the like
+      const { rows: likeRows } = await pool.query(
+        "SELECT * FROM likes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+        [userId, id]
+      );
+      
+      if (likeRows.length > 0) {
+        // Remove like
+        await pool.query(
+          "DELETE FROM likes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+          [userId, id]
+        );
+        
+        // Update video likes count
+        await pool.query(
+          "UPDATE videos SET likes = GREATEST(likes - 1, 0) WHERE id = $1",
+          [id]
+        );
+        
+        // Update creator stats
+        await pool.query(
+          `UPDATE creator_stats 
+           SET total_likes = GREATEST(total_likes - 1, 0), updated_at = NOW() 
+           WHERE user_id = $1`,
+          [video.user_id]
+        );
+      }
+    } else if (action === 'undislike' && alreadyDisliked) {
+      // Remove dislike
+      await pool.query(
+        "DELETE FROM dislikes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+        [userId, id]
+      );
+      
+      // Update video dislikes count
+      await pool.query(
+        "UPDATE videos SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1",
+        [id]
+      );
+    }
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Dislike video error:", err);
+    res.status(500).json({ error: "Failed to dislike video" });
+  }
+});
+
+// Dislike/undislike comment
+app.post("/api/comments/:id/dislike", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { action } = req.body; // 'dislike' or 'undislike'
+    
+    // Check if comment exists
+    const { rows: commentRows } = await pool.query(
+      "SELECT * FROM comments WHERE id = $1",
+      [id]
+    );
+    
+    if (commentRows.length === 0) return res.status(404).json({ error: "Comment not found" });
+    
+    const comment = commentRows[0];
+    
+    // Check if user already disliked this comment
+    const { rows: dislikeRows } = await pool.query(
+      "SELECT * FROM dislikes WHERE user_id = $1 AND content_type = 'comment' AND content_id = $2",
+      [userId, id]
+    );
+    
+    const alreadyDisliked = dislikeRows.length > 0;
+    
+    if (action === 'dislike' && !alreadyDisliked) {
+      // Add dislike
+      await pool.query(
+        "INSERT INTO dislikes (user_id, content_type, content_id, created_at) VALUES ($1, 'comment', $2, NOW())",
+        [userId, id]
+      );
+      
+      // Update comment dislikes count
+      await pool.query(
+        "UPDATE comments SET dislikes = dislikes + 1 WHERE id = $1",
+        [id]
+      );
+      
+      // If user had previously liked, remove the like
+      const { rows: likeRows } = await pool.query(
+        "SELECT * FROM likes WHERE user_id = $1 AND content_type = 'comment' AND content_id = $2",
+        [userId, id]
+      );
+      
+      if (likeRows.length > 0) {
+        // Remove like
+        await pool.query(
+          "DELETE FROM likes WHERE user_id = $1 AND content_type = 'comment' AND content_id = $2",
+          [userId, id]
+        );
+        
+        // Update comment likes count
+        await pool.query(
+          "UPDATE comments SET likes = GREATEST(likes - 1, 0) WHERE id = $1",
+          [id]
+        );
+      }
+    } else if (action === 'undislike' && alreadyDisliked) {
+      // Remove dislike
+      await pool.query(
+        "DELETE FROM dislikes WHERE user_id = $1 AND content_type = 'comment' AND content_id = $2",
+        [userId, id]
+      );
+      
+      // Update comment dislikes count
+      await pool.query(
+        "UPDATE comments SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1",
+        [id]
+      );
+    }
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Dislike comment error:", err);
+    res.status(500).json({ error: "Failed to dislike comment" });
+  }
+});
+
+// Get user's like/dislike status for a video
+app.get("/api/videos/:id/reaction-status", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    
+    // Check if user liked this video
+    const { rows: likeRows } = await pool.query(
+      "SELECT * FROM likes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+      [userId, id]
+    );
+    
+    // Check if user disliked this video
+    const { rows: dislikeRows } = await pool.query(
+      "SELECT * FROM dislikes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+      [userId, id]
+    );
+    
+    res.json({
+      liked: likeRows.length > 0,
+      disliked: dislikeRows.length > 0
+    });
+  } catch (err) {
+    console.error("Get reaction status error:", err);
+    res.status(500).json({ error: "Failed to get reaction status" });
+  }
+});
+
+// Get user's like/dislike status for a comment
+app.get("/api/comments/:id/reaction-status", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    
+    // Check if user liked this comment
+    const { rows: likeRows } = await pool.query(
+      "SELECT * FROM likes WHERE user_id = $1 AND content_type = 'comment' AND content_id = $2",
+      [userId, id]
+    );
+    
+    // Check if user disliked this comment
+    const { rows: dislikeRows } = await pool.query(
+      "SELECT * FROM dislikes WHERE user_id = $1 AND content_type = 'comment' AND content_id = $2",
+      [userId, id]
+    );
+    
+    res.json({
+      liked: likeRows.length > 0,
+      disliked: dislikeRows.length > 0
+    });
+  } catch (err) {
+    console.error("Get reaction status error:", err);
+    res.status(500).json({ error: "Failed to get reaction status" });
+  }
+});
+
+// Add these tables to your database initialization function
+
+// Dislikes table
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS dislikes (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    content_type VARCHAR(20) CHECK (content_type IN ('video', 'music', 'comment')),
+    content_id INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+  )
+`);
+
+// Email confirmations table
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS email_confirmations (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    token VARCHAR(255) UNIQUE NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+  )
+`);
       
       // Add to streamer's wallet
       await pool.query(
