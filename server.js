@@ -23,29 +23,53 @@ import ffmpegPath from "ffmpeg-static";
 import axios from "axios";
 import OpenAI from "openai";
 import FormData from "form-data";
+import Redis from "ioredis";
+import NodeCache from "node-cache";
+import cron from "node-cron";
+import { createWorker } from "tesseract.js";
+import sharp from "sharp";
+import { createCanvas, loadImage } from "canvas";
+import { createHmac } from "crypto";
+import { Worker } from "worker_threads";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
 
-import session from "express-session";
-import RedisStore from "connect-redis";
-import { createClient } from "redis";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const app = express();               // ✅ FIRST
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-const redisClient = createClient({
-  url: process.env.REDIS_URL
+// Initialize Redis for caching and session storage
+const redis = new Redis(process.env.REDIS_URL);
+const cache = new NodeCache({ stdTTL: 600 }); // Cache with 10 minute TTL
+
+// Initialize PostgreSQL pool
+const pool = new pg.Pool({
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASS,
+  port: process.env.DB_PORT,
+  max: 20, // Maximum number of clients in the pool
+  idleTimeoutMillis: 30000, // How long a client is allowed to remain idle before being closed
+  connectionTimeoutMillis: 2000, // How long to wait when connecting a new client
 });
 
-await redisClient.connect();
+// Session configuration with Redis store
+import session from "express-session";
+import RedisStore from "connect-redis";
 
 app.use(
   session({
-    store: new RedisStore({ client: redisClient }),
+    store: new RedisStore({ client: redis }),
     secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: true,
+      secure: process.env.NODE_ENV === "production",
       sameSite: "none",
       maxAge: 1000 * 60 * 60 * 24 * 7
     }
@@ -89,161 +113,601 @@ const {
   AGORA_APP_ID,
   AGORA_APP_CERTIFICATE,
 
-  // AWS VARS (fixed — DO NOT write AWS_REGION= anything)
+  // AWS VARS
   AWS_REGION,
   AWS_ACCESS_KEY_ID,
   AWS_SECRET_ACCESS_KEY,
   S3_BUCKET_NAME,
-  AWS_S3_BUCKET, // Added for video uploads
+  AWS_S3_BUCKET,
 
-  // MediaConvert (fixed — removed invalid "=" syntax)
+  // MediaConvert
   MEDIACONVERT_ROLE_ARN,
   MEDIACONVERT_ENDPOINT,
 
   // OpenAI for Whisper
-  OPENAI_API_KEY
+  OPENAI_API_KEY,
+
+  // Stripe for payments
+  STRIPE_SECRET_KEY,
+  STRIPE_WEBHOOK_SECRET,
+
+  // Additional services
+  ASSEMBLYAI_KEY,
+  SIGHTENGINE_API_USER,
+  SIGHTENGINE_API_SECRET,
+  DEEP_AI_KEY,
 } = process.env;
 
-// SAFE fallback without redeclaring AWS_REGION
-const region = AWS_REGION || "us-east-1";
-
-// Setup PostgreSQL pool
-const pool = new pg.Pool({
-  user: DB_USER,
-  host: DB_HOST,
-  database: DB_NAME,
-  password: DB_PASS,
-  port: DB_PORT,
+// AWS S3 client
+const s3 = new S3Client({ 
+  region: AWS_REGION,
+  credentials: {
+    accessKeyId: AWS_ACCESS_KEY_ID,
+    secretAccessKey: AWS_SECRET_ACCESS_KEY,
+  }
 });
+
+// OpenAI client
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// Stripe client
+import Stripe from "stripe";
+const stripe = Stripe(STIPE_SECRET_KEY);
 
 // Create tables if they don't exist
 async function initializeTables() {
   try {
-    // Products table
+    // Enhanced users table with additional fields
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS products (
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(255) UNIQUE NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(255),
+        phone VARCHAR(20),
+        device_id VARCHAR(255),
+        profile_url VARCHAR(500),
+        cover_url VARCHAR(500),
+        bio TEXT,
+        social_links JSON,
+        role VARCHAR(20) DEFAULT 'free' CHECK (role IN ('free', 'premium', 'elite', 'admin')),
+        subscription_plan VARCHAR(20) DEFAULT 'free',
+        subscription_expires TIMESTAMP,
+        is_musician BOOLEAN DEFAULT false,
+        is_creator BOOLEAN DEFAULT false,
+        is_admin BOOLEAN DEFAULT false,
+        is_verified BOOLEAN DEFAULT false,
+        verification_status VARCHAR(20) DEFAULT 'none' CHECK (verification_status IN ('none', 'pending', 'approved', 'rejected')),
+        status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'banned')),
+        suspend_until TIMESTAMP,
+        suspension_reason TEXT,
+        auth_provider VARCHAR(50),
+        earnings DECIMAL(10, 2) DEFAULT 0,
+        balance DECIMAL(10, 2) DEFAULT 0,
+        dob DATE,
+        preferences JSON,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Enhanced content tables for YouTube/TikTok functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS videos (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        video_url VARCHAR(500) NOT NULL,
+        thumbnail_url VARCHAR(500),
+        duration INTEGER, -- in seconds
+        tags JSON,
+        category VARCHAR(100),
+        is_public BOOLEAN DEFAULT true,
+        is_short BOOLEAN DEFAULT false, -- For TikTok-style short videos
+        processing_status VARCHAR(20) DEFAULT 'pending' CHECK (processing_status IN ('pending', 'processing', 'completed', 'failed')),
+        views INTEGER DEFAULT 0,
+        likes INTEGER DEFAULT 0,
+        dislikes INTEGER DEFAULT 0,
+        comments_count INTEGER DEFAULT 0,
+        shares INTEGER DEFAULT 0,
+        earnings DECIMAL(10, 2) DEFAULT 0,
+        content_rating VARCHAR(10) DEFAULT 'general' CHECK (content_rating IN ('general', 'mature', 'adult')),
+        language VARCHAR(10) DEFAULT 'en',
+        transcription TEXT,
+        auto_captions JSON,
+        custom_captions JSON,
+        download_allowed BOOLEAN DEFAULT true,
+        monetization_enabled BOOLEAN DEFAULT true,
+        ad_breaks JSON, -- Timestamps for ad breaks
+        featured BOOLEAN DEFAULT false,
+        trending_score DECIMAL(10, 2) DEFAULT 0,
+        recommendation_score DECIMAL(10, 2) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Music table for Spotify-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS music (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        artist VARCHAR(255) NOT NULL,
+        album VARCHAR(255),
+        genre VARCHAR(100),
+        music_url VARCHAR(500) NOT NULL,
+        cover_url VARCHAR(500),
+        duration INTEGER, -- in seconds
+        lyrics TEXT,
+        explicit BOOLEAN DEFAULT false,
+        track_number INTEGER,
+        isrc VARCHAR(12), -- International Standard Recording Code
+        license_type VARCHAR(50) DEFAULT 'standard',
+        listens INTEGER DEFAULT 0,
+        likes INTEGER DEFAULT 0,
+        shares INTEGER DEFAULT 0,
+        downloads INTEGER DEFAULT 0,
+        earnings DECIMAL(10, 2) DEFAULT 0,
+        featured BOOLEAN DEFAULT false,
+        trending_score DECIMAL(10, 2) DEFAULT 0,
+        recommendation_score DECIMAL(10, 2) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Playlists table for Spotify-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS playlists (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
         name VARCHAR(255) NOT NULL,
         description TEXT,
-        price DECIMAL(10, 2) NOT NULL,
-        type VARCHAR(20) NOT NULL CHECK (type IN ('physical', 'digital')),
-        crypto VARCHAR(10), -- For digital products (ETH, BTC, etc.)
-        sizes JSON, -- For physical products
-        colors JSON, -- For physical products
-        stock INTEGER, -- For physical products
-        images JSON, -- Array of image URLs
-        tags JSON, -- Array of tags
+        cover_url VARCHAR(500),
+        is_public BOOLEAN DEFAULT true,
+        is_collaborative BOOLEAN DEFAULT false,
+        tracks JSON, -- Array of music IDs
+        followers INTEGER DEFAULT 0,
+        plays INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       )
     `);
 
-    // Orders table
+    // Podcasts table
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS orders (
+      CREATE TABLE IF NOT EXISTS podcasts (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        items JSON, -- Array of order items
-        total DECIMAL(10, 2) NOT NULL,
-        payment_method VARCHAR(50), -- 'bank' or crypto type
-        shipping_address JSON, -- For physical products
-        status VARCHAR(20) NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'shipped', 'delivered', 'cancelled', 'refunded')),
-        tracking_number VARCHAR(100),
-        delivery_date DATE,
-        cancel_reason TEXT,
-        refund_date DATE,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        cover_url VARCHAR(500),
+        category VARCHAR(100),
+        language VARCHAR(10) DEFAULT 'en',
+        explicit BOOLEAN DEFAULT false,
+        rss_url VARCHAR(500),
+        followers INTEGER DEFAULT 0,
+        plays INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       )
     `);
 
-    // Add total_stripe_sales and total_crypto_sales to creator_stats if not exists
+    // Podcast episodes table
     await pool.query(`
-      ALTER TABLE creator_stats 
-      ADD COLUMN IF NOT EXISTS total_stripe_sales DECIMAL(10, 2) DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS total_crypto_sales DECIMAL(10, 2) DEFAULT 0
-    `);
-
-    // Video processing tables for ProUploadStudio
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS video_processing_jobs (
+      CREATE TABLE IF NOT EXISTS podcast_episodes (
         id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
-        job_type VARCHAR(50) NOT NULL,
-        parameters JSON,
-        status VARCHAR(20) DEFAULT 'pending',
-        result JSON,
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS video_audio_tracks (
-        id SERIAL PRIMARY KEY,
-        video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        name VARCHAR(255) NOT NULL,
+        podcast_id INTEGER REFERENCES podcasts(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
         audio_url VARCHAR(500) NOT NULL,
-        gain DECIMAL(3,2) DEFAULT 1,
-        mute BOOLEAN DEFAULT false,
-        solo BOOLEAN DEFAULT false,
+        duration INTEGER, -- in seconds
+        episode_number INTEGER,
+        season_number INTEGER,
+        publish_date TIMESTAMP,
+        listens INTEGER DEFAULT 0,
+        likes INTEGER DEFAULT 0,
+        downloads INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       )
     `);
 
+    // Enhanced livestreams table for Twitch-like functionality
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS video_captions (
-        id SERIAL PRIMARY KEY,
-        video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
-        start_time DECIMAL(10,2) NOT NULL,
-        end_time DECIMAL(10,2) NOT NULL,
-        text TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS video_caption_styles (
-        id SERIAL PRIMARY KEY,
-        video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE UNIQUE,
-        font_size INTEGER DEFAULT 16,
-        color VARCHAR(7) DEFAULT '#FFFFFF',
-        background_color VARCHAR(20) DEFAULT 'rgba(0,0,0,0.5)',
-        position VARCHAR(10) DEFAULT 'bottom',
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS video_export_settings (
-        id SERIAL PRIMARY KEY,
-        video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE UNIQUE,
-        resolution VARCHAR(10) DEFAULT '1080p',
-        format VARCHAR(10) DEFAULT 'mp4',
-        quality VARCHAR(10) DEFAULT 'high',
-        fps INTEGER DEFAULT 30,
-        bitrate INTEGER DEFAULT 5000,
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS uploaded_files (
+      CREATE TABLE IF NOT EXISTS livestreams (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        filename VARCHAR(255) NOT NULL,
-        original_name VARCHAR(255) NOT NULL,
-        mime_type VARCHAR(100) NOT NULL,
-        size INTEGER NOT NULL,
-        s3_key VARCHAR(255) NOT NULL,
-        s3_url VARCHAR(500) NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        category VARCHAR(100),
+        thumbnail_url VARCHAR(500),
+        stream_key VARCHAR(255) UNIQUE NOT NULL,
+        is_live BOOLEAN DEFAULT false,
+        is_scheduled BOOLEAN DEFAULT false,
+        scheduled_start TIMESTAMP,
+        viewers INTEGER DEFAULT 0,
+        peak_viewers INTEGER DEFAULT 0,
+        likes INTEGER DEFAULT 0,
+        shares INTEGER DEFAULT 0,
+        duration INTEGER, -- in seconds
+        recording_url VARCHAR(500), -- VOD URL
+        chat_enabled BOOLEAN DEFAULT true,
+        delay_seconds INTEGER DEFAULT 0, -- Stream delay
+        tags JSON,
+        earnings DECIMAL(10, 2) DEFAULT 0,
+        started_at TIMESTAMP,
+        ended_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // VOD (Video on Demand) table for Twitch-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS vods (
+        id SERIAL PRIMARY KEY,
+        stream_id INTEGER REFERENCES livestreams(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        thumbnail_url VARCHAR(500),
+        duration INTEGER, -- in seconds
+        views INTEGER DEFAULT 0,
+        likes INTEGER DEFAULT 0,
+        is_highlight BOOLEAN DEFAULT false,
+        is_processed BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Clips table for Twitch-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS clips (
+        id SERIAL PRIMARY KEY,
+        stream_id INTEGER REFERENCES livestreams(id) ON DELETE CASCADE,
+        creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255),
+        thumbnail_url VARCHAR(500),
+        video_url VARCHAR(500) NOT NULL,
+        duration INTEGER, -- in seconds (max 60)
+        views INTEGER DEFAULT 0,
+        likes INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Stories table for Instagram-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS stories (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        media_url VARCHAR(500) NOT NULL,
+        media_type VARCHAR(10) CHECK (media_type IN ('image', 'video')),
+        duration INTEGER, -- in seconds (for video stories)
+        is_active BOOLEAN DEFAULT true,
+        views JSON, -- Array of user IDs who viewed the story
+        reactions JSON, -- Object with emoji keys and user ID arrays as values
+        created_at TIMESTAMP DEFAULT NOW(),
+        expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '24 hours')
+      )
+    `);
+
+    // Highlights table for Instagram-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS highlights (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        cover_url VARCHAR(500),
+        stories JSON, -- Array of story IDs
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Challenges table for TikTok-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS challenges (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        hashtag VARCHAR(100) UNIQUE NOT NULL,
+        banner_url VARCHAR(500),
+        sound_url VARCHAR(500), -- Associated sound/music
+        start_date TIMESTAMP DEFAULT NOW(),
+        end_date TIMESTAMP,
+        is_active BOOLEAN DEFAULT true,
+        is_featured BOOLEAN DEFAULT false,
+        participants INTEGER DEFAULT 0,
+        views INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Challenge entries table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS challenge_entries (
+        id SERIAL PRIMARY KEY,
+        challenge_id INTEGER REFERENCES challenges(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
+        votes INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Duet/Stitch table for TikTok-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS video_interactions (
+        id SERIAL PRIMARY KEY,
+        original_video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
+        response_video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        interaction_type VARCHAR(10) CHECK (interaction_type IN ('duet', 'stitch')),
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Enhanced comments table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS comments (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        content_type VARCHAR(20) CHECK (content_type IN ('video', 'music', 'podcast', 'livestream')),
+        content_id INTEGER NOT NULL,
+        parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        likes INTEGER DEFAULT 0,
+        dislikes INTEGER DEFAULT 0,
+        replies_count INTEGER DEFAULT 0,
+        is_pinned BOOLEAN DEFAULT false,
+        is_deleted BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Enhanced notifications table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        type VARCHAR(50) NOT NULL,
+        title VARCHAR(255),
+        message TEXT,
+        data JSON, -- Additional data related to the notification
+        is_read BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Ads table for YouTube-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ads (
+        id SERIAL PRIMARY KEY,
+        advertiser_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        media_url VARCHAR(500) NOT NULL,
+        media_type VARCHAR(10) CHECK (media_type IN ('image', 'video')),
+        target_audience JSON, -- Demographics, interests, etc.
+        budget DECIMAL(10, 2) NOT NULL,
+        bid_amount DECIMAL(10, 2) NOT NULL, -- Cost per view/click
+        ad_type VARCHAR(20) CHECK (ad_type IN ('pre-roll', 'mid-roll', 'post-roll', 'banner')),
+        start_date TIMESTAMP NOT NULL,
+        end_date TIMESTAMP NOT NULL,
+        is_active BOOLEAN DEFAULT true,
+        views INTEGER DEFAULT 0,
+        clicks INTEGER DEFAULT 0,
+        spend DECIMAL(10, 2) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Channel points/rewards table for Twitch-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS channel_rewards (
+        id SERIAL PRIMARY KEY,
+        streamer_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        icon_url VARCHAR(500),
+        cost INTEGER NOT NULL, -- Points cost
+        is_enabled BOOLEAN DEFAULT true,
+        redemptions INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Channel points transactions table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS channel_points_transactions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        streamer_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        reward_id INTEGER REFERENCES channel_rewards(id) ON DELETE SET NULL,
+        points INTEGER NOT NULL,
+        type VARCHAR(20) CHECK (type IN ('earn', 'spend', 'refund')),
+        description TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Emotes table for Twitch-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS emotes (
+        id SERIAL PRIMARY KEY,
+        streamer_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        name VARCHAR(50) NOT NULL,
+        image_url VARCHAR(500) NOT NULL,
+        tier INTEGER DEFAULT 1, -- Subscription tier required
+        is_global BOOLEAN DEFAULT false,
+        usage_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Watch history table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS watch_history (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        content_type VARCHAR(20) CHECK (content_type IN ('video', 'music', 'podcast', 'livestream')),
+        content_id INTEGER NOT NULL,
+        watch_duration INTEGER, -- in seconds
+        completed BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Recommendation table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS recommendations (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        content_type VARCHAR(20) CHECK (content_type IN ('video', 'music', 'podcast', 'livestream')),
+        content_id INTEGER NOT NULL,
+        score DECIMAL(5, 4) NOT NULL, -- Recommendation score (0-1)
+        reason VARCHAR(100), -- Why this was recommended
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Trending table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS trending (
+        id SERIAL PRIMARY KEY,
+        content_type VARCHAR(20) CHECK (content_type IN ('video', 'music', 'podcast', 'challenge')),
+        content_id INTEGER NOT NULL,
+        score DECIMAL(10, 2) NOT NULL,
+        period VARCHAR(20) CHECK (period IN ('hour', 'day', 'week', 'month')),
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Offline downloads table for Spotify-like functionality
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS offline_downloads (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        content_type VARCHAR(20) CHECK (content_type IN ('video', 'music', 'podcast')),
+        content_id INTEGER NOT NULL,
+        download_token VARCHAR(255) UNIQUE NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Content moderation table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS content_reports (
+        id SERIAL PRIMARY KEY,
+        reporter_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        content_type VARCHAR(20) CHECK (content_type IN ('video', 'music', 'podcast', 'comment', 'user')),
+        content_id INTEGER NOT NULL,
+        reason VARCHAR(100) NOT NULL,
+        description TEXT,
+        status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'reviewing', 'resolved', 'dismissed')),
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Content moderation actions table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS moderation_actions (
+        id SERIAL PRIMARY KEY,
+        moderator_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        target_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        content_type VARCHAR(20) CHECK (content_type IN ('video', 'music', 'podcast', 'comment', 'user')),
+        content_id INTEGER,
+        action VARCHAR(50) NOT NULL, -- e.g., 'remove_content', 'suspend_user', 'ban_user'
+        reason TEXT,
+        duration INTEGER, -- For temporary actions in days
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Content filters table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS content_filters (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        filter_type VARCHAR(50) NOT NULL, -- e.g., 'channel', 'keyword', 'category'
+        filter_value VARCHAR(255) NOT NULL,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Analytics events table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS analytics_events (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        session_id VARCHAR(255),
+        event_type VARCHAR(100) NOT NULL,
+        event_data JSON,
+        ip_address INET,
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // User preferences table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_preferences (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        auto_play BOOLEAN DEFAULT true,
+        quality_preference VARCHAR(20) DEFAULT 'auto', -- 'auto', 'high', 'medium', 'low'
+        language VARCHAR(10) DEFAULT 'en',
+        theme VARCHAR(20) DEFAULT 'light', -- 'light', 'dark', 'auto'
+        notifications JSON, -- Notification preferences
+        privacy JSON, -- Privacy settings
+        recommendations JSON, -- Recommendation preferences
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Subscription tiers table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS subscription_tiers (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        price DECIMAL(10, 2) NOT NULL,
+        billing_cycle VARCHAR(20) CHECK (billing_cycle IN ('monthly', 'yearly')),
+        features JSON, -- List of features included in this tier
+        max_upload_quality VARCHAR(20), -- e.g., '720p', '1080p', '4k'
+        max_storage_gb INTEGER,
+        no_ads BOOLEAN DEFAULT false,
+        priority_support BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // User subscriptions table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_subscriptions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        tier_id INTEGER REFERENCES subscription_tiers(id) ON DELETE CASCADE,
+        stripe_subscription_id VARCHAR(255),
+        status VARCHAR(20) CHECK (status IN ('active', 'canceled', 'past_due', 'unpaid')),
+        current_period_start TIMESTAMP,
+        current_period_end TIMESTAMP,
+        cancel_at_period_end BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
       )
     `);
 
@@ -264,26 +728,44 @@ const transporter = nodemailer.createTransport({
   auth: { user: EMAIL_USER, pass: EMAIL_PASS },
 });
 
-// Multer setup for verification uploads
-const UPLOAD_DIR = path.join(process.cwd(), "uploads/verification");
+// Multer setup for file uploads
+const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  destination: (req, file, cb) => {
+    const subDir = file.fieldname === 'thumbnail' ? 'thumbnails' : 'uploads';
+    const dir = path.join(UPLOAD_DIR, subDir);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname);
     cb(null, `${Date.now()}-${file.fieldname}${ext}`);
   },
 });
-export const upload = multer({ storage });
 
-app.use(express.json());
-app.use(
-  session({
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: true,
-  })
-);
+export const upload = multer({ 
+  storage,
+  limits: {
+    fileSize: 100 * 1024 * 1024, // 100MB max file size
+  },
+  fileFilter: (req, file, cb) => {
+    // Allow common media file types
+    const allowedTypes = [
+      'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+      'video/mp4', 'video/webm', 'video/ogg',
+      'audio/mpeg', 'audio/wav', 'audio/ogg'
+    ];
+    
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Unsupported file type: ${file.mimetype}`));
+    }
+  }
+});
+
 app.use(passport.initialize());
 app.use(passport.session());
 
@@ -329,8 +811,8 @@ passport.use(
         let user = rows[0];
         if (!user) {
           const r = await pool.query(
-            `INSERT INTO users (username, email, role, subscription_plan, is_musician, is_creator, is_admin, created_at)
-             VALUES ($1, $2, 'free', 'free', false, false, false, NOW())
+            `INSERT INTO users (username, email, role, subscription_plan, is_musician, is_creator, is_admin, auth_provider, created_at)
+             VALUES ($1, $2, 'free', 'free', false, false, false, 'google', NOW())
              RETURNING *`,
             [profile.displayName || profile.username || email.split("@")[0], email]
           );
@@ -361,8 +843,8 @@ passport.use(
         let user = rows[0];
         if (!user) {
           const r = await pool.query(
-            `INSERT INTO users (username, email, role, subscription_plan, is_musician, is_creator, is_admin, created_at)
-             VALUES ($1, $2, 'free', 'free', false, false, false, NOW())
+            `INSERT INTO users (username, email, role, subscription_plan, is_musician, is_creator, is_admin, auth_provider, created_at)
+             VALUES ($1, $2, 'free', 'free', false, false, false, 'discord', NOW())
              RETURNING *`,
             [profile.username || email.split("@")[0], email]
           );
@@ -397,8 +879,8 @@ passport.use(
         let user = rows[0];
         if (!user) {
           const r = await pool.query(
-            `INSERT INTO users (username, email, role, subscription_plan, is_musician, is_creator, is_admin, created_at)
-             VALUES ($1, $2, 'free', 'free', false, false, false, NOW())
+            `INSERT INTO users (username, email, role, subscription_plan, is_musician, is_creator, is_admin, auth_provider, created_at)
+             VALUES ($1, $2, 'free', 'free', false, false, false, 'github', NOW())
              RETURNING *`,
             [profile.username || email.split("@")[0], email]
           );
@@ -417,7 +899,7 @@ passport.use(
 async function sendEmail({ to, subject, html, text }) {
   try {
     const info = await transporter.sendMail({
-      from: `"Your App Name" <${EMAIL_USER}>`,
+      from: `"Your Platform" <${EMAIL_USER}>`,
       to,
       subject,
       text: text || undefined,
@@ -444,174 +926,956 @@ function authMiddleware(req, res, next) {
   }
 }
 
+// --- Admin middleware ---
+function adminMiddleware(req, res, next) {
+  try {
+    const adminKey = req.headers["x-admin-key"] || req.body.adminKey || req.query.adminKey;
+    if (!adminKey || adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
+    req.admin = { key: adminKey };
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Authentication failed" });
+  }
+}
+
 // --- Earnings config and calculation ---
 const RATES = {
   per_like: 0.025,
   per_follow: 0.0075,
   per_view: 0.015,
+  per_comment: 0.005,
+  per_share: 0.01,
+  per_download: 0.02,
 };
 
-function calculateEarningsFromDeltas({ likesDelta = 0, followsDelta = 0, viewsDelta = 0, tips = 0, merch = 0 }) {
+function calculateEarningsFromDeltas({ 
+  likesDelta = 0, 
+  followsDelta = 0, 
+  viewsDelta = 0, 
+  commentsDelta = 0,
+  sharesDelta = 0,
+  downloadsDelta = 0,
+  tips = 0, 
+  merch = 0,
+  adRevenue = 0,
+  subscriptionRevenue = 0
+}) {
   const fromLikes = likesDelta * RATES.per_like;
   const fromFollows = followsDelta * RATES.per_follow;
   const fromViews = viewsDelta * RATES.per_view;
-  const total = Number((fromLikes + fromFollows + fromViews + Number(tips) + Number(merch)).toFixed(4));
-  return { total, breakdown: { fromLikes, fromFollows, fromViews, tips: Number(tips), merch: Number(merch) } };
+  const fromComments = commentsDelta * RATES.per_comment;
+  const fromShares = sharesDelta * RATES.per_share;
+  const fromDownloads = downloadsDelta * RATES.per_download;
+  const total = Number((fromLikes + fromFollows + fromViews + fromComments + fromShares + fromDownloads + Number(tips) + Number(merch) + Number(adRevenue) + Number(subscriptionRevenue)).toFixed(4));
+  return { 
+    total, 
+    breakdown: { 
+      fromLikes, 
+      fromFollows, 
+      fromViews, 
+      fromComments,
+      fromShares,
+      fromDownloads,
+      tips: Number(tips), 
+      merch: Number(merch),
+      adRevenue: Number(adRevenue),
+      subscriptionRevenue: Number(subscriptionRevenue)
+    } 
+  };
 }
 
 // Configure ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
 
-// AWS S3 client
-const s3 = new S3Client({ region: process.env.AWS_REGION });
+// --- Recommendation Algorithm ---
 
-// OpenAI client
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// AssemblyAI key
-const assemblyKey = process.env.ASSEMBLYAI_KEY;
-
-/**
- * Download S3 object to temp file
- */
-async function downloadS3ToTempFile(key) {
-  const cmd = new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key });
-  const resp = await s3.send(cmd);
-  const tmpPath = path.join(os.tmpdir(), `upload-${Date.now()}-${path.basename(key)}`);
-  await new Promise((resolve, reject) => {
-    const writeStream = require("fs").createWriteStream(tmpPath);
-    resp.Body.pipe(writeStream);
-    writeStream.on("finish", resolve);
-    writeStream.on("error", reject);
-  });
-  return tmpPath;
-}
-
-/**
- * Extract N thumbnails using ffmpeg
- */
-async function extractThumbnails(filePath, count = 3) {
-  const tmpFramesDir = path.join(path.dirname(filePath), "frames-" + uuidv4());
-  await fs.mkdir(tmpFramesDir, { recursive: true });
-
-  // get video duration
-  const duration = await new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(filePath, (err, metadata) => {
-      if (err) return reject(err);
-      resolve(metadata.format.duration || 0);
-    });
-  });
-
-  const interval = Math.max(1, Math.floor(duration / (count + 1)));
-  const thumbFiles = [];
-
-  for (let i = 1; i <= count; i++) {
-    const t = Math.min(Math.floor(i * interval), Math.max(1, Math.floor(duration - 1)));
-    const outFile = path.join(tmpFramesDir, `thumb_${i}.jpg`);
-    await new Promise((resolve, reject) => {
-      ffmpeg(filePath)
-        .screenshots({ timestamps: [t], filename: path.basename(outFile), folder: tmpFramesDir, size: "1280x720" })
-        .on("end", () => resolve())
-        .on("error", reject);
-    });
-    thumbFiles.push(outFile);
+class RecommendationEngine {
+  constructor() {
+    this.weights = {
+      userInteractions: 0.4,
+      contentSimilarity: 0.3,
+      trending: 0.2,
+      freshness: 0.1
+    };
   }
 
-  // read buffers
-  const buffers = await Promise.all(thumbFiles.map(f => fs.readFile(f)));
+  async generateRecommendations(userId, contentType, limit = 20) {
+    try {
+      // Check cache first
+      const cacheKey = `recommendations:${userId}:${contentType}`;
+      let recommendations = cache.get(cacheKey);
+      
+      if (!recommendations) {
+        // Get user's viewing history
+        const { rows: history } = await pool.query(
+          `SELECT content_id, content_type, watch_duration, completed 
+           FROM watch_history 
+           WHERE user_id = $1 AND content_type = $2 
+           ORDER BY created_at DESC 
+           LIMIT 50`,
+          [userId, contentType]
+        );
 
-  // cleanup
-  for (const f of thumbFiles) await fs.rm(f, { force: true });
-  await fs.rmdir(tmpFramesDir, { recursive: true }).catch(() => {});
+        // Get user's likes
+        const { rows: likes } = await pool.query(
+          `SELECT content_id 
+           FROM likes 
+           WHERE user_id = $1 AND content_type = $2`,
+          [userId, contentType]
+        );
 
-  return buffers;
-}
+        // Get user's follows
+        const { rows: follows } = await pool.query(
+          `SELECT following_id 
+           FROM follows 
+           WHERE follower_id = $1`,
+          [userId]
+        );
 
-/**
- * Upload file to AssemblyAI
- */
-async function uploadToAssembly(filePath) {
-  const readStream = require("fs").createReadStream(filePath);
-  const resp = await axios({
-    method: "post",
-    url: "https://api.assemblyai.com/v2/upload",
-    headers: { "authorization": assemblyKey, "transfer-encoding": "chunked" },
-    data: readStream,
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity,
-  });
-  return resp.data.upload_url;
-}
+        // Get user's preferences
+        const { rows: preferences } = await pool.query(
+          `SELECT recommendations 
+           FROM user_preferences 
+           WHERE user_id = $1`,
+          [userId]
+        );
 
-/**
- * Create transcription and poll until completed
- */
-async function transcribeWithAssembly(filePath) {
-  const uploadUrl = await uploadToAssembly(filePath);
-  const createResp = await axios.post("https://api.assemblyai.com/v2/transcript", {
-    audio_url: uploadUrl,
-    language_code: "en",
-  }, { headers: { authorization: assemblyKey } });
+        // Get trending content
+        const { rows: trending } = await pool.query(
+          `SELECT content_id, score 
+           FROM trending 
+           WHERE content_type = $1 AND period = 'day' 
+           ORDER BY score DESC 
+           LIMIT 20`,
+          [contentType]
+        );
 
-  const id = createResp.data.id;
+        // Calculate recommendation scores
+        const contentScores = new Map();
 
-  while (true) {
-    await new Promise(r => setTimeout(r, 3000));
-    const statusResp = await axios.get(`https://api.assemblyai.com/v2/transcript/${id}`, {
-      headers: { authorization: assemblyKey }
-    });
-    if (statusResp.data.status === "completed") return statusResp.data.text;
-    if (statusResp.data.status === "failed") throw new Error("AssemblyAI transcription failed");
+        // Process viewing history
+        for (const item of history) {
+          const score = item.completed ? 1.0 : (item.watch_duration / 300); // Assuming 5 minutes is full watch
+          contentScores.set(item.content_id, (contentScores.get(item.content_id) || 0) + score * this.weights.userInteractions);
+        }
+
+        // Process likes
+        for (const item of likes) {
+          contentScores.set(item.content_id, (contentScores.get(item.content_id) || 0) + 0.5 * this.weights.userInteractions);
+        }
+
+        // Process follows (recommend content from followed creators)
+        if (follows.length > 0) {
+          const followIds = follows.map(f => f.following_id);
+          const { rows: followedContent } = await pool.query(
+            `SELECT id 
+             FROM ${contentType}s 
+             WHERE user_id = ANY($1) AND is_public = true 
+             ORDER BY created_at DESC 
+             LIMIT 100`,
+            [followIds]
+          );
+
+          for (const item of followedContent) {
+            contentScores.set(item.id, (contentScores.get(item.id) || 0) + 0.3 * this.weights.userInteractions);
+          }
+        }
+
+        // Process trending content
+        for (const item of trending) {
+          contentScores.set(item.content_id, (contentScores.get(item.content_id) || 0) + (item.score / 100) * this.weights.trending);
+        }
+
+        // Get content details and calculate similarity scores
+        const contentIds = Array.from(contentScores.keys());
+        if (contentIds.length > 0) {
+          const { rows: contentDetails } = await pool.query(
+            `SELECT * FROM ${contentType}s WHERE id = ANY($1) AND is_public = true`,
+            [contentIds]
+          );
+
+          // Calculate content similarity based on tags, category, etc.
+          for (const content of contentDetails) {
+            const currentScore = contentScores.get(content.id) || 0;
+            const similarityScore = await this.calculateContentSimilarity(content, history, contentType);
+            contentScores.set(content.id, currentScore + similarityScore * this.weights.contentSimilarity);
+
+            // Add freshness score (newer content gets a boost)
+            const daysSinceCreated = (new Date() - new Date(content.created_at)) / (1000 * 60 * 60 * 24);
+            const freshnessScore = Math.max(0, 1 - (daysSinceCreated / 30)); // Decay over 30 days
+            contentScores.set(content.id, (contentScores.get(content.id) || 0) + freshnessScore * this.weights.freshness);
+          }
+        }
+
+        // Sort by score and get top recommendations
+        recommendations = Array.from(contentScores.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, limit)
+          .map(([contentId, score]) => ({ contentId, score }));
+
+        // Cache the recommendations
+        cache.set(cacheKey, recommendations, 600); // Cache for 10 minutes
+      }
+
+      // Get full content details for recommendations
+      const contentIds = recommendations.map(r => r.contentId);
+      if (contentIds.length === 0) return [];
+
+      const { rows: contentDetails } = await pool.query(
+        `SELECT c.*, u.username, u.profile_url 
+         FROM ${contentType}s c 
+         JOIN users u ON c.user_id = u.id 
+         WHERE c.id = ANY($1)`,
+        [contentIds]
+      );
+
+      // Map scores to content details
+      const contentMap = new Map(contentDetails.map(c => [c.id, c]));
+      return recommendations
+        .map(r => ({
+          ...contentMap.get(r.contentId),
+          recommendationScore: r.score
+        }))
+        .filter(Boolean); // Remove any null entries
+    } catch (error) {
+      console.error("Error generating recommendations:", error);
+      return [];
+    }
+  }
+
+  async calculateContentSimilarity(content, history, contentType) {
+    try {
+      // This is a simplified similarity calculation
+      // In a real implementation, you'd use more sophisticated algorithms
+      
+      // Get content tags
+      const contentTags = content.tags || [];
+      
+      // Get tags from user's viewing history
+      const historyTags = [];
+      for (const item of history) {
+        const { rows: itemContent } = await pool.query(
+          `SELECT tags FROM ${contentType}s WHERE id = $1`,
+          [item.content_id]
+        );
+        if (itemContent.length > 0 && itemContent[0].tags) {
+          historyTags.push(...itemContent[0].tags);
+        }
+      }
+
+      // Calculate tag similarity
+      if (contentTags.length === 0 || historyTags.length === 0) return 0;
+      
+      const contentTagSet = new Set(contentTags);
+      const historyTagSet = new Set(historyTags);
+      
+      const intersection = new Set([...contentTagSet].filter(tag => historyTagSet.has(tag)));
+      const union = new Set([...contentTagSet, ...historyTagSet]);
+      
+      return intersection.size / union.size; // Jaccard similarity
+    } catch (error) {
+      console.error("Error calculating content similarity:", error);
+      return 0;
+    }
+  }
+
+  async updateTrendingScores() {
+    try {
+      // This would typically be run as a scheduled job (e.g., every hour)
+      const contentTypes = ['video', 'music', 'podcast'];
+      const periods = ['hour', 'day', 'week', 'month'];
+      
+      for (const contentType of contentTypes) {
+        for (const period of periods) {
+          // Calculate time threshold based on period
+          let timeThreshold;
+          switch (period) {
+            case 'hour':
+              timeThreshold = new Date(Date.now() - 60 * 60 * 1000);
+              break;
+            case 'day':
+              timeThreshold = new Date(Date.now() - 24 * 60 * 60 * 1000);
+              break;
+            case 'week':
+              timeThreshold = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+              break;
+            case 'month':
+              timeThreshold = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+              break;
+          }
+          
+          // Get engagement metrics for the period
+          const { rows: engagement } = await pool.query(
+            `SELECT 
+               c.id as content_id,
+               c.views,
+               c.likes,
+               c.comments_count,
+               c.shares,
+               COUNT(w.id) as watch_count,
+               AVG(w.watch_duration) as avg_watch_duration
+             FROM ${contentType}s c
+             LEFT JOIN watch_history w ON c.id = w.content_id AND w.created_at >= $1
+             WHERE c.created_at >= $1 AND c.is_public = true
+             GROUP BY c.id`,
+            [timeThreshold]
+          );
+          
+          // Calculate trending scores
+          for (const item of engagement) {
+            // Weighted formula for trending score
+            const viewsScore = item.views * 0.3;
+            const likesScore = item.likes * 0.5;
+            const commentsScore = item.comments_count * 0.7;
+            const sharesScore = item.shares * 0.9;
+            const watchScore = (item.watch_count || 0) * 0.4;
+            const durationScore = (item.avg_watch_duration || 0) * 0.01;
+            
+            const totalScore = viewsScore + likesScore + commentsScore + sharesScore + watchScore + durationScore;
+            
+            // Update or insert trending score
+            await pool.query(
+              `INSERT INTO trending (content_type, content_id, score, period, created_at)
+               VALUES ($1, $2, $3, $4, NOW())
+               ON CONFLICT (content_type, content_id, period) 
+               DO UPDATE SET score = $3, created_at = NOW()`,
+              [contentType, item.content_id, totalScore, period]
+            );
+            
+            // Update the content's trending score
+            await pool.query(
+              `UPDATE ${contentType}s SET trending_score = $1 WHERE id = $2`,
+              [totalScore, item.content_id]
+            );
+          }
+        }
+      }
+      
+      console.log("Trending scores updated successfully");
+    } catch (error) {
+      console.error("Error updating trending scores:", error);
+    }
   }
 }
 
-/**
- * OpenAI text moderation
- */
-async function moderateTextWithOpenAI(text) {
-  const resp = await openai.moderations.create({ model: "omni-moderation-latest", input: text });
-  const result = resp.results?.[0] || {};
-  const categories = result.categories || {};
-  const trueCount = Object.values(categories).filter(Boolean).length;
-  const categoryCount = Object.keys(categories).length || 1;
-  const toxicityScore = trueCount / categoryCount;
-  return { flagged: result.flagged || false, categories, toxicityScore, raw: result };
+// Initialize recommendation engine
+const recommendationEngine = new RecommendationEngine();
+
+// Schedule trending score updates
+cron.schedule('0 * * * *', () => {
+  recommendationEngine.updateTrendingScores();
+});
+
+// --- Content Processing Pipeline ---
+
+class ContentProcessor {
+  constructor() {
+    this.workerPool = [];
+    this.maxWorkers = 4;
+    this.taskQueue = [];
+    this.initWorkers();
+  }
+
+  initWorkers() {
+    for (let i = 0; i < this.maxWorkers; i++) {
+      const worker = new Worker(path.join(__dirname, 'contentWorker.js'));
+      worker.on('message', (result) => {
+        this.handleWorkerResult(result);
+      });
+      worker.on('error', (error) => {
+        console.error(`Worker ${i} error:`, error);
+      });
+      this.workerPool.push({
+        worker,
+        busy: false,
+        id: i
+      });
+    }
+  }
+
+  async processContent(contentId, contentType, options = {}) {
+    return new Promise((resolve, reject) => {
+      const task = {
+        id: uuidv4(),
+        contentId,
+        contentType,
+        options,
+        resolve,
+        reject
+      };
+      
+      this.taskQueue.push(task);
+      this.processQueue();
+    });
+  }
+
+  processQueue() {
+    if (this.taskQueue.length === 0) return;
+    
+    const availableWorker = this.workerPool.find(w => !w.busy);
+    if (!availableWorker) return;
+    
+    const task = this.taskQueue.shift();
+    availableWorker.busy = true;
+    
+    availableWorker.worker.postMessage({
+      taskId: task.id,
+      contentId: task.contentId,
+      contentType: task.contentType,
+      options: task.options
+    });
+    
+    // Store the task resolve/reject for later
+    availableWorker.currentTask = task;
+  }
+
+  handleWorkerResult(result) {
+    const worker = this.workerPool.find(w => w.currentTask && w.currentTask.id === result.taskId);
+    if (!worker) return;
+    
+    const task = worker.currentTask;
+    worker.busy = false;
+    worker.currentTask = null;
+    
+    if (result.error) {
+      task.reject(new Error(result.error));
+    } else {
+      task.resolve(result.data);
+    }
+    
+    // Process next task in queue
+    this.processQueue();
+  }
+
+  async generateThumbnails(videoPath, outputDir, count = 3) {
+    return new Promise((resolve, reject) => {
+      const thumbnails = [];
+      
+      // Get video duration
+      ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) return reject(err);
+        
+        const duration = metadata.format.duration;
+        const interval = Math.max(1, Math.floor(duration / (count + 1)));
+        
+        let completed = 0;
+        
+        for (let i = 1; i <= count; i++) {
+          const time = Math.min(Math.floor(i * interval), Math.max(1, Math.floor(duration - 1)));
+          const outputPath = path.join(outputDir, `thumb_${i}.jpg`);
+          
+          ffmpeg(videoPath)
+            .screenshots({
+              timestamps: [time],
+              filename: path.basename(outputPath),
+              folder: path.dirname(outputPath),
+              size: '1280x720'
+            })
+            .on('end', () => {
+              thumbnails.push(outputPath);
+              completed++;
+              
+              if (completed === count) {
+                resolve(thumbnails);
+              }
+            })
+            .on('error', (err) => {
+              reject(err);
+            });
+        }
+      });
+    });
+  }
+
+  async transcribeAudio(audioPath) {
+    try {
+      // Upload to AssemblyAI
+      const formData = new FormData();
+      formData.append('audio', fs.createReadStream(audioPath));
+      
+      const uploadResponse = await axios.post('https://api.assemblyai.com/v2/upload', formData, {
+        headers: {
+          'authorization': ASSEMBLYAI_KEY,
+          ...formData.getHeaders()
+        }
+      });
+      
+      const audioUrl = uploadResponse.data.upload_url;
+      
+      // Start transcription
+      const transcriptResponse = await axios.post('https://api.assemblyai.com/v2/transcript', {
+        audio_url: audioUrl,
+        language_code: 'en',
+        auto_highlights: true,
+        sentiment_analysis: true
+      }, {
+        headers: {
+          'authorization': ASSEMBLYAI_KEY,
+          'content-type': 'application/json'
+        }
+      });
+      
+      const transcriptId = transcriptResponse.data.id;
+      
+      // Poll for completion
+      let transcript = null;
+      while (!transcript || transcript.status === 'queued' || transcript.status === 'processing') {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        const pollingResponse = await axios.get(`https://api.assemblyai.com/v2/transcript/${transcriptId}`, {
+          headers: {
+            'authorization': ASSEMBLYAI_KEY
+          }
+        });
+        
+        transcript = pollingResponse.data;
+      }
+      
+      if (transcript.status === 'completed') {
+        return transcript;
+      } else {
+        throw new Error(`Transcription failed: ${transcript.status}`);
+      }
+    } catch (error) {
+      console.error('Error transcribing audio:', error);
+      throw error;
+    }
+  }
+
+  async generateCaptions(transcript) {
+    try {
+      if (!transcript || !transcript.words) {
+        return [];
+      }
+      
+      // Group words into captions (approximately 10 words per caption)
+      const captions = [];
+      const wordsPerCaption = 10;
+      
+      for (let i = 0; i < transcript.words.length; i += wordsPerCaption) {
+        const words = transcript.words.slice(i, i + wordsPerCaption);
+        
+        if (words.length > 0) {
+          captions.push({
+            start: words[0].start,
+            end: words[words.length - 1].end,
+            text: words.map(w => w.text).join(' ')
+          });
+        }
+      }
+      
+      return captions;
+    } catch (error) {
+      console.error('Error generating captions:', error);
+      return [];
+    }
+  }
+
+  async moderateContent(contentUrl, contentType) {
+    try {
+      // For images, use SightEngine
+      if (contentType === 'image') {
+        const formData = new FormData();
+        formData.append('media', contentUrl);
+        formData.append('models', 'nudity,wad,offensive');
+        
+        const response = await axios.post('https://api.sightengine.com/1.0/check.json', formData, {
+          params: {
+            'api_user': SIGHTENGINE_API_USER,
+            'api_secret': SIGHTENGINE_API_SECRET
+          }
+        });
+        
+        return {
+          safe: !response.data.nudity && !response.data.weapon && !response.data.alcohol && !response.data.offensive,
+          details: response.data
+        };
+      }
+      
+      // For text, use OpenAI moderation
+      if (contentType === 'text') {
+        const moderation = await openai.moderations.create({
+          input: contentUrl
+        });
+        
+        return {
+          safe: !moderation.results[0].flagged,
+          details: moderation.results[0]
+        };
+      }
+      
+      // For videos, we'd need to extract frames and check each one
+      // This is a simplified implementation
+      return { safe: true, details: {} };
+    } catch (error) {
+      console.error('Error moderating content:', error);
+      return { safe: true, details: { error: error.message } };
+    }
+  }
+
+  async processVideo(videoId) {
+    try {
+      // Get video details
+      const { rows: videoRows } = await pool.query(
+        'SELECT * FROM videos WHERE id = $1',
+        [videoId]
+      );
+      
+      if (videoRows.length === 0) {
+        throw new Error('Video not found');
+      }
+      
+      const video = videoRows[0];
+      
+      // Update processing status
+      await pool.query(
+        'UPDATE videos SET processing_status = $1 WHERE id = $2',
+        ['processing', videoId]
+      );
+      
+      // Download video from S3
+      const videoPath = await this.downloadFromS3(video.video_url);
+      
+      // Create temporary directory for processing
+      const tempDir = path.join(os.tmpdir(), `video-${videoId}`);
+      fs.mkdirSync(tempDir, { recursive: true });
+      
+      try {
+        // Generate thumbnails
+        const thumbnails = await this.generateThumbnails(videoPath, tempDir, 3);
+        
+        // Upload thumbnails to S3
+        const thumbnailUrls = [];
+        for (const thumbnail of thumbnails) {
+          const thumbnailUrl = await this.uploadToS3(thumbnail, `thumbnails/${videoId}/${path.basename(thumbnail)}`);
+          thumbnailUrls.push(thumbnailUrl);
+        }
+        
+        // Extract audio for transcription
+        const audioPath = path.join(tempDir, 'audio.mp3');
+        await new Promise((resolve, reject) => {
+          ffmpeg(videoPath)
+            .noVideo()
+            .audioCodec('mp3')
+            .output(audioPath)
+            .on('end', resolve)
+            .on('error', reject)
+            .run();
+        });
+        
+        // Transcribe audio
+        const transcript = await this.transcribeAudio(audioPath);
+        
+        // Generate captions
+        const captions = this.generateCaptions(transcript);
+        
+        // Moderate content
+        const moderation = await this.moderateContent(video.video_url, 'video');
+        
+        // Update video with processed data
+        await pool.query(
+          `UPDATE videos 
+           SET 
+             processing_status = $1,
+             thumbnail_url = $2,
+             transcription = $3,
+             auto_captions = $4,
+             content_rating = $5,
+             updated_at = NOW()
+           WHERE id = $6`,
+          [
+            'completed',
+            thumbnailUrls[0], // Use first thumbnail as main thumbnail
+            transcript.text,
+            JSON.stringify(captions),
+            moderation.safe ? 'general' : 'mature',
+            videoId
+          ]
+        );
+        
+        // Update recommendation score
+        await this.updateRecommendationScore(videoId, 'video');
+        
+        return {
+          success: true,
+          thumbnails: thumbnailUrls,
+          transcript: transcript.text,
+          captions
+        };
+      } finally {
+        // Clean up temporary files
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        fs.unlinkSync(videoPath);
+      }
+    } catch (error) {
+      console.error('Error processing video:', error);
+      
+      // Update processing status
+      await pool.query(
+        'UPDATE videos SET processing_status = $1 WHERE id = $2',
+        ['failed', videoId]
+      );
+      
+      throw error;
+    }
+  }
+
+  async processMusic(musicId) {
+    try {
+      // Get music details
+      const { rows: musicRows } = await pool.query(
+        'SELECT * FROM music WHERE id = $1',
+        [musicId]
+      );
+      
+      if (musicRows.length === 0) {
+        throw new Error('Music not found');
+      }
+      
+      const music = musicRows[0];
+      
+      // Download music from S3
+      const musicPath = await this.downloadFromS3(music.music_url);
+      
+      // Create temporary directory for processing
+      const tempDir = path.join(os.tmpdir(), `music-${musicId}`);
+      fs.mkdirSync(tempDir, { recursive: true });
+      
+      try {
+        // Extract audio metadata
+        const metadata = await new Promise((resolve, reject) => {
+          ffmpeg.ffprobe(musicPath, (err, metadata) => {
+            if (err) return reject(err);
+            resolve(metadata);
+          });
+        });
+        
+        // Transcribe audio for lyrics
+        const transcript = await this.transcribeAudio(musicPath);
+        
+        // Generate waveform visualization
+        const waveformPath = path.join(tempDir, 'waveform.png');
+        await this.generateWaveform(musicPath, waveformPath);
+        
+        // Upload waveform to S3
+        const waveformUrl = await this.uploadToS3(waveformPath, `waveforms/${musicId}.png`);
+        
+        // Update music with processed data
+        await pool.query(
+          `UPDATE music 
+           SET 
+             duration = $1,
+             lyrics = $2,
+             updated_at = NOW()
+           WHERE id = $3`,
+          [
+            Math.floor(metadata.format.duration),
+            transcript.text,
+            musicId
+          ]
+        );
+        
+        // Update recommendation score
+        await this.updateRecommendationScore(musicId, 'music');
+        
+        return {
+          success: true,
+          duration: Math.floor(metadata.format.duration),
+          lyrics: transcript.text,
+          waveformUrl
+        };
+      } finally {
+        // Clean up temporary files
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        fs.unlinkSync(musicPath);
+      }
+    } catch (error) {
+      console.error('Error processing music:', error);
+      throw error;
+    }
+  }
+
+  async generateWaveform(audioPath, outputPath) {
+    return new Promise((resolve, reject) => {
+      ffmpeg(audioPath)
+        .complexFilter([
+          '[0:a]aformat=channel_layouts=mono,compand=gain=-6,showwavespic=s=640x120:colors=white[v]'
+        ])
+        .outputOptions(['-frames:v', '1'])
+        .output(outputPath)
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
+    });
+  }
+
+  async downloadFromS3(url) {
+    try {
+      // Extract key from URL
+      const urlParts = new URL(url);
+      const key = urlParts.pathname.substring(1); // Remove leading slash
+      
+      // Get object from S3
+      const response = await s3.send(new GetObjectCommand({
+        Bucket: S3_BUCKET_NAME,
+        Key: key
+      }));
+      
+      // Save to temporary file
+      const tempPath = path.join(os.tmpdir(), `temp-${Date.now()}-${path.basename(key)}`);
+      const fileStream = fs.createWriteStream(tempPath);
+      
+      await new Promise((resolve, reject) => {
+        response.Body.pipe(fileStream);
+        fileStream.on('finish', resolve);
+        fileStream.on('error', reject);
+      });
+      
+      return tempPath;
+    } catch (error) {
+      console.error('Error downloading from S3:', error);
+      throw error;
+    }
+  }
+
+  async uploadToS3(filePath, key) {
+    try {
+      const fileStream = fs.createReadStream(filePath);
+      
+      await s3.send(new PutObjectCommand({
+        Bucket: S3_BUCKET_NAME,
+        Key: key,
+        Body: fileStream,
+        ContentType: this.getContentType(filePath)
+      }));
+      
+      return `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+    } catch (error) {
+      console.error('Error uploading to S3:', error);
+      throw error;
+    }
+  }
+
+  getContentType(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    switch (ext) {
+      case '.jpg':
+      case '.jpeg':
+        return 'image/jpeg';
+      case '.png':
+        return 'image/png';
+      case '.gif':
+        return 'image/gif';
+      case '.webp':
+        return 'image/webp';
+      case '.mp4':
+        return 'video/mp4';
+      case '.webm':
+        return 'video/webm';
+      case '.ogg':
+        return 'video/ogg';
+      case '.mp3':
+        return 'audio/mpeg';
+      case '.wav':
+        return 'audio/wav';
+      default:
+        return 'application/octet-stream';
+    }
+  }
+
+  async updateRecommendationScore(contentId, contentType) {
+    try {
+      // Calculate recommendation score based on various factors
+      const { rows: content } = await pool.query(
+        `SELECT * FROM ${contentType}s WHERE id = $1`,
+        [contentId]
+      );
+      
+      if (content.length === 0) return;
+      
+      const item = content[0];
+      
+      // Factors for recommendation score
+      const viewsScore = Math.log10(Math.max(1, item.views)) * 0.3;
+      const likesScore = Math.log10(Math.max(1, item.likes)) * 0.4;
+      const commentsScore = Math.log10(Math.max(1, item.comments_count || 0)) * 0.2;
+      const sharesScore = Math.log10(Math.max(1, item.shares || 0)) * 0.1;
+      
+      // Freshness factor (newer content gets a boost)
+      const daysSinceCreated = (new Date() - new Date(item.created_at)) / (1000 * 60 * 60 * 24);
+      const freshnessScore = Math.max(0, 1 - (daysSinceCreated / 30)) * 0.2;
+      
+      // Calculate total score
+      const totalScore = viewsScore + likesScore + commentsScore + sharesScore + freshnessScore;
+      
+      // Update content with recommendation score
+      await pool.query(
+        `UPDATE ${contentType}s SET recommendation_score = $1 WHERE id = $2`,
+        [totalScore, contentId]
+      );
+    } catch (error) {
+      console.error('Error updating recommendation score:', error);
+    }
+  }
 }
 
-/**
- * Full moderation pipeline
- */
-export async function moderateVideoPipeline({ key, isForKids }) {
-  const tmpFile = await downloadS3ToTempFile(key);
+// Initialize content processor
+const contentProcessor = new ContentProcessor();
+
+// --- Content Worker ---
+
+// This would be in a separate file (contentWorker.js) in a real implementation
+// For this example, we'll define it inline
+const contentWorkerCode = `
+const { parentPort } = require('worker_threads');
+const ffmpeg = require('fluent-ffmpeg');
+const path = require('path');
+const fs = require('fs');
+
+parentPort.on('message', async (task) => {
   try {
-    // 1) Extract thumbnails
-    const thumbnails = await extractThumbnails(tmpFile, 3);
-
-    // 2) TODO: Image moderation (SightEngine / DeepAI / Rekognition)
-    // For now we skip image moderation in this snippet; implement as needed
-
-    // 3) Transcribe audio
-    const transcript = await transcribeWithAssembly(tmpFile);
-
-    // 4) Text moderation
-    const textMod = await moderateTextWithOpenAI(transcript);
-
-    if (textMod.flagged && textMod.toxicityScore > 0.5) {
-      return { safe: false, reason: "text_flagged", transcript, textMod, thumbnails };
+    let result;
+    
+    switch (task.contentType) {
+      case 'video':
+        result = await processVideo(task.contentId, task.options);
+        break;
+      case 'music':
+        result = await processMusic(task.contentId, task.options);
+        break;
+      default:
+        throw new Error(\`Unsupported content type: \${task.contentType}\`);
     }
-
-    // 5) Kids stricter logic
-    if (isForKids) {
-      // add stricter thresholds if needed
-    }
-
-    return { safe: true, autoPublish: true, transcript, textMod, thumbnails };
-  } finally {
-    await fs.rm(tmpFile, { force: true }).catch(() => {});
+    
+    parentPort.postMessage({
+      taskId: task.taskId,
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    parentPort.postMessage({
+      taskId: task.taskId,
+      success: false,
+      error: error.message
+    });
   }
+});
+
+async function processVideo(videoId, options) {
+  // This would contain the video processing logic
+  return { videoId, processed: true };
 }
 
-const liveStreams = {};
+async function processMusic(musicId, options) {
+  // This would contain the music processing logic
+  return { musicId, processed: true };
+}
+`;
+
+// In a real implementation, you would write this to a file and create the worker
+// For this example, we'll simulate the worker functionality
+
+// --- API Routes ---
 
 // OAuth routes: Google
 app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
@@ -620,7 +1884,7 @@ app.get(
   passport.authenticate("google", { failureRedirect: "/", session: false }),
   (req, res) => {
     const token = jwt.sign({ id: req.user.id, email: req.user.email, role: req.user.role }, JWT_SECRET, { expiresIn: "7d" });
-    res.redirect(`/welcome.html?token=${token}`);
+    res.redirect(`${FRONTEND_URL}/welcome.html?token=${token}`);
   }
 );
 
@@ -631,7 +1895,7 @@ app.get(
   passport.authenticate("discord", { failureRedirect: "/", session: false }),
   (req, res) => {
     const token = jwt.sign({ id: req.user.id, email: req.user.email, role: req.user.role }, JWT_SECRET, { expiresIn: "7d" });
-    res.redirect(`/welcome.html?token=${token}`);
+    res.redirect(`${FRONTEND_URL}/welcome.html?token=${token}`);
   }
 );
 
@@ -642,486 +1906,20 @@ app.get(
   passport.authenticate("github", { failureRedirect: "/", session: false }),
   (req, res) => {
     const token = jwt.sign({ id: req.user.id, email: req.user.email, role: req.user.role }, JWT_SECRET, { expiresIn: "7d" });
-    res.redirect(`/welcome.html?token=${token}`);
+    res.redirect(`${FRONTEND_URL}/welcome.html?token=${token}`);
   }
 );
 
-// Password reset
-app.post("/password-reset", async (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: "Email required" });
-  const { rows } = await pool.query("SELECT id, username FROM users WHERE email=$1", [email]);
-  const user = rows[0];
-  if (!user) return res.status(404).json({ error: "User not found" });
-  const resetToken = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "1h" });
-  const resetLink = `${FRONTEND_URL}/reset-password?token=${resetToken}`;
-  await sendEmail({
-    to: email,
-    subject: "Password Reset Request",
-    html: `<p>Hi ${user.username},</p><p>Click <a href="${resetLink}">here</a> to reset your password. This link expires in 1 hour.</p>`
-  });
-  res.json({ message: "Password reset email sent" });
-});
-
-// Subscription upgrade
-app.post("/subscribe", authMiddleware, async (req, res) => {
-  try {
-    const { plan } = req.body;
-    const userId = req.user.id;
-    const expiry = new Date();
-    if (plan === "monthly") expiry.setMonth(expiry.getMonth() + 1);
-    else if (plan === "yearly") expiry.setFullYear(expiry.getFullYear() + 1);
-    else if (plan === "elite") expiry.setMonth(expiry.getMonth() + 1);
-    const { rows } = await pool.query(
-      `UPDATE users SET subscription_plan=$1, subscription_expires=$2, role=$3, updated_at=NOW()
-       WHERE id=$4 RETURNING *`,
-      [plan, expiry, plan === "elite" ? "elite" : "premium", userId]
-    );
-    res.json({ message: "Subscription updated", user: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Subscription failed" });
-  }
-});
-
-// POST /api/verify-role
-app.post("/verify-role", authMiddleware, async (req, res) => {
-  try {
-    const { type } = req.body; // "musician" or "creator"
-    const userId = req.user.id;
-
-    // Fetch DOB to ensure 18+
-    const { rows: userRows } = await pool.query(
-      `SELECT dob FROM users WHERE id=$1`,
-      [userId]
-    );
-
-    if (!userRows[0] || !userRows[0].dob) {
-      return res.status(400).json({ error: "DOB not provided" });
-    }
-
-    const birthDate = new Date(userRows[0].dob);
-    const age = new Date().getFullYear() - birthDate.getFullYear();
-    if (age < 18) return res.status(403).json({ error: "Must be 18 or older to verify role" });
-
-    const field = type === "musician" ? "is_musician" : "is_creator";
-    const { rows } = await pool.query(
-      `UPDATE users SET ${field}=true, updated_at=NOW() WHERE id=$1 RETURNING *`,
-      [userId]
-    );
-
-    await ensureCreatorStats(userId); // your existing helper
-
-    res.json({ message: `${type} verified`, user: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Verification failed" });
-  }
-});
-
-// --- Chatbot refund check and submissions ---
-
-const orders = [
-  { orderId: "123", date: "2025-10-22", userId: 1 },
-  { orderId: "456", date: "2025-10-25", userId: 2 },
-];
-const chatbotSubmissions = [];
-
-function isRefundEligible(orderDate) {
-  const today = new Date();
-  const order = new Date(orderDate);
-  const diffTime = today - order;
-  const diffDays = diffTime / (1000 * 60 * 60 * 24);
-  return diffDays <= 7;
-}
-
-app.post("/api/chatbot/check-refund", authMiddleware, async (req, res) => {
-  try {
-    const { orderId } = req.body;
-    const order = orders.find(o => o.orderId === orderId);
-    if (!order) return res.json({ eligible: false, message: "Order not found" });
-    const eligible = isRefundEligible(order.date);
-    res.json({ eligible, orderDate: order.date });
-  } catch (err) {
-    console.error("Refund check error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.post("/api/chatbot/submit", authMiddleware, async (req, res) => {
-  try {
-    const { type, answers } = req.body;
-    if (!type || !answers) return res.status(400).json({ error: "Missing fields" });
-    const submission = { type, answers, userId: req.user.id, date: new Date() };
-    chatbotSubmissions.push(submission);
-    console.log("MintZa Chatbot submission:", submission);
-    io.emit("admin-new-chatbot-submission", submission);
-    res.json({ success: true, message: "Submission received" });
-  } catch (err) {
-    console.error("Chatbot submission error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.get("/api/chatbot/submissions", authMiddleware, async (req, res) => {
-  try {
-    res.json(chatbotSubmissions);
-  } catch (err) {
-    console.error("Fetch submissions error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// --- Messaging middlewares and routes ---
-
-// Middleware to check block and ban status
-async function checkBlockAndBan(req, res, next) {
-  const senderId = req.user.id;
-  const { to_user_id } = req.body;
-  if (!to_user_id) return res.status(400).json({ error: "Missing to_user_id" });
-  try {
-    const userRes = await pool.query(
-      `SELECT id, status FROM users WHERE id IN ($1, $2);`,
-      [senderId, to_user_id]
-    );
-    if (userRes.rows.length < 2) return res.status(404).json({ error: "User not found" });
-    const sender = userRes.rows.find(u => u.id === senderId);
-    const receiver = userRes.rows.find(u => u.id == to_user_id);
-    if (sender.status === "banned") return res.status(403).json({ error: "You are banned from sending messages" });
-    if (receiver.status === "banned") return res.status(403).json({ error: "User is banned" });
-    const blockRes = await pool.query(
-      `SELECT
-         EXISTS(SELECT 1 FROM blocked_users WHERE blocker_id=$1 AND blocked_id=$2) AS sender_blocked,
-         EXISTS(SELECT 1 FROM blocked_users WHERE blocker_id=$2 AND blocked_id=$1) AS receiver_blocked`,
-      [senderId, to_user_id]
-    );
-    const { sender_blocked, receiver_blocked } = blockRes.rows[0];
-    if (sender_blocked) return res.status(403).json({ error: "You have blocked this user" });
-    if (receiver_blocked) return res.status(403).json({ error: "User has blocked you" });
-    next();
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Database error" });
-  }
-}
-
-// Send private message
-app.post("/messages/send", authMiddleware, checkBlockAndBan, async (req, res) => {
-  try {
-    const fromId = req.user.id;
-    const { to_user_id, content } = req.body;
-    if (!to_user_id || !content) return res.status(400).json({ error: "Missing params" });
-    const r = await pool.query(
-      "INSERT INTO messages (from_user_id, to_user_id, content, is_group, created_at) VALUES ($1,$2,$3,false,NOW()) RETURNING *",
-      [fromId, to_user_id, content]
-    );
-    res.json({ message: "Sent", messageRow: r.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Message send failed" });
-  }
-});
-
-// Send group message
-app.post("/messages/send-group", authMiddleware, async (req, res) => {
-  try {
-    const fromId = req.user.id;
-    const { group_id, content } = req.body;
-    if (!group_id || !content) return res.status(400).json({ error: "Missing params" });
-    const r = await pool.query(
-      "INSERT INTO messages (from_user_id, group_id, content, is_group, created_at) VALUES ($1,$2,$3,true,NOW()) RETURNING *",
-      [fromId, group_id, content]
-    );
-    res.json({ message: "Group message sent", messageRow: r.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Group message failed" });
-  }
-});
-
-// Get messages between two users
-app.get("/messages/history/:otherUserId", authMiddleware, async (req, res) => {
-  try {
-    const me = req.user.id;
-    const other = req.params.otherUserId;
-    const { rows } = await pool.query(
-      `SELECT * FROM messages WHERE (from_user_id=$1 AND to_user_id=$2) OR (from_user_id=$2 AND to_user_id=$1) ORDER BY created_at ASC`,
-      [me, other]
-    );
-    res.json({ messages: rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch messages" });
-  }
-});
-
-// Get group messages
-app.get("/messages/group/:groupId", authMiddleware, async (req, res) => {
-  try {
-    const { groupId } = req.params;
-    const { rows } = await pool.query("SELECT * FROM messages WHERE group_id=$1 ORDER BY created_at ASC", [groupId]);
-    res.json({ messages: rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch group messages" });
-  }
-});
-
-// --- Wallet & Coins ---
-
-app.post("/wallet/balance", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { rows } = await pool.query("SELECT coins FROM wallets WHERE user_id=$1", [userId]);
-    const balance = rows[0]?.coins || 0;
-    res.json({ balance });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Unable to fetch balance" });
-  }
-});
-
-app.post("/wallet/add", async (req, res) => {
-  try {
-    const { token, user_id, amount, description } = req.body;
-    let userId = user_id;
-    if (token) {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      userId = decoded.id;
-    }
-    if (!userId || !amount || amount <= 0) return res.status(400).json({ error: "Invalid params" });
-    await pool.query(
-      `INSERT INTO wallets (user_id, coins)
-       VALUES ($1, $2)
-       ON CONFLICT (user_id)
-       DO UPDATE SET coins = wallets.coins + EXCLUDED.coins, last_updated = NOW()`,
-      [userId, amount]
-    );
-    await pool.query(
-      "INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1, $2, 'purchase', $3)",
-      [userId, amount, description || "Coin credit"]
-    );
-    res.json({ message: "Coins added", amount });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to add coins" });
-  }
-});
-
-app.post("/wallet/spend", authMiddleware, async (req, res) => {
-  try {
-    const { amount, description } = req.body;
-    const userId = req.user.id;
-    if (!amount || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
-    const { rows } = await pool.query("SELECT coins FROM wallets WHERE user_id=$1", [userId]);
-    const balance = rows[0]?.coins || 0;
-    if (balance < amount) return res.status(400).json({ error: "Insufficient balance" });
-    await pool.query("UPDATE wallets SET coins = coins - $1, last_updated = NOW() WHERE user_id=$2", [amount, userId]);
-    await pool.query("INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1, $2, 'spend', $3)", [userId, -amount, description || "Spend coins"]);
-    res.json({ message: "Coins spent", remaining: balance - amount });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to spend coins" });
-  }
-});
-
-app.post("/wallet/tip", authMiddleware, async (req, res) => {
-  try {
-    const fromId = req.user.id;
-    const { toUserId, amount, message } = req.body;
-    if (!toUserId || !amount || amount <= 0) return res.status(400).json({ error: "Invalid params" });
-    const { rows } = await pool.query("SELECT coins FROM wallets WHERE user_id=$1", [fromId]);
-    const balance = rows[0]?.coins || 0;
-    if (balance < amount) return res.status(400).json({ error: "Insufficient coins" });
-    await pool.query("UPDATE wallets SET coins = coins - $1, last_updated = NOW() WHERE user_id=$2", [amount, fromId]);
-    await pool.query("INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1, $2, 'tip', $3)", [fromId, -amount, `Tip to ${toUserId}: ${message || ""}`]);
-    await pool.query("UPDATE creator_stats SET total_tips = COALESCE(total_tips,0) + $1, updated_at = NOW() WHERE user_id=$2", [amount, toUserId]);
-    await pool.query("INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1, $2, 'tip_received', $3)", [toUserId, amount, `Tip from ${fromId}: ${message || ""}`]);
-    await recalcCreatorEarnings(toUserId);
-    res.json({ message: "Tip sent" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Tip failed" });
-  }
-});
-
-// --- Creator stats update & recalc ---
-
-function calculateEarningsFromDeltas({
-  likesDelta = 0,
-  followsDelta = 0,
-  viewsDelta = 0,
-  tips = 0,
-  merch = 0,
-  stripeSales = 0,
-  cryptoSales = 0
-}) {
-  // Updated rates
-  const likeRate = 0.025;   // $0.025 per like
-  const followRate = 0;     // followers do not generate earnings
-  const viewRate = 0.02;    // $0.02 per view
-
-  const platformCut = 0.05; // 5% platform fee
-
-  // Calculate earnings
-  const likesEarnings = likesDelta * likeRate;
-  const followsEarnings = followsDelta * followRate; // 0
-  const viewsEarnings = viewsDelta * viewRate;
-  const tipsEarnings = tips;    // already in USD
-  const merchEarnings = merch;  // already in USD
-
-  const stripeEarnings = stripeSales * (1 - platformCut);
-  const cryptoEarnings = cryptoSales * (1 - platformCut);
-
-  const total = likesEarnings + followsEarnings + viewsEarnings +
-                tipsEarnings + merchEarnings + stripeEarnings + cryptoEarnings;
-
-  const breakdown = {
-    likes: likesEarnings,
-    follows: followsEarnings,
-    views: viewsEarnings,
-    tips: tipsEarnings,
-    merch: merchEarnings,
-    stripe: stripeEarnings,
-    crypto: cryptoEarnings
-  };
-
-  return { total, breakdown };
-}
-
-// =======================
-// Update Creator Stats Endpoint
-// =======================
-app.post("/creator/update-deltas", async (req, res) => {
-  try {
-    const {
-      token,
-      adminKey,
-      userId,
-      likesDelta = 0,
-      followsDelta = 0,
-      viewsDelta = 0,
-      tipsAmount = 0,
-      merchAmount = 0,
-      stripeSales = 0, // physical product sales
-      cryptoSales = 0  // digital product sales
-    } = req.body;
-
-    let targetUserId = userId;
-
-    // Verify token or admin key
-    if (token) {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      targetUserId = decoded.id;
-    } else if (!adminKey || adminKey !== ADMIN_KEY) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
-    // Update cumulative stats in creator_stats
-    await pool.query(
-      `INSERT INTO creator_stats (
-        user_id, total_likes, total_follows, total_views, total_tips,
-        total_merch_sales, total_stripe_sales, total_crypto_sales, earnings, updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,NOW())
-      ON CONFLICT (user_id) DO UPDATE
-        SET total_likes = creator_stats.total_likes + $2,
-            total_follows = creator_stats.total_follows + $3,
-            total_views = creator_stats.total_views + $4,
-            total_tips = creator_stats.total_tips + $5,
-            total_merch_sales = creator_stats.total_merch_sales + $6,
-            total_stripe_sales = creator_stats.total_stripe_sales + $7,
-            total_crypto_sales = creator_stats.total_crypto_sales + $8,
-            updated_at = NOW()
-      `,
-      [targetUserId, likesDelta, followsDelta, viewsDelta, tipsAmount, merchAmount, stripeSales, cryptoSales]
-    );
-
-    // Calculate earnings including sales after 5% platform cut
-    const calc = calculateEarningsFromDeltas({
-      likesDelta,
-      followsDelta,
-      viewsDelta,
-      tips: tipsAmount,
-      merch: merchAmount,
-      stripeSales,
-      cryptoSales
-    });
-
-    const earningsDelta = calc.total;
-
-    // Update earnings in creator_stats and users table
-    await pool.query(
-      "UPDATE creator_stats SET earnings = COALESCE(earnings,0) + $1 WHERE user_id=$2",
-      [earningsDelta, targetUserId]
-    );
-    await pool.query(
-      "UPDATE users SET earnings = COALESCE(earnings,0) + $1 WHERE id=$2",
-      [earningsDelta, targetUserId]
-    );
-
-    res.json({ message: "Creator stats updated", earningsDelta, breakdown: calc.breakdown });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to update creator stats" });
-  }
-});
-
-// -------------------------
-// Helper: Ban / Suspension utilities
-// -------------------------
-async function refreshSuspensionIfExpired(userRow) {
-  // userRow is a DB row object (from users table)
-  if (!userRow) return userRow;
-  if (userRow.status === "suspended" && userRow.suspend_until) {
-    // if suspension expired, reset
-    if (dayjs().isAfter(dayjs(userRow.suspend_until))) {
-      await pool.query(
-        `UPDATE users SET status='active', suspend_until=NULL, suspension_reason=NULL WHERE id=$1`,
-        [userRow.id]
-      );
-      userRow.status = "active";
-      userRow.suspend_until = null;
-      userRow.suspension_reason = null;
-    }
-  }
-  return userRow;
-}
-
-function isUserBlocked(userRow, deviceIdFromClient) {
-  if (!userRow) return { blocked: false };
-
-  // Permanent device / account ban checks (status 'banned' or banType)
-  if (userRow.status === "banned") {
-    return { blocked: true, type: "banned", reason: userRow.suspension_reason || "Permanent ban" };
-  }
-
-  // Suspended check (suspend_until handled by refreshSuspensionIfExpired)
-  if (userRow.status === "suspended") {
-    return { blocked: true, type: "suspended", until: userRow.suspend_until, reason: userRow.suspension_reason || "Temporary suspension" };
-  }
-
-  // Optional device mismatch block: if user row has a device_id and it differs from client (this is stricter)
-  if (userRow.device_id && deviceIdFromClient && userRow.device_id !== deviceIdFromClient) {
-    // This check is optional — some implementations avoid blocking on mismatch to allow multiple devices.
-    return { blocked: true, type: "device_mismatch", reason: "Device not recognized" };
-  }
-
-  return { blocked: false };
-}
-
-// -------------------------
-// Replace /signup (supports phone & device_id)
-// -------------------------
+// User registration
 app.post("/signup", async (req, res) => {
   try {
     const { username, email, password, phone, device_id } = req.body;
     if (!username || !email || !password) return res.status(400).json({ error: "Missing fields" });
 
-    const existingUser = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
-    if (existingUser.rows.length > 0) return res.status(400).json({ error: "Email already registered" });
+    const existingUser = await pool.query("SELECT id FROM users WHERE email = $1 OR username = $2", [email, username]);
+    if (existingUser.rows.length > 0) return res.status(400).json({ error: "Email or username already registered" });
 
-    // Using argon2 instead of bcrypt
+    // Using argon2 for password hashing
     const hashed = await argon2.hash(password, {
       type: argon2.argon2id,
       memoryCost: 2 ** 16,
@@ -1140,6 +1938,13 @@ app.post("/signup", async (req, res) => {
     const user = rows[0];
     await ensureCreatorStats(user.id);
     const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
+    
+    // Initialize user preferences
+    await pool.query(
+      `INSERT INTO user_preferences (user_id, created_at) VALUES ($1, NOW())`,
+      [user.id]
+    );
+    
     res.json({ message: "Signed up successfully", user, token });
   } catch (err) {
     console.error("Signup error:", err);
@@ -1147,9 +1952,7 @@ app.post("/signup", async (req, res) => {
   }
 });
 
-// -------------------------
-// Replace /login (email/password) — supports device_id field and ban checks
-// -------------------------
+// User login
 app.post("/login", async (req, res) => {
   try {
     const { email, password, device_id } = req.body;
@@ -1159,1627 +1962,806 @@ app.post("/login", async (req, res) => {
     const userRow = rows[0];
     if (!userRow) return res.status(400).json({ error: "Invalid credentials" });
 
-    // Refresh suspension if expired (auto-unsuspend)
-    await refreshSuspensionIfExpired(userRow);
-
-    // Re-fetch to reflect possible update
-    const refreshed = (await pool.query("SELECT * FROM users WHERE id=$1", [userRow.id])).rows[0];
-
-    // Block checks
-    const block = isUserBlocked(refreshed, device_id);
-    if (block.blocked) {
-      if (block.type === "suspended") return res.status(403).json({ error: "Account suspended", until: refreshed.suspend_until, reason: refreshed.suspension_reason });
-      if (block.type === "banned") return res.status(403).json({ error: "Account banned", reason: refreshed.suspension_reason });
-      if (block.type === "device_mismatch") return res.status(403).json({ error: "Device mismatch", reason: block.reason });
+    // Check if user is suspended or banned
+    if (userRow.status === "banned") {
+      return res.status(403).json({ error: "Account banned", reason: userRow.suspension_reason });
+    }
+    
+    if (userRow.status === "suspended" && userRow.suspend_until && new Date() < new Date(userRow.suspend_until)) {
+      return res.status(403).json({ 
+        error: "Account suspended", 
+        until: userRow.suspend_until, 
+        reason: userRow.suspension_reason 
+      });
     }
 
-    if (!refreshed.password_hash) return res.status(400).json({ error: "Set a password or use OAuth" });
+    if (!userRow.password_hash) return res.status(400).json({ error: "Set a password or use OAuth" });
     
-    // Using argon2 instead of bcrypt
-    const valid = await argon2.verify(refreshed.password_hash, password);
+    // Using argon2 for password verification
+    const valid = await argon2.verify(userRow.password_hash, password);
     if (!valid) return res.status(400).json({ error: "Invalid credentials" });
 
-    // Save device_id if not set (optional) — won't overwrite if already present
-    if (!refreshed.device_id && device_id) {
-      await pool.query("UPDATE users SET device_id=$1 WHERE id=$2", [device_id, refreshed.id]);
-      refreshed.device_id = device_id;
+    // Update device_id if provided
+    if (device_id && device_id !== userRow.device_id) {
+      await pool.query("UPDATE users SET device_id=$1 WHERE id=$2", [device_id, userRow.id]);
+      userRow.device_id = device_id;
     }
 
-    const token = jwt.sign({ id: refreshed.id, email: refreshed.email, role: refreshed.role }, JWT_SECRET, { expiresIn: "7d" });
-    res.json({ message: "Logged in", user: refreshed, token });
+    // Reset suspension if it has expired
+    if (userRow.status === "suspended" && userRow.suspend_until && new Date() >= new Date(userRow.suspend_until)) {
+      await pool.query(
+        "UPDATE users SET status='active', suspend_until=NULL, suspension_reason=NULL WHERE id=$1",
+        [userRow.id]
+      );
+      userRow.status = "active";
+      userRow.suspend_until = null;
+      userRow.suspension_reason = null;
+    }
+
+    const token = jwt.sign({ id: userRow.id, email: userRow.email, role: userRow.role }, JWT_SECRET, { expiresIn: "7d" });
+    res.json({ message: "Logged in", user: userRow, token });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Login failed" });
   }
 });
 
-// -------------------------
-// OAuth callbacks: ensure we enforce bans after provider returns user data
-// Replace your existing redirect handlers for Google/Discord/Github with these patterns
-// -------------------------
-
-// Helper: create-or-update user after OAuth profile received
-async function findOrCreateOAuthUser({ email, username, provider, device_id = null, phone = null }) {
-  const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-  let user = rows[0];
-  if (!user) {
-    const r = await pool.query(
-      `INSERT INTO users (username, email, phone, device_id, auth_provider, role, subscription_plan, is_musician, is_creator, is_admin, status, created_at)
-       VALUES ($1,$2,$3,$4,$5,'free','free',false,false,false,'active',NOW())
-       RETURNING *`,
-      [username || email.split("@")[0], email, phone || null, device_id || null, provider]
-    );
-    user = r.rows[0];
-    await ensureCreatorStats(user.id);
-  } else {
-    // update device_id/phone if missing
-    const toUpdate = {};
-    if (!user.device_id && device_id) toUpdate.device_id = device_id;
-    if (!user.phone && phone) toUpdate.phone = phone;
-    if (Object.keys(toUpdate).length > 0) {
-      await pool.query(
-        `UPDATE users SET phone=COALESCE($1,phone), device_id=COALESCE($2,device_id), updated_at=NOW() WHERE id=$3`,
-        [toUpdate.phone || null, toUpdate.device_id || null, user.id]
-      );
-      const refreshed = (await pool.query("SELECT * FROM users WHERE id=$1", [user.id])).rows[0];
-      user = refreshed;
-    }
-  }
-  return user;
-}
-
-// Google callback finalizer (used in your /auth/google/callback route)
-async function completeOAuthLogin(req, res, oauthUser) {
+// Get current user
+app.get("/api/me", authMiddleware, async (req, res) => {
   try {
-    // oauthUser should contain: email, username, provider, device_id (if provided by client)
-    let userRow = await findOrCreateOAuthUser(oauthUser);
-
-    // refresh suspension if expired
-    await refreshSuspensionIfExpired(userRow);
-    userRow = (await pool.query("SELECT * FROM users WHERE id=$1", [userRow.id])).rows[0];
-
-    // enforce bans/suspensions
-    const block = isUserBlocked(userRow, oauthUser.device_id);
-    if (block.blocked) {
-      // do not issue token; notify client
-      return res.status(403).send(`<h1>Access denied</h1><p>${block.reason || "Account blocked"}</p>`);
-    }
-
-    // optionally set device_id if missing
-    if (!userRow.device_id && oauthUser.device_id) {
-      await pool.query("UPDATE users SET device_id=$1 WHERE id=$2", [oauthUser.device_id, userRow.id]);
-      userRow.device_id = oauthUser.device_id;
-    }
-
-    // Issue JWT and redirect back to frontend with token
-    const token = jwt.sign({ id: userRow.id, email: userRow.email, role: userRow.role }, JWT_SECRET, { expiresIn: "7d" });
-    // Adjust redirect target to fit your app (welcome.html previously used)
-    return res.redirect(`${FRONTEND_URL}/welcome.html?token=${token}`);
-  } catch (err) {
-    console.error("completeOAuthLogin error:", err);
-    return res.status(500).send("OAuth failed");
-  }
-}
-
-// Example: modify your existing passport callbacks to call completeOAuthLogin
-// In your Google callback route you currently do:
-// passport.authenticate("google", { failureRedirect: "/", session: false }), (req, res) => { const token = jwt.sign(...); res.redirect(...); }
-// Replace final handler with a wrapper that passes device_id (client should send device_id via cookie/query state or saved earlier)
-app.get(
-  "/auth/google/callback",
-  passport.authenticate("google", { failureRedirect: "/", session: false }),
-  async (req, res) => {
-    // `req.user` is user returned by your passport strategy function (you already insert/find user there).
-    // However to centralize ban checking we re-fetch and complete login
-    // Try to get device_id from query or cookie (client should include it)
-    const device_id = req.query.device_id || req.cookies?.device_id || null;
-    const phone = req.query.phone || null;
-    // If passport stored profile in req.user (from your strategy), use it; otherwise fetch by email
-    const email = req.user?.email;
-    await completeOAuthLogin(req, res, { email, username: req.user?.username || req.user?.displayName, provider: "google", device_id, phone });
-  }
-);
-
-// Similarly update Discord and GitHub callbacks:
-app.get(
-  "/auth/discord/callback",
-  passport.authenticate("discord", { failureRedirect: "/", session: false }),
-  async (req, res) => {
-    const device_id = req.query.device_id || req.cookies?.device_id || null;
-    const phone = req.query.phone || null;
-    const email = req.user?.email;
-    await completeOAuthLogin(req, res, { email, username: req.user?.username, provider: "discord", device_id, phone });
-  }
-);
-
-app.get(
-  "/auth/github/callback",
-  passport.authenticate("github", { failureRedirect: "/", session: false }),
-  async (req, res) => {
-    const device_id = req.query.device_id || req.cookies?.device_id || null;
-    const phone = req.query.phone || null;
-    const email = req.user?.email || `${req.user?.username}@github.local`;
-    await completeOAuthLogin(req, res, { email, username: req.user?.username, provider: "github", device_id, phone });
-  }
-);
-
-// -------------------------
-// POST /user/update-contact (auth users update phone/device)
-// -------------------------
-app.post("/user/update-contact", authMiddleware, async (req, res) => {
-  try {
-    const { phone, device_id } = req.body;
-    const userId = req.user.id;
-    const { rows } = await pool.query(
-      `UPDATE users SET phone=$1, device_id=$2, updated_at=NOW() WHERE id=$3 RETURNING phone, device_id`,
-      [phone || null, device_id || null, userId]
-    );
-    res.json({ message: "Contact info updated", user: rows[0] });
-  } catch (err) {
-    console.error("update-contact failed:", err);
-    res.status(500).json({ error: "Failed to update" });
-  }
-});
-
-// -------------------------
-// Admin actions: suspend (6 months), device-ban (permanent), unsuspend, view banned
-// -------------------------
-app.post("/api/admin/users/:id/suspend", async (req, res) => {
-  try {
-    const adminKey = req.headers["x-admin-key"] || req.body.adminKey || req.query.adminKey;
-    if (!adminKey || adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
-
-    const userId = req.params.id;
-    const reason = req.body.reason || "Violation";
-    const suspendUntil = dayjs().add(6, "month").toISOString();
-
-    // Update user status and create BannedRecord (if you use a banned_records table)
-    await pool.query("UPDATE users SET status='suspended', suspend_until=$1, suspension_reason=$2 WHERE id=$3", [suspendUntil, reason, userId]);
-    // optional: insert into banned_records table for email/phone/device
-    await pool.query(
-      `INSERT INTO banned_records (user_id, email, phone, device_id, expires, permanent, reason, created_at)
-       SELECT id, email, phone, device_id, $1, false, $2, NOW() FROM users WHERE id=$3`,
-      [suspendUntil, reason, userId]
-    );
-
-    res.json({ suspendUntil });
-  } catch (err) {
-    console.error("suspend user error:", err);
-    res.status(500).json({ error: "Suspend failed" });
-  }
-});
-
-app.post("/api/admin/users/:id/device-ban", async (req, res) => {
-  try {
-    const adminKey = req.headers["x-admin-key"] || req.body.adminKey || req.query.adminKey;
-    if (!adminKey || adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
-
-    const userId = req.params.id;
-    const reason = req.body.reason || "Severe violation";
-
-    // fetch user's device_id / email / phone
-    const { rows } = await pool.query("SELECT email, phone, device_id FROM users WHERE id=$1", [userId]);
+    const { rows } = await pool.query("SELECT * FROM users WHERE id = $1", [req.user.id]);
+    if (rows.length === 0) return res.status(404).json({ error: "User not found" });
+    
+    // Remove sensitive information
     const user = rows[0];
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    // mark user as permanently banned
-    await pool.query("UPDATE users SET status='banned', suspension_reason=$1 WHERE id=$2", [reason, userId]);
-
-    // create or update banned_records as permanent
-    await pool.query(
-      `INSERT INTO banned_records (user_id, email, phone, device_id, expires, permanent, reason, created_at)
-       VALUES ($1,$2,$3,$4,NULL,true,$5,NOW())
-       ON CONFLICT (device_id) DO UPDATE SET permanent=true, expires=NULL, reason=$5`,
-      [userId, user.email || null, user.phone || null, user.device_id || null, reason]
-    );
-
-    res.json({ ok: true });
+    delete user.password_hash;
+    
+    res.json({ user });
   } catch (err) {
-    console.error("device ban error:", err);
-    res.status(500).json({ error: "Device ban failed" });
+    console.error("Get user error:", err);
+    res.status(500).json({ error: "Failed to get user" });
   }
 });
 
-app.post("/api/admin/users/:id/unsuspend", async (req, res) => {
-  try {
-    const adminKey = req.headers["x-admin-key"] || req.body.adminKey || req.query.adminKey;
-    if (!adminKey || adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
-
-    const userId = req.params.id;
-    await pool.query("UPDATE users SET status='active', suspend_until=NULL, suspension_reason=NULL WHERE id=$1", [userId]);
-
-    // optional: remove/expire banned_records for that user
-    await pool.query("UPDATE banned_records SET expires=NOW() WHERE user_id=$1 AND permanent=false", [userId]);
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("unsuspend error:", err);
-    res.status(500).json({ error: "Unsuspend failed" });
-  }
-});
-
-app.get("/api/admin/users/status", async (req, res) => {
-  try {
-    const adminKey = req.headers["x-admin-key"] || req.query.adminKey;
-    if (!adminKey || adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
-
-    const { rows } = await pool.query("SELECT id, username, email, phone, device_id, status, suspend_until, suspension_reason FROM users WHERE status != 'active'");
-    res.json({ users: rows });
-  } catch (err) {
-    console.error("fetch banned users error:", err);
-    res.status(500).json({ error: "Failed" });
-  }
-});
-
-app.post("/api/history/record", authMiddleware, async (req, res) => {
+// Update user profile
+app.post("/api/profile/update", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { contentType, contentId, title, thumbnailUrl } = req.body;
-
-    if (!contentType || !contentId || !title) {
-      return res.status(400).json({ error: "Missing fields" });
-    }
-
-    await pool.query(
-      `
-      INSERT INTO watch_history (user_id, content_type, content_id, title, thumbnail_url)
-      VALUES ($1,$2,$3,$4,$5)
-      `,
-      [userId, contentType, contentId, title, thumbnailUrl || null]
-    );
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("History record error:", err);
-    res.status(500).json({ error: "Failed to record history" });
-  }
-});
-
-app.get("/api/history", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-
+    const { profile_url, cover_url, bio, social_links, preferences } = req.body;
+    
+    // Update user profile
     const { rows } = await pool.query(
-      `
-      SELECT id, content_type, content_id, title, thumbnail_url, watched_at
-      FROM watch_history
-      WHERE user_id = $1
-      ORDER BY watched_at DESC
-      LIMIT 500
-      `,
-      [userId]
-    );
-
-    res.json(rows);
-  } catch (err) {
-    console.error("Fetch history error:", err);
-    res.status(500).json({ error: "Failed to load history" });
-  }
-});
-
-app.delete("/api/history", authMiddleware, async (req, res) => {
-  try {
-    await pool.query("DELETE FROM watch_history WHERE user_id=$1", [req.user.id]);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to clear history" });
-  }
-});
-
-app.post("/creator/recalc/:userId", async (req, res) => {
-  try {
-    const targetUserId = req.params.userId;
-    const { rows } = await pool.query("SELECT total_likes, total_follows, total_views, total_tips, total_merch_sales FROM creator_stats WHERE user_id=$1", [targetUserId]);
-    const s = rows[0];
-    if (!s) return res.status(404).json({ error: "Creator stats not found" });
-    const calc = calculateEarningsFromDeltas({
-      likesDelta: s.total_likes,
-      followsDelta: s.total_follows,
-      viewsDelta: s.total_views,
-      tips: s.total_tips,
-      merch: s.total_merch_sales,
-    });
-    await pool.query("UPDATE creator_stats SET earnings = $1, updated_at = NOW() WHERE user_id=$2", [calc.total, targetUserId]);
-    await pool.query("UPDATE users SET earnings = $1 WHERE id=$2", [calc.total, targetUserId]);
-    res.json({ message: "Recalculated", earnings: calc.total, breakdown: calc.breakdown });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Recalc failed" });
-  }
-});
-
-async function recalcCreatorEarnings(userId) {
-  const { rows } = await pool.query("SELECT total_likes, total_follows, total_views, total_tips, total_merch_sales FROM creator_stats WHERE user_id=$1", [userId]);
-  const s = rows[0];
-  if (!s) return;
-  const calc = calculateEarningsFromDeltas({
-    likesDelta: s.total_likes || 0,
-    followsDelta: s.total_follows || 0,
-    viewsDelta: s.total_views || 0,
-    tips: s.total_tips || 0,
-    merch: s.total_merch_sales || 0,
-  });
-  await pool.query("UPDATE creator_stats SET earnings = $1, updated_at = NOW() WHERE user_id=$2", [calc.total, userId]);
-  await pool.query("UPDATE users SET earnings = $1 WHERE id=$2", [calc.total, userId]);
-}
-
-app.get("/api/users/:username", async (req, res) => {
-  try {
-    const { username } = req.params;
-
-    const user = await db.oneOrNone(
-      "SELECT * FROM users WHERE username = $1",
-      [username]
-    );
-
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    const stories = await db.any(
-      "SELECT * FROM stories WHERE user_id = $1 ORDER BY created_at DESC",
-      [user.id]
-    );
-
-    const highlights = await db.any(
-      "SELECT * FROM highlights WHERE user_id = $1",
-      [user.id]
-    );
-
-    const followers = await db.any(
-      `SELECT u.* FROM follows f
-       JOIN users u ON u.id = f.follower_id
-       WHERE f.following_id = $1`,
-      [user.id]
-    );
-
-    const following = await db.any(
-      `SELECT u.* FROM follows f
-       JOIN users u ON u.id = f.following_id
-       WHERE f.follower_id = $1`,
-      [user.id]
-    );
-
-    res.json({
-      user,
-      stories,
-      highlights,
-      followers,
-      following
-    });
-  } catch (e) {
-    res.status(500).json({ error: "profile_failed" });
-  }
-});
-
-/* ===============================
-   FOLLOW / UNFOLLOW
-=============================== */
-app.post("/api/follow/:userId", authMiddleware, async (req, res) => {
-  const { userId } = req.params;
-  const { action } = req.body;
-  const current = req.user;
-
-  try {
-    if (action === "follow") {
-      await db.none(
-        "INSERT INTO follows (follower_id, following_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-        [current.id, userId]
-      );
-    } else {
-      await db.none(
-        "DELETE FROM follows WHERE follower_id=$1 AND following_id=$2",
-        [current.id, userId]
-      );
-    }
-
-    res.json({ status: "ok" });
-  } catch {
-    res.status(500).json({ error: "follow_failed" });
-  }
-});
-
-/* ===============================
-   STORIES
-=============================== */
-/* --- OLD STORY ENDPOINT (optional for legacy frontend) --- */
-app.post("/api/stories", authMiddleware, async (req, res) => {
-  const { media, type } = req.body;
-  const current = req.user;
-
-  await db.none(
-    "INSERT INTO stories (id, user_id, media, type) VALUES (gen_random_uuid(), $1, $2, $3)",
-    [current.id, media, type]
-  );
-
-  res.json({ status: "created" });
-});
-
-/* --- REACT TO STORY --- */
-app.post("/api/stories/:storyId/react", authMiddleware, async (req, res) => {
-  const { storyId } = req.params;
-  const { emoji } = req.body;
-  const current = req.user;
-
-  await db.none(
-    `INSERT INTO story_reactions (story_id, user_id, emoji)
-     VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-    [storyId, current.id, emoji]
-  );
-
-  res.json({ status: "reacted" });
-});
-
-/* --- DELETE STORY --- */
-app.delete("/api/stories/:storyId", authMiddleware, async (req, res) => {
-  const { storyId } = req.params;
-  const current = req.user;
-
-  await db.none(
-    "DELETE FROM stories WHERE id=$1 AND user_id=$2",
-    [storyId, current.id]
-  );
-
-  res.json({ status: "deleted" });
-});
-
-/* --- UPLOAD STORY TO AWS S3 --- */
-app.post(
-  "/api/stories/upload",
-  authMiddleware,
-  upload.single("file"),
-  async (req, res) => {
-    try {
-      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
-      const current = req.user;
-      const ext = path.extname(req.file.originalname);
-      const fileKey = `stories/${current.id}/${uuidv4()}${ext}`;
-
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: process.env.AWS_S3_BUCKET,
-          Key: fileKey,
-          Body: req.file.buffer,
-          ContentType: req.file.mimetype,
-          ACL: "public-read",
-        })
-      );
-
-      const mediaUrl = `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileKey}`;
-      const type = req.file.mimetype.startsWith("video") ? "video" : "image";
-
-      const story = await db.one(
-        "INSERT INTO stories (id, user_id, media, type) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING *",
-        [current.id, mediaUrl, type]
-      );
-
-      res.json({ status: "uploaded", story });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "upload_failed" });
-    }
-  }
-);
-
-/* ===============================
-   HIGHLIGHTS
-=============================== */
-app.post("/api/highlights", authMiddleware, async (req, res) => {
-  const { title, storyIds, cover } = req.body;
-  const current = req.user;
-
-  const highlight = await db.one(
-    "INSERT INTO highlights (user_id, title, cover) VALUES ($1,$2,$3) RETURNING id",
-    [current.id, title, cover]
-  );
-
-  for (const sid of storyIds) {
-    await db.none(
-      "INSERT INTO highlight_stories (highlight_id, story_id) VALUES ($1,$2)",
-      [highlight.id, sid]
-    );
-  }
-
-  res.json({ status: "created" });
-});
-
-/* ===============================
-   CONTENT TABS
-=============================== */
-app.get("/api/users/:username/videos", async (req, res) => {
-  const { username } = req.params;
-  const data = await db.any("SELECT * FROM videos WHERE username=$1", [username]);
-  res.json(data);
-});
-
-app.get("/api/users/:username/shorts", async (req, res) => {
-  const { username } = req.params;
-  const data = await db.any("SELECT * FROM shorts WHERE username=$1", [username]);
-  res.json(data);
-});
-
-app.get("/api/users/:username/music", async (req, res) => {
-  const { username } = req.params;
-  const data = await db.any("SELECT * FROM music WHERE username=$1", [username]);
-  res.json(data);
-});
-
-/* ===============================
-   LIVE STREAM
-=============================== */
-app.post("/api/live/start", authMiddleware, async (req, res) => {
-  const current = req.user;
-
-  const live = await db.one(
-    "INSERT INTO live_streams (user_id, active) VALUES ($1,true) RETURNING id",
-    [current.id]
-  );
-
-  res.json({ liveStreamId: live.id });
-});
-
-app.post("/api/live/end", authMiddleware, async (req, res) => {
-  const current = req.user;
-
-  await db.none(
-    "UPDATE live_streams SET active=false WHERE user_id=$1",
-    [current.id]
-  );
-
-  res.json({ status: "ended" });
-});
-
-/* ===============================
-   ACCOUNT SWITCHER
-=============================== */
-app.get("/api/accounts", authMiddleware, async (req, res) => {
-  const current = req.user;
-
-  const accounts = await db.any(
-    "SELECT * FROM accounts WHERE owner_id=$1",
-    [current.owner_id]
-  );
-
-  res.json(accounts);
-});
-
-app.post("/api/accounts/switch", authMiddleware, async (req, res) => {
-  res.json({ activeAccount: req.body.accountId });
-});
-
-// --- Verification upload ---
-
-app.post("/verify", authMiddleware, upload.single("image"), async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const {
-      name,
-      age,
-      dob,
-      address,
-      latitude,
-      longitude,
-      city,
-      postalCode,
-      bio,
-      link,
-      payment_method
-    } = req.body;
-    if (!name || !age || !dob || !address || !bio || !link) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-    const imagePath = req.file ? `/uploads/verification/${req.file.filename}` : null;
-    if (!imagePath) return res.status(400).json({ error: "Profile/ID image required" });
-    const result = await pool.query(`
-      INSERT INTO verification_requests (
-        user_id, name, age, dob, address, latitude, longitude, city, postal_code, bio, content_link, payment_method, image_path, status, created_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending',NOW())
-      ON CONFLICT (user_id) DO UPDATE SET
-        name=EXCLUDED.name,
-        age=EXCLUDED.age,
-        dob=EXCLUDED.dob,
-        address=EXCLUDED.address,
-        latitude=EXCLUDED.latitude,
-        longitude=EXCLUDED.longitude,
-        city=EXCLUDED.city,
-        postal_code=EXCLUDED.postal_code,
-        bio=EXCLUDED.bio,
-        content_link=EXCLUDED.content_link,
-        payment_method=EXCLUDED.payment_method,
-        image_path=EXCLUDED.image_path,
-        status='pending',
-        updated_at=NOW()
-      RETURNING *;
-    `, [userId, name, age, dob, address, latitude || null, longitude || null, city || null, postalCode || null, bio, link, payment_method, imagePath]);
-    res.json({ message: "Verification submitted successfully", verification: result.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to submit verification" });
-  }
-});
-
-// --- Lemon Squeezy webhook for coin purchases ---
-
-app.post("/webhooks/coins", express.json(), async (req, res) => {
-  try {
-    const event = req.body;
-    const email = event?.email || event?.data?.attributes?.customer_email;
-    const product_name = event?.product_name || event?.data?.attributes?.product_name || event?.data?.attributes?.name;
-    if (!email || !product_name) {
-      console.warn("Webhook missing email/product", event);
-      return res.status(400).json({ error: "Missing fields" });
-    }
-    const { rows } = await pool.query("SELECT id FROM users WHERE email=$1", [email]);
-    const user = rows[0];
-    if (!user) return res.status(400).json({ error: "User not found" });
-    const coinMapping = {
-      "100 Coins": 100,
-      "250 Coins": 275,
-      "500 Coins": 575,
-      "1000 Coins": 1200,
-      "2500 Coins": 3000,
-      "5000 Coins": 6200,
-      "10000 Coins": 13000,
-      "20000 Coins": 27500
-    };
-    const coins = coinMapping[product_name] || parseInt(event?.data?.attributes?.quantity || "0");
-    if (coins && coins > 0) {
-      await pool.query(
-        `INSERT INTO wallets (user_id, coins)
-         VALUES ($1, $2)
-         ON CONFLICT (user_id)
-         DO UPDATE SET coins = wallets.coins + EXCLUDED.coins, last_updated = NOW()`,
-        [user.id, coins]
-      );
-      await pool.query("INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1, $2, 'purchase', $3)", [user.id, coins, `Purchase ${product_name}`]);
-    }
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("webhooks/coins error:", err);
-    res.status(500).json({ error: "Webhook processing failed" });
-  }
-});
-
-/ Add these endpoints to your server.js file
-
-// --- Admin Monitoring System ---
-
-// Admin authentication middleware
-function adminAuthMiddleware(req, res, next) {
-  try {
-    const adminKey = req.headers["x-admin-key"] || req.body.adminKey || req.query.adminKey;
-    if (!adminKey || adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
-    req.admin = { key: adminKey };
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: "Authentication failed" });
-  }
-}
-
-// --- Communication Logging Tables ---
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS communication_logs (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    chat_id INTEGER REFERENCES chats(id) ON DELETE CASCADE,
-    message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
-    call_id INTEGER REFERENCES calls(id) ON DELETE CASCADE,
-    action VARCHAR(20) NOT NULL,
-    previous_data JSONB,
-    new_data JSONB,
-    created_at TIMESTAMP DEFAULT NOW(),
-    admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE
-  )
-`);
-
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS deleted_content (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    content_type VARCHAR(20) NOT NULL,
-    content_id VARCHAR(255) NOT NULL,
-    original_content TEXT,
-    deleted_at TIMESTAMP DEFAULT NOW(),
-    deleted_by INTEGER REFERENCES users(id) ON DELETE CASCADE
-  )
-`);
-
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS call_logs (
-    id SERIAL PRIMARY KEY,
-    caller_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    call_id INTEGER REFERENCES calls(id) ON DELETE CASCADE,
-    recording_url VARCHAR(500),
-    status VARCHAR(20) DEFAULT 'initiated',
-    duration_seconds INTEGER,
-    started_at TIMESTAMP DEFAULT NOW(),
-    ended_at TIMESTAMP,
-    admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE
-  )
-`);
-
-// --- Message Logging ---
-
-// Log all message events
-async function logMessageEvent(userId, chatId, messageId, action, data = {}) {
-  try {
-    await pool.query(`
-      INSERT INTO communication_logs 
-      (user_id, chat_id, message_id, action, previous_data, new_data, admin_id, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-    `, [userId, chatId, messageId, action, JSON.stringify(data.previousData || {}), JSON.stringify(data.newData || {}), req.admin.id]);
-  } catch (err) {
-    console.error("Failed to log message event:", err);
-  }
-}
-
-// Enhanced send message with logging
-app.post("/api/messages", authMiddleware, async (req, res) => {
-  try {
-    const { to_user_id, content, reply_to_id, type = 'text' } = req.body;
-    const fromId = req.user.id;
-    
-    // Create message in database
-    const { rows } = await pool.query(
-      `INSERT INTO messages (from_user_id, to_user_id, content, type, reply_to_id, created_at)
-      VALUES ($1, $2, $3, $4, $5, NOW())
-      RETURNING *`,
-      [fromId, to_user_id, content, type, reply_to_id]
-    );
-    
-    const message = rows[0];
-    
-    // Log the message creation
-    await logMessageEvent(fromId, message.chat_id, "create", { content, type, reply_to_id });
-    
-    // Send to recipient via socket
-    if (req.body.realtime !== false) {
-      const io = req.app.get("io");
-      if (io) {
-        io.to(`user-${to_user_id}`).emit("new_message", {
-          id: message.id,
-          chatId: message.chat_id,
-          message,
-          sender: {
-            id: req.user.id,
-            username: req.user.username
-          }
-        });
-      }
-    }
-    
-    res.json({ message });
-  } catch (err) {
-    console.error("Failed to send message:", err);
-    res.status(500).json({ error: "Failed to send message" });
-  }
-});
-
-// Enhanced delete message with logging
-app.delete("/api/messages/:messageId", authMiddleware, async (logMessageDeleteMessage(req, res) {
-  try {
-    const { messageId } = req.params;
-    const userId = req.user.id;
-    
-    // Get message before deletion
-    const { rows } = await pool.query("SELECT * FROM messages WHERE id = $1", [messageId]);
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Message not found" });
-    }
-    
-    const message = rows[0];
-    
-    // Store deleted content in deleted_content table
-    await pool.query(`
-      INSERT INTO deleted_content (user_id, content_type, content_id, original_content, deleted_at, deleted_by)
-      VALUES ($1, $2, $3, $4, NOW(), $5)
-    `, [userId, message.type, message.id, message.content, req.admin.id]);
-    
-    // Log the deletion
-    await logMessageEvent(userId, message.chat_id, "delete", { 
-      content: message.content,
-      type: message.type,
-      reply_to_id: message.reply_to_id
-    });
-    
-    // Actually delete the message
-    await pool.query("DELETE FROM messages WHERE id = $1", [messageId]);
-    
-    res.json({ message: "Message deleted successfully" });
-  } catch (err) {
-    console.error("Failed to delete message:", err);
-    res.status(500).json({ error: "Failed to delete message" });
-  }
-});
-
-// Enhanced edit message with logging
-app.put("/api/messages/:messageId", authMiddleware, async (req, res) => {
-  try {
-    const { messageId } = req.params;
-    const { content } = req.body;
-    const userId = req.user.id;
-    
-    // Get message before editing
-    const { rows } = await pool.query("SELECT * FROM messages WHERE id = $1", [messageId]);
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Message not found" });
-    }
-    
-    const message = rows[0];
-    
-    // Store previous content in deleted_content table if not already there
-    const { rows: existingDeleted } = await pool.query(
-      "SELECT id FROM deleted_content WHERE content_id = $1 AND content_type = 'message' AND content_id = $1",
-      [messageId]
-    );
-    
-    if (existingDeleted.length === 0) {
-      await pool.query(`
-        INSERT INTO deleted_content (user_id, content_type, content_id, original_content, deleted_at, deleted_by)
-        VALUES ($1, 'message', $2, $3, NOW(), $4)
-      `, [userId, messageId, message.content, req.admin.id]);
-    }
-    
-    // Log the edit
-    await logMessageEvent(userId, message.chat_id, "edit", { 
-      previous_content: message.content,
-      new_content: content,
-      type: message.type,
-      reply_to_id: message.reply_to_id
-    });
-    
-    // Actually update the message
-    await pool.query("UPDATE messages SET content = $1, edited = true, edited_at = NOW() WHERE id = $2", [content, messageId]);
-    
-    res.json({ message: "Message updated successfully" });
-  } catch (err) {
-    console.error("Failed to edit message:", err);
-    res.status(500).json({ error: "Failed to edit message" });
-  }
-});
-
-// --- Call Recording and Logging ---
-
-// Start call with logging
-app.post("/api/calls", authMiddleware, async (req, {
-  try {
-    const { recipientId, callType = "voice" } = req.body;
-    const callerId = req.user.id;
-    
-    // Create call record
-    const { rows } = await pool.query(`
-      INSERT INTO calls (caller_id, receiver_id, type, status, created_at)
-      VALUES ($1, $2, $3, 'initiated', NOW())
-      RETURNING *
-    `, [callerId, recipientId, callType]);
-    
-    const call = rows[0];
-    
-    // Log the call initiation
-    await logMessageEvent(callerId, call.id, "initiate", { 
-      callType,
-      recipientId
-    });
-    
-    // Create a room for the call
-    const { rows: roomRows } = await pool.query(`
-      INSERT INTO call_rooms (call_id, created_at)
-      VALUES ($1, NOW())
-      RETURNING *
-    `, [call.id]);
-    
-    const room = roomRows[0];
-    
-    // Join the room for signaling
-    const agoraToken = generateAgoraToken(room.id, callerId, "publisher");
-    
-    res.json({ 
-      roomId: room.id, 
-      agoraToken, 
-      channelName: room.id,
-      uid: callerId
-    });
-  } catch (err) {
-    console.error("Failed to initiate call:", err);
-    res.status(500).json({ error: "Failed to initiate call" });
-  }
-});
-
-// End call with logging
-app.post("/api/calls/:callId/end", authMiddleware, async (req, res) => {
-  try {
-    const { callId } = req.params;
-    const adminId = req.user.id;
-    
-    // Get call details
-    const { rows } = await pool.query("SELECT * FROM calls WHERE id = $1", [callId]);
-    if (callRows.length === 0) {
-      return res.status(404).json({ error: "Call not found" });
-    }
-    
-    const call = callRows[0];
-    
-    // Log the call end
-    await logMessageEvent(call.caller_id, call.id, "end", { 
-      status: call.status,
-      duration: call.duration_seconds
-    });
-    
-    // Update call status
-    await pool.query("UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = $1", [callId]);
-    
-    res.json({ message: "Call ended" });
-  } catch (err) {
-    console.error("Failed to end call:", err);
-    res.status(500).json({ error: "Failed to end call" });
-  }
-});
-
-// Store call recording
-app.post("/api/calls/:callId/recording", authMiddleware, async (req, res) => {
-  try {
-    const { callId } = req.params;
-    const adminId = req.user.id;
-    
-    // Get call details
-    const { rows } = await pool.query("SELECT * FROM calls WHERE id = $1", [callId]);
-    if (call.status !== 'active') {
-      return res.status(400).json({ error: "Call is not active" });
-    }
-    
-    const call = rows[0];
-    
-    // Store recording in S3
-    const recordingUrl = await uploadToS3(req.body.recording, `recordings/${callId}.webm`);
-    
-    // Log the recording storage
-    await logMessageEvent(call.caller_id, call.id, "record", { 
-      recordingUrl,
-      duration: call.duration_seconds
-    });
-    
-    // Update call with recording URL
-    await pool.query("UPDATE calls SET recording_url = $1 WHERE id = $1", [recordingUrl]);
-    
-    res.json({ recordingUrl });
-  } catch (err) {
-    console.error("Failed to store call recording:", err);
-    res.status(500).json({ error: "Failed to store recording" });
-  }
-});
-
-// Helper function to upload to S3
-async function uploadToS3(file, key) {
-  const s3 = new S3Client({ region: process.env.AWS_REGION });
-  
-  const params = {
-    Bucket: process.env.S3_BUCKET_NAME,
-    Key: key,
-    Body: file,
-    ContentType: file.type
-  };
-  
-  const result = await s3.send(new PutObjectCommand(params));
-  return `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
-}
-
-// --- Image and Media Upload with Logging ---
-
-// Upload image with logging
-app.post("/api/media/upload", authMiddleware, upload.single("file"), async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const file = req.file;
-    
-    // Upload to S3
-    const fileKey = `media/${userId}/${Date.now()}-${file.originalname}`;
-    const fileUrl = await uploadToS3(file, fileKey);
-    
-    // Log the upload
-    await logMessageEvent(userId, null, "media_upload", { 
-      fileName: file.originalname,
-      fileSize: file.size,
-      fileType: file.type,
-      fileUrl
-    });
-    
-    // Save to database
-    const { rows } = await pool.query(`
-      INSERT INTO media (user_id, filename, original_name, file_size, file_type, s3_key, s3_url, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6, NOW())
-      RETURNING *
-    `, [userId, file.originalname, file.size, file.type, fileKey, fileUrl]);
-    
-    res.json({ 
-      message: "Media uploaded successfully", 
-      media: rows[0] 
-    });
-  } catch (err) {
-    console.error("Error uploading media:", err);
-    res.status(500).json({ error: "Failed to upload media" });
-  }
-});
-
-// Delete media with logging
-app.delete("/api/media/:mediaId", authMiddleware, async (req, const res) => {
-  try {
-    const { mediaId } = req.params;
-    const userId = req.user.id;
-    
-    // Get media details
-    const { rows } = await pool.query("SELECT * FROM media WHERE id = $1", [mediaId]);
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Media not found" });
-    }
-    
-    const media = rows[0];
-    
-    // Store deleted content in deleted_content table
-    await pool.query(`
-      INSERT INTO deleted_content (user_id, content_type, content_id, original_content, deleted_at, deleted_by)
-      VALUES ($1, 'media', $2, $3, $4, NOW(), $5)
-    `, [userId, media.id, media.url]);
-    
-    // Log the deletion
-    await logMessageEvent(userId, null, "media_delete", { 
-      fileName: media.original_name,
-      fileType: media.type,
-      s3_key: media.s3_key
-    });
-    
-    // Delete from database
-    await pool.query("DELETE FROM media WHERE id = $1", [mediaId]);
-    
-    res.json({ message: "Media deleted successfully" });
-  } catch (err) {
-    console.error("Error deleting media:", err);
-    res.status(500).json({ error: "Failed to delete media" });
-  }
-});
-
-// --- Voice Message Recording and Transcription ---
-
-// Store voice message with logging
-app.post("/api/messages/voice", authMiddleware, upload.single("audio"), async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { chatId } = req.body;
-    const file = req.file;
-    
-    // Upload to S3
-    const fileKey = `voice/${userId}/${Date.now()}-${file.originalname}`;
-    const audioUrl = await uploadToS3(file, fileKey);
-    
-    // Log the voice message
-    await logMessageEvent(userId, chatId, "voice_message", { 
-      fileName: file.originalname,
-      duration: req.body.duration,
-      audioUrl
-    });
-    
-    // Save to database
-    const { rows } = await pool.query(`
-      INSERT INTO messages (from_user_id, to_user_id, content, type, chat_id, created_at)
-      VALUES ($1, $2, $3, 'voice', $4, NOW())
-      RETURNING *
-    `, [userId, chatId, audioUrl, req.body.duration]);
-    
-    res.json({ message: rows[0] });
-  } catch (err) {
-    console.error("Error sending voice message:", err);
-    res.status(500).json({ error: "Failed to send voice message" });
-  }
-});
-
-// Transcribe voice message with logging
-app.post("/api/messages/:messageId/transcribe", authMiddleware, async (req, res) => {
-  try {
-    const { messageId } = req.params;
-    const adminId = req.user.id;
-    
-    // Get message details
-    const { rows } = await pool.query("SELECT * FROM messages WHERE id = $1", [messageId]);
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Message not found" });
-    }
-    
-    const message = rows[0];
-    
-    // Get the audio file from S3
-    const { rows: audioRows } = await pool.query("SELECT * FROM messages WHERE id = $1", [messageId]);
-    if (audioRows.length === 0 || !audioRows[0].content) {
-      return res.status(404).json({ error: "Audio message not found" });
-    }
-    
-    const audioUrl = audioRows[0].content;
-    const fileKey = audioUrl.split('/').pop();
-    
-    // Download from S3
-    const audioBuffer = await downloadFromS3(fileKey);
-    
-    // Transcribe with Whisper API
-    const formData = new FormData();
-    formData.append("file", new Blob([audioBuffer], { type: "audio/webm" }));
-    formData.append("model", "whisper-1");
-    formData.append("response_format", "verbose_json");
-    
-    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
-      },
-      body: formData
-    });
-    
-    if (!response.ok) {
-      const transcriptionData = await response.json();
-      
-      // Log the transcription
-      await logMessageEvent(req.user.id, null, "transcription", { 
-        messageId,
-        transcript: transcriptionData.text,
-        language: transcriptionData.language
-      });
-      
-      // Save transcription
-      await pool.query(`
-        UPDATE messages 
-        SET transcription = $1, transcribed = true, transcribed_text = $2
-        WHERE id = $3
-      `, [transcriptionData.text, messageId]);
-      
-      res.json({ 
-        message: "Message transcribed successfully", 
-        transcription: transcriptionData 
-      });
-    } else {
-      res.status(500).json({ error: "Failed to transcribe message" });
-    }
-  } catch (err) {
-    console.error("Error transcribing message:", err);
-    res.status(500).json({ error: "Failed to transcribe message" });
-  }
-});
-
-// --- Search for Admins ---
-
-// Search messages for admins
-app.get("/api/admin/messages/search", adminAuthMiddleware, async (req, res) => {
-  try {
-    const { query = req.query.q;
-    const { page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const offset = (page - 1) * limit;
-    
-    const { rows } = await pool.query(`
-      SELECT m.*, u.username, u.email, u.avatar_url
-      FROM messages m
-      JOIN users u ON m.from_user_id = u.id
-      WHERE m.content ILIKE $1 OR m.content ILIKE $2 OR u.username ILIKE $3 OR u.email ILIKE $4 OR m.content ILIKE $5
-      ORDER BY m.created_at DESC
-      LIMIT $2 OFFSET $3
-    `, [`%${query}%`, limit, offset]);
-    
-    res.json({ messages: rows });
-  } catch (err) {
-    console.error("Error searching messages:", err);
-    res.status(500).json({ error: "Failed to search messages" });
-  }
-});
-
-// Search deleted content for admins
-app.get("/api/admin/deleted-content", adminAuthMiddleware, async (req, res) => {
-  try {
-    const { type = req.query.type || 'all';
-    const { page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const offset = (page - 1) * limit;
-    
-    let query = `
-      SELECT dc.*, u.username, u.email, u.avatar_url
-      FROM deleted_content dc
-      JOIN users u ON dc.user_id = u.id
-    `;
-    
-    if (type !== 'all') {
-      query += ` WHERE dc.content_type = $1`;
-    }
-    
-    query += ` ORDER BY dc.deleted_at DESC LIMIT $2 OFFSET $3`;
-    
-    const { rows } = await pool.query(query);
-    res.json({ deletedContent: rows });
-  } catch (err) {
-    console.error("Error searching deleted content:", err);
-    res.status(500).json({ error: "Failed to search deleted content" });
-  }
-});
-
-// Search call recordings for admins
-app.get("/api/admin/calls", adminAuthMiddleware, async (req, res) => {
-  try {
-    const { page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const offset = (page - 1) * limit;
-    
-    const { rows } = await pool.query(`
-      SELECT c.*, u.username, u.avatar_url
-      FROM calls c
-      JOIN users u ON c.caller_id = u.id
-      ORDER BY c.created_at DESC
-      LIMIT $2 OFFSET $3
-    `);
-    
-    res.json({ calls: rows });
-  } catch (err) {
-    console.error("Error searching calls:", err);
-    res.status(500).json({ error: "Failed to search calls" });
-  }
-});
-
-// Get all deleted content for admins
-app.get("/api/admin/deleted-content", adminAuthMiddleware, async (req, res) => {
-  try {
-    const { type = req.query.type || 'all';
-    
-    let query = `
-      SELECT dc.*, u.username, u.email, u.avatar_url
-      FROM deleted_content dc
-      JOIN users u ON dc.user_id = u.id
-    `;
-    
-    if (type !== 'all') {
-      query += ` WHERE dc.content_type = $1`;
-    }
-    
-    query += ` ORDER BY dc.deleted_at DESC`;
-    
-    const { rows } = await pool.query(query);
-    res.json({ deletedContent: rows });
-  } catch (err) {
-    console.error("Error fetching deleted content:", err);
-    res.status(500).json({ error: "Failed to fetch deleted content" });
-  }
-});
-
-// Get deleted content details
-app.get("/api/admin/deleted-content/:id", adminAuthMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    const { rows } = await pool.query(`
-      SELECT dc.*, u.username, u.email, u.avatar_url
-      FROM deleted_content dc
-      JOIN users u ON dc.user_id = u.id
-      WHERE dc.id = $1
-    `, [id]);
-    
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Content not found" });
-    }
-    
-    const content = rows[0];
-    
-    // Get original content if available
-    let originalContent = content.original_content;
-    if (!originalContent && content.content_type !== 'text') {
-      try {
-        originalContent = await downloadFromS3(content.s3_key);
-        originalContent = await originalContent.text();
-      } catch (err) {
-        console.error("Failed to download original content:", err);
-      }
-    }
-    
-    res.json({ 
-      content: {
-        ...content,
-        originalContent
-      } 
-    });
-  } catch (err) {
-    console.error("Error fetching deleted content details:", err);
-    res.status(500).json({ error: "Failed to fetch content details" });
-  }
-});
-
-// Helper function to download from S3
-async function downloadFromS3(key) {
-  const getObjectCommand = new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: key });
-  const response = await s3.send(getObjectCommand);
-  return Buffer.from(response.Body);
-}
-
-// Helper function to upload to S3
-async function uploadToS3(file, key) {
-  const s3 = new S3Client({ region: process.env.AWS_REGION });
-  const putObjectCommand = new PutObjectCommand({
-    Bucket: process.env.S3_BUCKET_NAME,
-    Key: key,
-    Body: file
-  });
-  await s3.send(putObjectCommand);
-  return `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
-}
-// --- Withdraw request ---
-
-app.post("/withdraw", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { amount, methodDetails } = req.body;
-    if (!amount || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
-    const { rows } = await pool.query("SELECT earnings FROM users WHERE id=$1", [userId]);
-    const earnings = rows[0]?.earnings || 0;
-    if (amount > earnings) return res.status(400).json({ error: "Insufficient earnings" });
-    const r = await pool.query(
-      "INSERT INTO withdrawals (user_id, amount, method_details, status, created_at) VALUES ($1,$2,$3,'pending',NOW()) RETURNING *",
-      [userId, amount, methodDetails || null]
-    );
-    await pool.query("UPDATE users SET earnings = earnings - $1 WHERE id=$2", [amount, userId]);
-    res.json({ message: "Withdrawal requested", withdrawal: r.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Withdraw failed" });
-  }
-});
-
-// --- Livestream management ---
-
-app.post("/livestream/start", authMiddleware, async (req, res) => {
-  try {
-    const { title, description, thumbnail_url } = req.body;
-    const userId = req.user.id;
-    const streamKey = uuidv4();
-    const { rows } = await pool.query(
-      `INSERT INTO livestreams (user_id, title, description, stream_key, is_live, thumbnail_url, started_at)
-       VALUES ($1,$2,$3,$4,true,$5,NOW())
+      `UPDATE users SET 
+         profile_url = COALESCE($1, profile_url), 
+         cover_url = COALESCE($2, cover_url),
+         bio = COALESCE($3, bio), 
+         social_links = COALESCE($4, social_links), 
+         updated_at = NOW()
+       WHERE id = $5
        RETURNING *`,
-      [userId, title, description, streamKey, thumbnail_url || null]
-    );
-    res.json({ message: "Livestream started", stream: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to start livestream" });
-  }
-});
-
-app.post("/livestream/:id/request-join", authMiddleware, async (req, res) => {
-  try {
-    const streamId = req.params.id;
-    const userId = req.user.id;
-    const { rows } = await pool.query(
-      `INSERT INTO livestream_requests (stream_id, user_id)
-       VALUES ($1, $2)
-       RETURNING *`,
-      [streamId, userId]
-    );
-    const creatorId = (await pool.query("SELECT user_id FROM livestreams WHERE id=$1", [streamId])).rows[0]?.user_id;
-    if (creatorId) io.to(`user-${creatorId}`).emit("join-request", { request: rows[0] });
-    res.json({ message: "Request sent", request: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to request join" });
-  }
-});
-
-app.post("/livestream/:id/request/:requestId/respond", authMiddleware, async (req, res) => {
-  try {
-    const streamId = req.params.id;
-    const requestId = req.params.requestId;
-    const { action } = req.body; // "approve" or "reject"
-    const userId = req.user.id;
-    const { rows: streamRows } = await pool.query("SELECT user_id FROM livestreams WHERE id=$1", [streamId]);
-    if (streamRows[0].user_id !== userId) return res.status(403).json({ error: "Not allowed" });
-    const status = action === "approve" ? "approved" : "rejected";
-    const { rows } = await pool.query(
-      `UPDATE livestream_requests SET status=$1, responded_at=NOW() WHERE id=$2 RETURNING *`,
-      [status, requestId]
-    );
-    res.json({ message: `Request ${status}`, request: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to respond to request" });
-  }
-});
-
-app.post("/livestream/:id/donate", authMiddleware, async (req, res) => {
-  try {
-    const streamId = req.params.id;
-    const { amount, message } = req.body;
-    const userId = req.user.id;
-    const { rows } = await pool.query("SELECT coins FROM wallets WHERE user_id=$1", [userId]);
-    const balance = rows[0]?.coins || 0;
-    if (balance < amount) return res.status(400).json({ error: "Insufficient balance" });
-    await pool.query("UPDATE wallets SET coins = coins - $1, last_updated = NOW() WHERE user_id=$2", [amount, userId]);
-    const PLATFORM_CUT = 0;
-    const platformFee = Number((amount * PLATFORM_CUT).toFixed(2));
-    const netAmount = amount - platformFee;
-    await pool.query(
-      `INSERT INTO stream_donations (stream_id, user_id, amount, message, platform_fee)
-       VALUES ($1,$2,$3,$4,$5)`,
-      [streamId, userId, netAmount, message || null, platformFee]
-    );
-    const { rows: streamRows } = await pool.query("SELECT user_id FROM livestreams WHERE id=$1", [streamId]);
-    const creatorId = streamRows[0]?.user_id;
-    if (creatorId) {
-      await pool.query(
-        `UPDATE creator_stats SET total_tips = COALESCE(total_tips,0) + $1, updated_at=NOW() WHERE user_id=$2`,
-        [netAmount, creatorId]
-      );
-    }
-    res.json({ message: "Donation sent to platform", netAmount, platformFee });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to donate" });
-  }
-});
-
-app.post("/creator/process-donations", authMiddleware, async (req, res) => {
-  try {
-    const creatorId = req.user.id;
-    const { rows } = await pool.query(
-      `SELECT SUM(amount) as total FROM stream_donations d
-       JOIN livestreams l ON d.stream_id = l.id
-       WHERE l.user_id=$1 AND d.processed=false`,
-      [creatorId]
-    );
-    const total = Number(rows[0]?.total || 0);
-    if (total <= 0) return res.json({ message: "No donations to process" });
-    await pool.query("UPDATE users SET earnings = COALESCE(earnings,0) + $1 WHERE id=$2", [total, creatorId]);
-    await pool.query(
-      `UPDATE stream_donations d
-       SET processed=true
-       FROM livestreams l
-       WHERE d.stream_id = l.id AND l.user_id=$1 AND d.processed=false`,
-      [creatorId]
-    );
-    res.json({ message: "Donations processed", total });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to process donations" });
-  }
-});
-
-app.post("/livestream/stop", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    await pool.query(
-      "UPDATE livestreams SET is_live=false, ended_at=NOW() WHERE user_id=$1 AND is_live=true",
-      [userId]
-    );
-    res.json({ message: "Livestream stopped" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to stop livestream" });
-  }
-});
-
-app.get("/livestreams", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      "SELECT l.*, u.username, u.profile_url FROM livestreams l JOIN users u ON l.user_id=u.id WHERE l.is_live=true"
-    );
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch livestreams" });
-  }
-});
-
-// --- Upload metadata ---
-
-app.post("/upload/video", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { title, description, video_url, thumbnail_url, tags = [] } = req.body;
-    if (!title || !video_url) return res.status(400).json({ error: "Missing fields" });
-    const r = await pool.query(
-      `INSERT INTO videos (user_id, title, description, video_url, thumbnail_url, tags, views, likes, earnings, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,0,0,0,NOW()) RETURNING *`,
-      [userId, title, description || null, video_url, thumbnail_url || null, tags]
-    );
-    await ensureCreatorStats(userId);
-    res.json({ message: "Video metadata saved", video: r.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Upload failed" });
-  }
-});
-
-app.post("/upload/music", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { title, description, music_url, cover_url, duration, tags = [] } = req.body;
-    if (!title || !music_url) return res.status(400).json({ error: "Missing fields" });
-    const r = await pool.query(
-      `INSERT INTO music (user_id, title, description, music_url, cover_url, duration, listens, likes, earnings, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,0,0,0,NOW()) RETURNING *`,
-      [userId, title, description || null, music_url, cover_url || null, duration || null]
-    );
-    await ensureCreatorStats(userId);
-    res.json({ message: "Music metadata saved", music: r.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Upload failed" });
-  }
-});
-
-// --- Shop ---
-
-const SHOP_ITEMS = [
-  { id: 1, name: "Yellow Coin", category: "Coins", price: 100, bonus: 0, svg: "<svg ...yellow coin svg...></svg>" },
-  { id: 2, name: "Dog Paw", category: "Gifts", price: 50, bonus: 0, svg: "<svg ...paw svg...></svg>" },
-  { id: 3, name: "Rocket", category: "Gifts", price: 150, bonus: 0, svg: "<svg ...rocket svg...></svg>" },
-  { id: 4, name: "Blue Coin", category: "Coins", price: 500, bonus: 50, svg: "<svg ...blue coin svg...></svg>" }
-];
-
-app.get("/shop/items", async (req, res) => {
-  const sections = {};
-  SHOP_ITEMS.forEach(item => {
-    if (!sections[item.category]) sections[item.category] = [];
-    sections[item.category].push(item);
-  });
-  const result = Object.keys(sections).map(cat => ({ category: cat, items: sections[cat] }));
-  res.json(result);
-});
-
-app.post("/shop/buy", authMiddleware, async (req, res) => {
-  try {
-    const { itemId } = req.body;
-    const userId = req.user.id;
-    const item = SHOP_ITEMS.find(i => i.id === itemId);
-    if (!item) return res.status(400).json({ error: "Item not found" });
-    const { rows } = await pool.query("SELECT coins FROM wallets WHERE user_id=$1", [userId]);
-    const balance = rows[0]?.coins || 0;
-    if (balance < item.price) return res.status(400).json({ error: "Insufficient coins" });
-    await pool.query("UPDATE wallets SET coins = coins - $1, last_updated = NOW() WHERE user_id=$2", [item.price, userId]);
-    await pool.query("INSERT INTO coin_transactions (user_id, amount, type, description) VALUES ($1,$2,'spend', $3)", [userId, -item.price, `Bought ${item.name}`]);
-    res.json({ message: `Successfully bought ${item.name}`, item });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Purchase failed" });
-  }
-});
-
-// --- Profile update ---
-
-app.post("/profile/update", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { profile_url, cover_url, bio, social_links } = req.body;
-    const r = await pool.query(
-      `UPDATE users SET profile_url=COALESCE($1,profile_url), cover_url=COALESCE($2,cover_url),
-       bio=COALESCE($3,bio), social_links=COALESCE($4,social_links), updated_at=NOW()
-       WHERE id=$5 RETURNING *`,
       [profile_url || null, cover_url || null, bio || null, social_links ? JSON.stringify(social_links) : null, userId]
     );
-    res.json({ message: "Profile updated", user: r.rows[0] });
+    
+    // Update user preferences if provided
+    if (preferences) {
+      await pool.query(
+        `UPDATE user_preferences SET 
+           auto_play = COALESCE($1, auto_play),
+           quality_preference = COALESCE($2, quality_preference),
+           language = COALESCE($3, language),
+           theme = COALESCE($4, theme),
+           notifications = COALESCE($5, notifications),
+           privacy = COALESCE($6, privacy),
+           recommendations = COALESCE($7, recommendations),
+           updated_at = NOW()
+         WHERE user_id = $8`,
+        [
+          preferences.auto_play,
+          preferences.quality_preference,
+          preferences.language,
+          preferences.theme,
+          preferences.notifications ? JSON.stringify(preferences.notifications) : null,
+          preferences.privacy ? JSON.stringify(preferences.privacy) : null,
+          preferences.recommendations ? JSON.stringify(preferences.recommendations) : null,
+          userId
+        ]
+      );
+    }
+    
+    res.json({ message: "Profile updated", user: rows[0] });
   } catch (err) {
-    console.error(err);
+    console.error("Profile update error:", err);
     res.status(500).json({ error: "Profile update failed" });
   }
 });
 
-// --- Admin helper: get creator stats ---
-app.get("/admin/creator-stats/:userId", async (req, res) => {
+// --- Video Endpoints ---
+
+// Upload video
+app.post("/api/videos/upload", authMiddleware, upload.single("video"), async (req, res) => {
   try {
-    const { userId } = req.params;
-    const { rows } = await pool.query("SELECT * FROM creator_stats WHERE user_id=$1", [userId]);
-    if (!rows[0]) return res.status(404).json({ error: "Not found" });
-    res.json({ stats: rows[0] });
+    if (!req.file) return res.status(400).json({ error: "No video file provided" });
+    
+    const userId = req.user.id;
+    const { title, description, tags, category, isShort = false, isPublic = true } = req.body;
+    
+    if (!title) return res.status(400).json({ error: "Title is required" });
+    
+    // Upload video to S3
+    const videoKey = `videos/${userId}/${Date.now()}-${req.file.originalname}`;
+    const videoUrl = await contentProcessor.uploadToS3(req.file.path, videoKey);
+    
+    // Create video record
+    const { rows } = await pool.query(
+      `INSERT INTO videos 
+       (user_id, title, description, video_url, tags, category, is_short, is_public, processing_status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW())
+       RETURNING *`,
+      [
+        userId,
+        title,
+        description || null,
+        videoUrl,
+        tags ? JSON.stringify(tags) : null,
+        category || null,
+        isShort,
+        isPublic
+      ]
+    );
+    
+    const video = rows[0];
+    
+    // Start processing video in background
+    contentProcessor.processVideo(video.id)
+      .then(result => {
+        console.log(`Video ${video.id} processed successfully:`, result);
+      })
+      .catch(error => {
+        console.error(`Error processing video ${video.id}:`, error);
+      });
+    
+    // Update creator stats
+    await ensureCreatorStats(userId);
+    
+    res.json({ message: "Video uploaded successfully", video });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed" });
+    console.error("Video upload error:", err);
+    res.status(500).json({ error: "Video upload failed" });
   }
 });
 
-// --- Agora Group Call Token ---
-
-app.post("/group-call/token", authMiddleware, (req, res) => {
+// Get video by ID
+app.get("/api/videos/:id", async (req, res) => {
   try {
-    const { group_id } = req.body;
-    if (!group_id) return res.status(400).json({ error: "Missing group_id" });
+    const { id } = req.params;
+    
+    // Increment view count
+    await pool.query(
+      "UPDATE videos SET views = views + 1 WHERE id = $1",
+      [id]
+    );
+    
+    // Get video details
+    const { rows } = await pool.query(
+      `SELECT v.*, u.username, u.profile_url 
+       FROM videos v 
+       JOIN users u ON v.user_id = u.id 
+       WHERE v.id = $1 AND v.is_public = true`,
+      [id]
+    );
+    
+    if (rows.length === 0) return res.status(404).json({ error: "Video not found" });
+    
+    const video = rows[0];
+    
+    // Record view history if user is authenticated
+    if (req.headers.authorization) {
+      try {
+        const token = req.headers.authorization.split(" ")[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        
+        await pool.query(
+          `INSERT INTO watch_history (user_id, content_type, content_id, created_at)
+           VALUES ($1, 'video', $2, NOW())
+           ON CONFLICT (user_id, content_type, content_id) 
+           DO UPDATE SET created_at = NOW()`,
+          [decoded.id, id]
+        );
+      } catch (err) {
+        // Invalid token, ignore
+      }
+    }
+    
+    res.json({ video });
+  } catch (err) {
+    console.error("Get video error:", err);
+    res.status(500).json({ error: "Failed to get video" });
+  }
+});
+
+// Get videos for a user
+app.get("/api/users/:userId/videos", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { limit = 20, offset = 0 } = req.query;
+    
+    const { rows } = await pool.query(
+      `SELECT v.*, u.username, u.profile_url 
+       FROM videos v 
+       JOIN users u ON v.user_id = u.id 
+       WHERE v.user_id = $1 AND v.is_public = true AND v.processing_status = 'completed'
+       ORDER BY v.created_at DESC 
+       LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
+    );
+    
+    res.json({ videos: rows });
+  } catch (err) {
+    console.error("Get user videos error:", err);
+    res.status(500).json({ error: "Failed to get user videos" });
+  }
+});
+
+// Get recommended videos (For You Page)
+app.get("/api/videos/recommended", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { limit = 20 } = req.query;
+    
+    const recommendations = await recommendationEngine.generateRecommendations(userId, 'video', limit);
+    
+    res.json({ videos: recommendations });
+  } catch (err) {
+    console.error("Get recommended videos error:", err);
+    res.status(500).json({ error: "Failed to get recommended videos" });
+  }
+});
+
+// Get trending videos
+app.get("/api/videos/trending", async (req, res) => {
+  try {
+    const { limit = 20, period = 'day' } = req.query;
+    
+    const { rows } = await pool.query(
+      `SELECT v.*, u.username, u.profile_url 
+       FROM videos v 
+       JOIN users u ON v.user_id = u.id 
+       JOIN trending t ON v.id = t.content_id 
+       WHERE t.content_type = 'video' AND t.period = $1 AND v.is_public = true AND v.processing_status = 'completed'
+       ORDER BY t.score DESC 
+       LIMIT $2`,
+      [period, limit]
+    );
+    
+    res.json({ videos: rows });
+  } catch (err) {
+    console.error("Get trending videos error:", err);
+    res.status(500).json({ error: "Failed to get trending videos" });
+  }
+});
+
+// Like/unlike video
+app.post("/api/videos/:id/like", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { action } = req.body; // 'like' or 'unlike'
+    
+    // Check if video exists
+    const { rows: videoRows } = await pool.query(
+      "SELECT * FROM videos WHERE id = $1",
+      [id]
+    );
+    
+    if (videoRows.length === 0) return res.status(404).json({ error: "Video not found" });
+    
+    const video = videoRows[0];
+    
+    // Check if user already liked this video
+    const { rows: likeRows } = await pool.query(
+      "SELECT * FROM likes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+      [userId, id]
+    );
+    
+    const alreadyLiked = likeRows.length > 0;
+    
+    if (action === 'like' && !alreadyLiked) {
+      // Add like
+      await pool.query(
+        "INSERT INTO likes (user_id, content_type, content_id, created_at) VALUES ($1, 'video', $2, NOW())",
+        [userId, id]
+      );
+      
+      // Update video likes count
+      await pool.query(
+        "UPDATE videos SET likes = likes + 1 WHERE id = $1",
+        [id]
+      );
+      
+      // Update creator stats
+      await pool.query(
+        `UPDATE creator_stats 
+         SET total_likes = total_likes + 1, updated_at = NOW() 
+         WHERE user_id = $1`,
+        [video.user_id]
+      );
+      
+      // Create notification
+      if (video.user_id !== userId) {
+        await pool.query(
+          `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
+           VALUES ($1, $2, 'like', 'New Like', '$3 liked your video', $4, NOW())`,
+          [
+            video.user_id,
+            userId,
+            req.user.username,
+            JSON.stringify({ contentId: id, contentType: 'video' })
+          ]
+        );
+      }
+    } else if (action === 'unlike' && alreadyLiked) {
+      // Remove like
+      await pool.query(
+        "DELETE FROM likes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+        [userId, id]
+      );
+      
+      // Update video likes count
+      await pool.query(
+        "UPDATE videos SET likes = GREATEST(likes - 1, 0) WHERE id = $1",
+        [id]
+      );
+      
+      // Update creator stats
+      await pool.query(
+        `UPDATE creator_stats 
+         SET total_likes = GREATEST(total_likes - 1, 0), updated_at = NOW() 
+         WHERE user_id = $1`,
+        [video.user_id]
+      );
+    }
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Like video error:", err);
+    res.status(500).json({ error: "Failed to like video" });
+  }
+});
+
+// Add comment to video
+app.post("/api/videos/:id/comments", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { content, parentId } = req.body;
+    
+    if (!content) return res.status(400).json({ error: "Comment content is required" });
+    
+    // Check if video exists
+    const { rows: videoRows } = await pool.query(
+      "SELECT * FROM videos WHERE id = $1",
+      [id]
+    );
+    
+    if (videoRows.length === 0) return res.status(404).json({ error: "Video not found" });
+    
+    const video = videoRows[0];
+    
+    // If this is a reply, check if parent comment exists
+    if (parentId) {
+      const { rows: parentRows } = await pool.query(
+        "SELECT * FROM comments WHERE id = $1 AND content_type = 'video' AND content_id = $2",
+        [parentId, id]
+      );
+      
+      if (parentRows.length === 0) return res.status(404).json({ error: "Parent comment not found" });
+    }
+    
+    // Add comment
+    const { rows } = await pool.query(
+      `INSERT INTO comments (user_id, content_type, content_id, parent_id, content, created_at)
+       VALUES ($1, 'video', $2, $3, $4, NOW())
+       RETURNING *`,
+      [userId, id, parentId || null, content]
+    );
+    
+    const comment = rows[0];
+    
+    // Update video comments count
+    await pool.query(
+      "UPDATE videos SET comments_count = comments_count + 1 WHERE id = $1",
+      [id]
+    );
+    
+    // If this is a reply, update parent comment's replies count
+    if (parentId) {
+      await pool.query(
+        "UPDATE comments SET replies_count = replies_count + 1 WHERE id = $1",
+        [parentId]
+      );
+    }
+    
+    // Create notification for video owner if not commenting on own video
+    if (video.user_id !== userId) {
+      await pool.query(
+        `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
+         VALUES ($1, $2, 'comment', 'New Comment', '$3 commented on your video', $4, NOW())`,
+        [
+          video.user_id,
+          userId,
+          req.user.username,
+          JSON.stringify({ contentId: id, contentType: 'video', commentId: comment.id })
+        ]
+      );
+    }
+    
+    // If this is a reply, create notification for parent comment author if not replying to own comment
+    if (parentId) {
+      const { rows: parentRows } = await pool.query(
+        "SELECT user_id FROM comments WHERE id = $1",
+        [parentId]
+      );
+      
+      if (parentRows.length > 0 && parentRows[0].user_id !== userId) {
+        await pool.query(
+          `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
+           VALUES ($1, $2, 'reply', 'New Reply', '$3 replied to your comment', $4, NOW())`,
+          [
+            parentRows[0].user_id,
+            userId,
+            req.user.username,
+            JSON.stringify({ contentId: id, contentType: 'video', commentId: comment.id, parentId })
+          ]
+        );
+      }
+    }
+    
+    res.json({ comment });
+  } catch (err) {
+    console.error("Add comment error:", err);
+    res.status(500).json({ error: "Failed to add comment" });
+  }
+});
+
+// Get comments for video
+app.get("/api/videos/:id/comments", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { limit = 20, offset = 0 } = req.query;
+    
+    // Get top-level comments
+    const { rows } = await pool.query(
+      `SELECT c.*, u.username, u.profile_url 
+       FROM comments c 
+       JOIN users u ON c.user_id = u.id 
+       WHERE c.content_type = 'video' AND c.content_id = $1 AND c.parent_id IS NULL AND c.is_deleted = false
+       ORDER BY c.created_at DESC 
+       LIMIT $2 OFFSET $3`,
+      [id, limit, offset]
+    );
+    
+    // Get replies for each comment
+    for (const comment of rows) {
+      const { rows: replies } = await pool.query(
+        `SELECT c.*, u.username, u.profile_url 
+         FROM comments c 
+         JOIN users u ON c.user_id = u.id 
+         WHERE c.parent_id = $1 AND c.is_deleted = false
+         ORDER BY c.created_at ASC 
+         LIMIT 5`,
+        [comment.id]
+      );
+      
+      comment.replies = replies;
+    }
+    
+    res.json({ comments: rows });
+  } catch (err) {
+    console.error("Get comments error:", err);
+    res.status(500).json({ error: "Failed to get comments" });
+  }
+});
+
+// --- Music Endpoints ---
+
+// Upload music
+app.post("/api/music/upload", authMiddleware, upload.fields([
+  { name: 'audio', maxCount: 1 },
+  { name: 'cover', maxCount: 1 }
+]), async (req, res) => {
+  try {
+    if (!req.files.audio || !req.files.audio[0]) return res.status(400).json({ error: "No audio file provided" });
+    
+    const userId = req.user.id;
+    const { title, artist, album, genre, lyrics, explicit = false } = req.body;
+    
+    if (!title || !artist) return res.status(400).json({ error: "Title and artist are required" });
+    
+    // Upload audio to S3
+    const audioKey = `music/${userId}/${Date.now()}-${req.files.audio[0].originalname}`;
+    const audioUrl = await contentProcessor.uploadToS3(req.files.audio[0].path, audioKey);
+    
+    // Upload cover to S3 if provided
+    let coverUrl = null;
+    if (req.files.cover && req.files.cover[0]) {
+      const coverKey = `covers/${userId}/${Date.now()}-${req.files.cover[0].originalname}`;
+      coverUrl = await contentProcessor.uploadToS3(req.files.cover[0].path, coverKey);
+    }
+    
+    // Create music record
+    const { rows } = await pool.query(
+      `INSERT INTO music 
+       (user_id, title, artist, album, genre, music_url, cover_url, lyrics, explicit, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+       RETURNING *`,
+      [
+        userId,
+        title,
+        artist,
+        album || null,
+        genre || null,
+        audioUrl,
+        coverUrl,
+        lyrics || null,
+        explicit
+      ]
+    );
+    
+    const music = rows[0];
+    
+    // Start processing music in background
+    contentProcessor.processMusic(music.id)
+      .then(result => {
+        console.log(`Music ${music.id} processed successfully:`, result);
+      })
+      .catch(error => {
+        console.error(`Error processing music ${music.id}:`, error);
+      });
+    
+    // Update creator stats
+    await ensureCreatorStats(userId);
+    
+    res.json({ message: "Music uploaded successfully", music });
+  } catch (err) {
+    console.error("Music upload error:", err);
+    res.status(500).json({ error: "Music upload failed" });
+  }
+});
+
+// Get music by ID
+app.get("/api/music/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Increment listen count
+    await pool.query(
+      "UPDATE music SET listens = listens + 1 WHERE id = $1",
+      [id]
+    );
+    
+    // Get music details
+    const { rows } = await pool.query(
+      `SELECT m.*, u.username, u.profile_url 
+       FROM music m 
+       JOIN users u ON m.user_id = u.id 
+       WHERE m.id = $1`,
+      [id]
+    );
+    
+    if (rows.length === 0) return res.status(404).json({ error: "Music not found" });
+    
+    const music = rows[0];
+    
+    // Record listen history if user is authenticated
+    if (req.headers.authorization) {
+      try {
+        const token = req.headers.authorization.split(" ")[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        
+        await pool.query(
+          `INSERT INTO watch_history (user_id, content_type, content_id, created_at)
+           VALUES ($1, 'music', $2, NOW())
+           ON CONFLICT (user_id, content_type, content_id) 
+           DO UPDATE SET created_at = NOW()`,
+          [decoded.id, id]
+        );
+      } catch (err) {
+        // Invalid token, ignore
+      }
+    }
+    
+    res.json({ music });
+  } catch (err) {
+    console.error("Get music error:", err);
+    res.status(500).json({ error: "Failed to get music" });
+  }
+});
+
+// Get recommended music
+app.get("/api/music/recommended", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { limit = 20 } = req.query;
+    
+    const recommendations = await recommendationEngine.generateRecommendations(userId, 'music', limit);
+    
+    res.json({ music: recommendations });
+  } catch (err) {
+    console.error("Get recommended music error:", err);
+    res.status(500).json({ error: "Failed to get recommended music" });
+  }
+});
+
+// Get trending music
+app.get("/api/music/trending", async (req, res) => {
+  try {
+    const { limit = 20, period = 'day' } = req.query;
+    
+    const { rows } = await pool.query(
+      `SELECT m.*, u.username, u.profile_url 
+       FROM music m 
+       JOIN users u ON m.user_id = u.id 
+       JOIN trending t ON m.id = t.content_id 
+       WHERE t.content_type = 'music' AND t.period = $1
+       ORDER BY t.score DESC 
+       LIMIT $2`,
+      [period, limit]
+    );
+    
+    res.json({ music: rows });
+  } catch (err) {
+    console.error("Get trending music error:", err);
+    res.status(500).json({ error: "Failed to get trending music" });
+  }
+});
+
+// --- Playlist Endpoints ---
+
+// Create playlist
+app.post("/api/playlists", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { name, description, isPublic = true, tracks } = req.body;
+    
+    if (!name) return res.status(400).json({ error: "Playlist name is required" });
+    
+    const { rows } = await pool.query(
+      `INSERT INTO playlists (user_id, name, description, is_public, tracks, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING *`,
+      [userId, name, description || null, isPublic, tracks ? JSON.stringify(tracks) : JSON.stringify([])]
+    );
+    
+    const playlist = rows[0];
+    
+    res.json({ message: "Playlist created successfully", playlist });
+  } catch (err) {
+    console.error("Create playlist error:", err);
+    res.status(500).json({ error: "Failed to create playlist" });
+  }
+});
+
+// Get playlist by ID
+app.get("/api/playlists/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Increment play count
+    await pool.query(
+      "UPDATE playlists SET plays = plays + 1 WHERE id = $1",
+      [id]
+    );
+    
+    // Get playlist details
+    const { rows } = await pool.query(
+      `SELECT p.*, u.username, u.profile_url 
+       FROM playlists p 
+       JOIN users u ON p.user_id = u.id 
+       WHERE p.id = $1 AND (p.is_public = true OR p.user_id = $2)`,
+      [id, req.user?.id || 0]
+    );
+    
+    if (rows.length === 0) return res.status(404).json({ error: "Playlist not found" });
+    
+    const playlist = rows[0];
+    
+    // Get tracks for playlist
+    if (playlist.tracks && playlist.tracks.length > 0) {
+      const { rows: tracks } = await pool.query(
+        `SELECT m.*, u.username, u.profile_url 
+         FROM music m 
+         JOIN users u ON m.user_id = u.id 
+         WHERE m.id = ANY($1)`,
+        [playlist.tracks]
+      );
+      
+      playlist.trackDetails = tracks;
+    } else {
+      playlist.trackDetails = [];
+    }
+    
+    res.json({ playlist });
+  } catch (err) {
+    console.error("Get playlist error:", err);
+    res.status(500).json({ error: "Failed to get playlist" });
+  }
+});
+
+// Add track to playlist
+app.post("/api/playlists/:id/tracks", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { trackId } = req.body;
+    
+    if (!trackId) return res.status(400).json({ error: "Track ID is required" });
+    
+    // Check if playlist exists and belongs to user
+    const { rows: playlistRows } = await pool.query(
+      "SELECT * FROM playlists WHERE id = $1 AND user_id = $2",
+      [id, userId]
+    );
+    
+    if (playlistRows.length === 0) return res.status(404).json({ error: "Playlist not found" });
+    
+    const playlist = playlistRows[0];
+    const tracks = playlist.tracks ? JSON.parse(playlist.tracks) : [];
+    
+    // Check if track already exists in playlist
+    if (tracks.includes(trackId)) {
+      return res.status(400).json({ error: "Track already in playlist" });
+    }
+    
+    // Add track to playlist
+    tracks.push(trackId);
+    
+    // Update playlist
+    await pool.query(
+      "UPDATE playlists SET tracks = $1, updated_at = NOW() WHERE id = $2",
+      [JSON.stringify(tracks), id]
+    );
+    
+    res.json({ message: "Track added to playlist successfully" });
+  } catch (err) {
+    console.error("Add track to playlist error:", err);
+    res.status(500).json({ error: "Failed to add track to playlist" });
+  }
+});
+
+// --- Livestream Endpoints ---
+
+// Start livestream
+app.post("/api/livestreams/start", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { title, description, category, thumbnailUrl, isScheduled = false, scheduledStart } = req.body;
+    
+    if (!title) return res.status(400).json({ error: "Title is required" });
+    
+    // Generate stream key
+    const streamKey = uuidv4();
+    
+    // Create livestream record
+    const { rows } = await pool.query(
+      `INSERT INTO livestreams 
+       (user_id, title, description, category, thumbnail_url, stream_key, is_scheduled, scheduled_start, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       RETURNING *`,
+      [
+        userId,
+        title,
+        description || null,
+        category || null,
+        thumbnailUrl || null,
+        streamKey,
+        isScheduled,
+        isScheduled && scheduledStart ? new Date(scheduledStart) : null
+      ]
+    );
+    
+    const livestream = rows[0];
+    
+    // Generate Agora token
     const uid = Math.floor(Math.random() * 100000);
     const role = RtcRole.PUBLISHER;
     const expireTime = 3600;
@@ -2788,1098 +2770,2268 @@ app.post("/group-call/token", authMiddleware, (req, res) => {
     const token = RtcTokenBuilder.buildTokenWithUid(
       AGORA_APP_ID,
       AGORA_APP_CERTIFICATE,
-      group_id.toString(),
+      streamKey,
       uid,
       role,
       privilegeExpireTime
     );
-    res.json({
-      appId: AGORA_APP_ID,
-      channelName: group_id.toString(),
-      token,
-      uid,
-      expiresIn: expireTime,
+    
+    res.json({ 
+      message: "Livestream created successfully", 
+      livestream,
+      agoraToken: token,
+      agoraChannel: streamKey,
+      agoraUid: uid
     });
   } catch (err) {
-    console.error("Agora token error:", err);
-    res.status(500).json({ error: "Failed to create token" });
+    console.error("Start livestream error:", err);
+    res.status(500).json({ error: "Failed to start livestream" });
   }
 });
 
-// --- Socket.IO and WebRTC signaling setup ---
-
-const server = http.createServer(app);
-const io = new SocketServer(server, { cors: { origin: "*" } });
-const peerServer = ExpressPeerServer(server, { debug: true, path: "/peerjs" });
-app.use("/peerjs", peerServer);
-
-const activeCalls = {}; // { groupId: Set(userIds) }
-const liveRooms = {};   // { streamId: { viewers: Set(userIds) } }
-
-io.on("connection", (socket) => {
-  console.log("Socket connected:", socket.id);
-
-  // Group calls
-  socket.on("join-call", ({ groupId, userId, username }) => {
-    socket.join(groupId);
-    if (!activeCalls[groupId]) activeCalls[groupId] = new Set();
-    activeCalls[groupId].add(userId);
-    io.to(groupId).emit("call-update", {
-      groupId,
-      participants: Array.from(activeCalls[groupId]),
-      count: activeCalls[groupId].size,
-      joined: username,
-    });
-    console.log(`${username} joined Agora group call ${groupId}`);
-  });
-
-  socket.on("leave-call", ({ groupId, userId, username }) => {
-    if (activeCalls[groupId]) {
-      activeCalls[groupId].delete(userId);
-      io.to(groupId).emit("call-update", {
-        groupId,
-        participants: Array.from(activeCalls[groupId]),
-        count: activeCalls[groupId].size,
-        left: username,
-      });
-    }
-    socket.leave(groupId);
-  });
-
-  // Livestream rooms
-  socket.on("join-room", ({ streamId, userId, username }) => {
-    socket.join(streamId);
-    if (!liveRooms[streamId]) liveRooms[streamId] = { viewers: new Set() };
-    liveRooms[streamId].viewers.add(userId);
-    io.to(streamId).emit("viewer-update", { count: liveRooms[streamId].viewers.size });
-    console.log(`${username} joined livestream ${streamId}`);
-  });
-
-  socket.on("leave-room", ({ streamId, userId }) => {
-    if (liveRooms[streamId]) {
-      liveRooms[streamId].viewers.delete(userId);
-      io.to(streamId).emit("viewer-update", { count: liveRooms[streamId].viewers.size });
-    }
-    socket.leave(streamId);
-  });
-
-  // Live chat messages
-  socket.on("chat-message", ({ streamId, username, message }) => {
-    io.to(streamId).emit("chat-message", { username, message, time: Date.now() });
-  });
-
-  // Reactions, typing, seen
-  socket.on("reaction", ({ messageId, reaction, userId }) => {
-    io.emit("reaction", { messageId, reaction, userId });
-  });
-
-  socket.on("typing", ({ toUserId, isTyping }) => {
-    socket.to(`user-${toUserId}`).emit("typing", { from: socket.id, isTyping });
-  });
-
-  socket.on("seen", ({ messageId, userId }) => {
-    io.emit("seen", { messageId, userId });
-  });
-
-  // WebRTC signaling
-  socket.on("webrtc-offer", ({ targetSocketId, offer }) => {
-    io.to(targetSocketId).emit("webrtc-offer", { offer, from: socket.id });
-  });
-
-  socket.on("webrtc-answer", ({ targetSocketId, answer }) => {
-    io.to(targetSocketId).emit("webrtc-answer", { answer, from: socket.id });
-  });
-
-  socket.on("webrtc-ice-candidate", ({ targetSocketId, candidate }) => {
-    io.to(targetSocketId).emit("webrtc-ice-candidate", { candidate, from: socket.id });
-  });
-
-  socket.on("disconnect", () => {
-    console.log("Socket disconnected:", socket.id);
-    // Remove user from activeCalls
-    for (const [groupId, participants] of Object.entries(activeCalls)) {
-      participants.forEach(uid => {
-        if (uid === socket.id) participants.delete(uid);
-      });
-      io.to(groupId).emit("call-update", {
-        groupId,
-        participants: Array.from(participants),
-        count: participants.size,
-      });
-    }
-    // Remove user from liveRooms
-    for (const [streamId, room] of Object.entries(liveRooms)) {
-      room.viewers.forEach(uid => {
-        if (uid === socket.id) room.viewers.delete(uid);
-      });
-      io.to(streamId).emit("viewer-update", { count: room.viewers.size });
-    }
-  });
-});
-
-// --- Basic health check ---
-app.get("/", (req, res) => res.send("Server up"));
-
-// --- Product Management Endpoints ---
-
-// Get all products
-app.get("/api/products", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      "SELECT p.*, u.username as creator_name FROM products p JOIN users u ON p.user_id = u.id ORDER BY p.created_at DESC"
-    );
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch products" });
-  }
-});
-
-// Get product by ID
-app.get("/api/products/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { rows } = await pool.query(
-      "SELECT p.*, u.username as creator_name FROM products p JOIN users u ON p.user_id = u.id WHERE p.id = $1",
-      [id]
-    );
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Product not found" });
-    }
-    res.json(rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch product" });
-  }
-});
-
-// Create product (for creators and musicians)
-app.post("/api/products", authMiddleware, upload.array("images", 5), async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const {
-      name,
-      description,
-      price,
-      type, // 'physical' or 'digital'
-      crypto, // for digital products (ETH, BTC, etc.)
-      sizes, // for physical products
-      colors, // for physical products
-      stock, // for physical products
-      tags
-    } = req.body;
-    
-    if (!name || !description || !price || !type) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-    
-    // Upload images to S3 and get URLs
-    const imageUrls = [];
-    if (req.files && req.files.length > 0) {
-      for (const file of req.files) {
-        const ext = path.extname(file.originalname);
-        const fileKey = `products/${userId}/${uuidv4()}${ext}`;
-        
-        await s3.send(
-          new PutObjectCommand({
-            Bucket: process.env.S3_BUCKET_NAME,
-            Key: fileKey,
-            Body: file.buffer,
-            ContentType: file.mimetype,
-            ACL: "public-read",
-          })
-        );
-        
-        const imageUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileKey}`;
-        imageUrls.push(imageUrl);
-      }
-    }
-    
-    // Insert product into database
-    const { rows } = await pool.query(
-      `INSERT INTO products 
-       (user_id, name, description, price, type, crypto, sizes, colors, stock, images, tags, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-       RETURNING *`,
-      [
-        userId,
-        name,
-        description,
-        price,
-        type,
-        crypto || null,
-        sizes ? JSON.stringify(sizes) : null,
-        colors ? JSON.stringify(colors) : null,
-        stock || null,
-        JSON.stringify(imageUrls),
-        tags ? JSON.stringify(tags) : null
-      ]
-    );
-    
-    await ensureCreatorStats(userId);
-    res.json({ message: "Product created successfully", product: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to create product" });
-  }
-});
-
-// Update product
-app.put("/api/products/:id", authMiddleware, upload.array("images", 5), async (req, res) => {
+// Go live (start streaming)
+app.post("/api/livestreams/:id/go-live", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
     const { id } = req.params;
-    const {
-      name,
-      description,
-      price,
-      type,
-      crypto,
-      sizes,
-      colors,
-      stock,
-      tags
-    } = req.body;
     
-    // Check if product exists and belongs to user
-    const { rows: productRows } = await pool.query(
-      "SELECT * FROM products WHERE id = $1 AND user_id = $2",
+    // Check if livestream exists and belongs to user
+    const { rows: streamRows } = await pool.query(
+      "SELECT * FROM livestreams WHERE id = $1 AND user_id = $2",
       [id, userId]
     );
     
-    if (productRows.length === 0) {
-      return res.status(404).json({ error: "Product not found or you don't have permission" });
-    }
+    if (streamRows.length === 0) return res.status(404).json({ error: "Livestream not found" });
     
-    // Handle image updates
-    let imageUrls = JSON.parse(productRows[0].images || "[]");
+    const livestream = streamRows[0];
     
-    if (req.files && req.files.length > 0) {
-      // Upload new images
-      for (const file of req.files) {
-        const ext = path.extname(file.originalname);
-        const fileKey = `products/${userId}/${uuidv4()}${ext}`;
-        
-        await s3.send(
-          new PutObjectCommand({
-            Bucket: process.env.S3_BUCKET_NAME,
-            Key: fileKey,
-            Body: file.buffer,
-            ContentType: file.mimetype,
-            ACL: "public-read",
-          })
-        );
-        
-        const imageUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileKey}`;
-        imageUrls.push(imageUrl);
-      }
-    }
+    if (livestream.is_live) return res.status(400).json({ error: "Stream is already live" });
     
-    // Update product in database
-    const { rows } = await pool.query(
-      `UPDATE products 
-       SET name = COALESCE($1, name),
-           description = COALESCE($2, description),
-           price = COALESCE($3, price),
-           type = COALESCE($4, type),
-           crypto = COALESCE($5, crypto),
-           sizes = COALESCE($6, sizes),
-           colors = COALESCE($7, colors),
-           stock = COALESCE($8, stock),
-           images = COALESCE($9, images),
-           tags = COALESCE($10, tags),
-           updated_at = NOW()
-       WHERE id = $11 AND user_id = $12
-       RETURNING *`,
-      [
-        name,
-        description,
-        price,
-        type,
-        crypto || null,
-        sizes ? JSON.stringify(sizes) : null,
-        colors ? JSON.stringify(colors) : null,
-        stock || null,
-        JSON.stringify(imageUrls),
-        tags ? JSON.stringify(tags) : null,
-        id,
-        userId
-      ]
-    );
-    
-    res.json({ message: "Product updated successfully", product: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to update product" });
-  }
-});
-
-// Delete product
-app.delete("/api/products/:id", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { id } = req.params;
-    
-    // Check if product exists and belongs to user
-    const { rows } = await pool.query(
-      "SELECT * FROM products WHERE id = $1 AND user_id = $2",
-      [id, userId]
-    );
-    
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Product not found or you don't have permission" });
-    }
-    
-    // Delete product
-    await pool.query("DELETE FROM products WHERE id = $1 AND user_id = $2", [id, userId]);
-    
-    res.json({ message: "Product deleted successfully" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to delete product" });
-  }
-});
-
-// Get products by user
-app.get("/api/users/:userId/products", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { rows } = await pool.query(
-      "SELECT * FROM products WHERE user_id = $1 ORDER BY created_at DESC",
-      [userId]
-    );
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch user products" });
-  }
-});
-
-// Order endpoints
-app.post("/api/orders", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { items, paymentMethod, shippingAddress } = req.body;
-    
-    if (!items || items.length === 0) {
-      return res.status(400).json({ error: "No items in order" });
-    }
-    
-    let total = 0;
-    const orderItems = [];
-    
-    // Calculate total and validate items
-    for (const item of items) {
-      const { rows: productRows } = await pool.query(
-        "SELECT * FROM products WHERE id = $1",
-        [item.productId]
-      );
-      
-      if (productRows.length === 0) {
-        return res.status(404).json({ error: `Product ${item.productId} not found` });
-      }
-      
-      const product = productRows[0];
-      const itemTotal = product.price * item.quantity;
-      total += itemTotal;
-      
-      orderItems.push({
-        product_id: item.productId,
-        quantity: item.quantity,
-        price: product.price
-      });
-      
-      // Update stock for physical products
-      if (product.type === 'physical' && product.stock) {
-        await pool.query(
-          "UPDATE products SET stock = stock - $1 WHERE id = $2",
-          [item.quantity, item.productId]
-        );
-      }
-    }
-    
-    // Create order
-    const { rows } = await pool.query(
-      `INSERT INTO orders 
-       (user_id, items, total, payment_method, shipping_address, status, created_at)
-       VALUES ($1, $2, $3, $4, $5, 'processing', NOW())
-       RETURNING *`,
-      [
-        userId,
-        JSON.stringify(orderItems),
-        total,
-        paymentMethod,
-        JSON.stringify(shippingAddress)
-      ]
-    );
-    
-    // Update creator stats for physical products
-    for (const item of items) {
-      const { rows: productRows } = await pool.query(
-        "SELECT * FROM products WHERE id = $1",
-        [item.productId]
-      );
-      
-      if (productRows.length > 0 && productRows[0].type === 'physical') {
-        const product = productRows[0];
-        const itemTotal = product.price * item.quantity;
-        
-        await pool.query(
-          `UPDATE creator_stats 
-           SET total_stripe_sales = COALESCE(total_stripe_sales, 0) + $1,
-               earnings = COALESCE(earnings, 0) + $1,
-               updated_at = NOW()
-           WHERE user_id = $2`,
-          [itemTotal, product.user_id]
-        );
-      } else if (productRows.length > 0 && productRows[0].type === 'digital') {
-        const product = productRows[0];
-        const itemTotal = product.price * item.quantity;
-        
-        await pool.query(
-          `UPDATE creator_stats 
-           SET total_crypto_sales = COALESCE(total_crypto_sales, 0) + $1,
-               earnings = COALESCE(earnings, 0) + $1,
-               updated_at = NOW()
-           WHERE user_id = $2`,
-          [itemTotal, product.user_id]
-        );
-      }
-    }
-    
-    res.json({ message: "Order created successfully", order: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to create order" });
-  }
-});
-
-// Get user orders
-app.get("/api/orders", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { rows } = await pool.query(
-      "SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC",
-      [userId]
-    );
-    
-    // Parse items JSON for each order
-    const ordersWithItems = rows.map(order => ({
-      ...order,
-      items: JSON.parse(order.items || "[]"),
-      shipping_address: JSON.parse(order.shipping_address || "{}")
-    }));
-    
-    res.json(ordersWithItems);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch orders" });
-  }
-});
-
-// Update order status
-app.put("/api/orders/:id/status", authMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status } = req.body;
-    
-    // Check if order exists
-    const { rows: orderRows } = await pool.query(
-      "SELECT * FROM orders WHERE id = $1",
+    // Update livestream status
+    await pool.query(
+      "UPDATE livestreams SET is_live = true, started_at = NOW(), updated_at = NOW() WHERE id = $1",
       [id]
     );
     
-    if (orderRows.length === 0) {
-      return res.status(404).json({ error: "Order not found" });
-    }
-    
-    // Update order status
-    const { rows } = await pool.query(
-      "UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
-      [status, id]
+    // Notify followers
+    const { rows: followers } = await pool.query(
+      `SELECT follower_id FROM follows WHERE following_id = $1`,
+      [userId]
     );
     
-    res.json({ message: "Order status updated", order: rows[0] });
+    for (const follower of followers) {
+      await pool.query(
+        `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
+         VALUES ($1, $2, 'livestream', 'Stream Started', '$3 is now live!', $4, NOW())`,
+        [
+          follower.follower_id,
+          userId,
+          req.user.username,
+          JSON.stringify({ streamId: id })
+        ]
+      );
+    }
+    
+    // Emit to Socket.io
+    io.emit('stream_started', { streamId: id, streamer: req.user.username });
+    
+    res.json({ message: "Stream is now live" });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to update order status" });
+    console.error("Go live error:", err);
+    res.status(500).json({ error: "Failed to go live" });
   }
 });
 
-// Cancel order
-app.post("/api/orders/:id/cancel", authMiddleware, async (req, res) => {
+// End livestream
+app.post("/api/livestreams/:id/end", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
     const { id } = req.params;
-    const { reason } = req.body;
     
-    // Check if order exists and belongs to user
-    const { rows: orderRows } = await pool.query(
-      "SELECT * FROM orders WHERE id = $1 AND user_id = $2",
+    // Check if livestream exists and belongs to user
+    const { rows: streamRows } = await pool.query(
+      "SELECT * FROM livestreams WHERE id = $1 AND user_id = $2",
       [id, userId]
     );
     
-    if (orderRows.length === 0) {
-      return res.status(404).json({ error: "Order not found" });
-    }
+    if (streamRows.length === 0) return res.status(404).json({ error: "Livestream not found" });
     
-    const order = orderRows[0];
+    const livestream = streamRows[0];
     
-    // Check if order can be cancelled (only processing orders)
-    if (order.status !== 'processing') {
-      return res.status(400).json({ error: "Order cannot be cancelled" });
-    }
+    if (!livestream.is_live) return res.status(400).json({ error: "Stream is not live" });
     
-    // Update order status
-    const { rows } = await pool.query(
-      `UPDATE orders 
-       SET status = 'cancelled', 
-           cancel_reason = $1, 
-           refund_date = NOW(),
-           updated_at = NOW() 
-       WHERE id = $2 RETURNING *`,
-      [reason, id]
-    );
+    // Calculate duration
+    const now = new Date();
+    const startedAt = new Date(livestream.started_at);
+    const duration = Math.floor((now - startedAt) / 1000); // in seconds
     
-    // Restore stock for physical products
-    const items = JSON.parse(order.items || "[]");
-    for (const item of items) {
-      const { rows: productRows } = await pool.query(
-        "SELECT * FROM products WHERE id = $1",
-        [item.product_id]
-      );
-      
-      if (productRows.length > 0 && productRows[0].type === 'physical') {
-        await pool.query(
-          "UPDATE products SET stock = stock + $1 WHERE id = $2",
-          [item.quantity, item.product_id]
-        );
-      }
-    }
-    
-    res.json({ message: "Order cancelled successfully", order: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to cancel order" });
-  }
-});
-
-// --- Video Processing and Upload Endpoints for ProUploadStudioPage ---
-
-// Generate presigned URL for S3 upload
-app.post("/api/s3-upload-url", authMiddleware, async (req, res) => {
-  try {
-    const { filename, filetype } = req.body;
-    if (!filename || !filetype) {
-      return res.status(400).json({ error: "Filename and filetype are required" });
-    }
-
-    const fileKey = `uploads/${req.user.id}/${Date.now()}-${filename}`;
-    
-    const s3Params = {
-      Bucket: process.env.S3_BUCKET_NAME,
-      Key: fileKey,
-      Expires: 60, // URL expires in 60 seconds
-      ContentType: filetype
-    };
-
-    const uploadUrl = await s3.getSignedUrlPromise('putObject', s3Params);
-    const publicUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileKey}`;
-
-    // Record the file in the database
+    // Update livestream status
     await pool.query(
-      `INSERT INTO uploaded_files (user_id, filename, original_name, mime_type, s3_key, s3_url, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
-      [req.user.id, filename, filename, filetype, fileKey, publicUrl]
+      "UPDATE livestreams SET is_live = false, ended_at = NOW(), duration = $1, updated_at = NOW() WHERE id = $2",
+      [duration, id]
     );
-
-    res.json({ url: uploadUrl, publicUrl, fileKey });
-  } catch (err) {
-    console.error("Error generating S3 upload URL:", err);
-    res.status(500).json({ error: "Failed to generate upload URL" });
-  }
-});
-
-// Process and save video metadata
-app.post("/api/videos/save", authMiddleware, async (req, res) => {
-  try {
-    const {
-      title,
-      description,
-      videoUrl,
-      thumbnailUrl,
-      duration,
-      tags,
-      category,
-      isPublic = true
-    } = req.body;
-
-    if (!title || !videoUrl) {
-      return res.status(400).json({ error: "Title and video URL are required" });
-    }
-
-    const { rows } = await pool.query(
-      `INSERT INTO videos 
-       (user_id, title, description, video_url, thumbnail_url, duration, tags, category, is_public, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-       RETURNING *`,
-      [
-        req.user.id,
-        title,
-        description || null,
-        videoUrl,
-        thumbnailUrl || null,
-        duration || 0,
-        tags ? JSON.stringify(tags) : null,
-        category || null,
-        isPublic
-      ]
-    );
-
-    // Update creator stats
-    await ensureCreatorStats(req.user.id);
-    await pool.query(
-      `UPDATE creator_stats 
-       SET total_videos = COALESCE(total_videos, 0) + 1, updated_at = NOW()
-       WHERE user_id = $1`,
-      [req.user.id]
-    );
-
-    res.json({ message: "Video saved successfully", video: rows[0] });
-  } catch (err) {
-    console.error("Error saving video:", err);
-    res.status(500).json({ error: "Failed to save video" });
-  }
-});
-
-// --- AI-Powered Caption Generation with Whisper ---
-
-// Generate captions using Whisper API
-app.post("/api/whisper", authMiddleware, upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
-
-    // Check if OpenAI API key is available
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: "Whisper service not configured" });
-    }
-
-    // Create a FormData object to send to OpenAI
-    const formData = new FormData();
-    formData.append("file", req.file.buffer, req.file.originalname);
-    formData.append("model", "whisper-1");
-    formData.append("response_format", "verbose_json");
-
-    // Send to OpenAI Whisper API
-    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
-      },
-      body: formData
-    });
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Whisper API error: ${error}`);
-    }
-
-    const transcriptionData = await response.json();
     
-    // Process segments into caption format
-    const segments = transcriptionData.segments || [];
-    const captions = segments.map((segment, index) => ({
-      id: index + 1,
-      start: segment.start,
-      end: segment.end,
-      text: segment.text.trim()
-    }));
-
-    res.json({ segments: captions });
-  } catch (err) {
-    console.error("Error generating captions:", err);
-    res.status(500).json({ error: "Failed to generate captions" });
-  }
-});
-
-// --- Video Editing Endpoints ---
-
-// Apply video edits (trim, filters, etc.)
-app.post("/api/videos/edit", authMiddleware, async (req, res) => {
-  try {
-    const { videoId, edits } = req.body;
-    
-    if (!videoId || !edits) {
-      return res.status(400).json({ error: "Video ID and edits are required" });
-    }
-
-    // Get video details
-    const { rows: videoRows } = await pool.query(
-      "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
-      [videoId, req.user.id]
-    );
-
-    if (videoRows.length === 0) {
-      return res.status(404).json({ error: "Video not found" });
-    }
-
-    const video = videoRows[0];
-    
-    // Create a job for video processing
-    const { rows: jobRows } = await pool.query(
-      `INSERT INTO video_processing_jobs 
-       (user_id, video_id, job_type, parameters, status, created_at)
+    // Create VOD record
+    const { rows: vodRows } = await pool.query(
+      `INSERT INTO vods (stream_id, title, description, thumbnail_url, duration, created_at)
        VALUES ($1, $2, $3, $4, $5, NOW())
        RETURNING *`,
-      [
-        req.user.id,
-        videoId,
-        "edit",
-        JSON.stringify(edits),
-        "pending"
-      ]
+      [id, livestream.title, livestream.description, livestream.thumbnail_url, duration]
     );
+    
+    // Emit to Socket.io
+    io.emit('stream_ended', { streamId: id, vodId: vodRows[0].id });
+    
+    res.json({ message: "Stream ended successfully", vod: vodRows[0] });
+  } catch (err) {
+    console.error("End livestream error:", err);
+    res.status(500).json({ error: "Failed to end livestream" });
+  }
+});
 
-    // In a real implementation, you would add this job to a queue
-    // For now, we'll just return the job ID
+// Get active livestreams
+app.get("/api/livestreams/active", async (req, res) => {
+  try {
+    const { limit = 20, offset = 0, category } = req.query;
+    
+    let query = `
+      SELECT l.*, u.username, u.profile_url 
+      FROM livestreams l 
+      JOIN users u ON l.user_id = u.id 
+      WHERE l.is_live = true
+    `;
+    
+    const params = [];
+    
+    if (category) {
+      query += " AND l.category = $1";
+      params.push(category);
+    }
+    
+    query += " ORDER BY l.viewers DESC LIMIT $" + (params.length + 1) + " OFFSET $" + (params.length + 2);
+    params.push(limit, offset);
+    
+    const { rows } = await pool.query(query, params);
+    
+    res.json({ livestreams: rows });
+  } catch (err) {
+    console.error("Get active livestreams error:", err);
+    res.status(500).json({ error: "Failed to get active livestreams" });
+  }
+});
+
+// Get livestream by ID
+app.get("/api/livestreams/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get livestream details
+    const { rows } = await pool.query(
+      `SELECT l.*, u.username, u.profile_url 
+       FROM livestreams l 
+       JOIN users u ON l.user_id = u.id 
+       WHERE l.id = $1`,
+      [id]
+    );
+    
+    if (rows.length === 0) return res.status(404).json({ error: "Livestream not found" });
+    
+    const livestream = rows[0];
+    
+    // Generate Agora token for viewer
+    const uid = Math.floor(Math.random() * 100000);
+    const role = RtcRole.SUBSCRIBER;
+    const expireTime = 3600;
+    const currentTime = Math.floor(Date.now() / 1000);
+    const privilegeExpireTime = currentTime + expireTime;
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      AGORA_APP_ID,
+      AGORA_APP_CERTIFICATE,
+      livestream.stream_key,
+      uid,
+      role,
+      privilegeExpireTime
+    );
+    
     res.json({ 
-      message: "Video edit job created", 
-      jobId: jobRows[0].id,
-      status: "pending"
+      livestream,
+      agoraToken: token,
+      agoraChannel: livestream.stream_key,
+      agoraUid: uid
     });
   } catch (err) {
-    console.error("Error creating video edit job:", err);
-    res.status(500).json({ error: "Failed to create video edit job" });
+    console.error("Get livestream error:", err);
+    res.status(500).json({ error: "Failed to get livestream" });
   }
 });
 
-// Get video processing job status
-app.get("/api/videos/jobs/:jobId", authMiddleware, async (req, res) => {
+// --- Clip Endpoints ---
+
+// Create clip from VOD
+app.post("/api/vods/:id/clips", authMiddleware, async (req, res) => {
   try {
-    const { jobId } = req.params;
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { title, startTime, endTime } = req.body;
     
-    const { rows } = await pool.query(
-      "SELECT * FROM video_processing_jobs WHERE id = $1 AND user_id = $2",
-      [jobId, req.user.id]
+    if (!startTime || !endTime) return res.status(400).json({ error: "Start and end times are required" });
+    
+    // Check if VOD exists
+    const { rows: vodRows } = await pool.query(
+      "SELECT * FROM vods WHERE id = $1",
+      [id]
     );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Job not found" });
-    }
-
-    res.json(rows[0]);
+    
+    if (vodRows.length === 0) return res.status(404).json({ error: "VOD not found" });
+    
+    const vod = vodRows[0];
+    
+    // Check if clip duration is valid (max 60 seconds)
+    const duration = endTime - startTime;
+    if (duration <= 0 || duration > 60) return res.status(400).json({ error: "Clip duration must be between 1 and 60 seconds" });
+    
+    // Create clip record
+    const { rows } = await pool.query(
+      `INSERT INTO clips (stream_id, creator_id, title, duration, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       RETURNING *`,
+      [vod.stream_id, userId, title || `Clip from ${vod.title}`, duration]
+    );
+    
+    const clip = rows[0];
+    
+    // In a real implementation, you would use a video processing service to extract the clip
+    // For this example, we'll just create the record
+    
+    res.json({ message: "Clip created successfully", clip });
   } catch (err) {
-    console.error("Error fetching job status:", err);
-    res.status(500).json({ error: "Failed to fetch job status" });
+    console.error("Create clip error:", err);
+    res.status(500).json({ error: "Failed to create clip" });
   }
 });
 
-// --- Audio Track Management ---
-
-// Add audio track to video
-app.post("/api/videos/:videoId/audio-tracks", authMiddleware, upload.single("audio"), async (req, res) => {
+// Get clips for a stream
+app.get("/api/livestreams/:id/clips", async (req, res) => {
   try {
-    const { videoId } = req.params;
-    const { name, gain = 1, mute = false, solo = false } = req.body;
+    const { id } = req.params;
+    const { limit = 20, offset = 0 } = req.query;
     
-    if (!req.file) {
-      return res.status(400).json({ error: "No audio file uploaded" });
-    }
-
-    // Check if video exists and belongs to user
-    const { rows: videoRows } = await pool.query(
-      "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
-      [videoId, req.user.id]
-    );
-
-    if (videoRows.length === 0) {
-      return res.status(404).json({ error: "Video not found" });
-    }
-
-    // Upload audio to S3
-    const audioKey = `audio/${req.user.id}/${Date.now()}-${req.file.originalname}`;
-    const audioUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${audioKey}`;
-    
-    await s3.send(new PutObjectCommand({
-      Bucket: process.env.S3_BUCKET_NAME,
-      Key: audioKey,
-      Body: req.file.buffer,
-      ContentType: req.file.mimetype
-    }));
-
-    // Save audio track to database
     const { rows } = await pool.query(
-      `INSERT INTO video_audio_tracks 
-       (video_id, user_id, name, audio_url, gain, mute, solo, created_at)
+      `SELECT c.*, u.username, u.profile_url 
+       FROM clips c 
+       JOIN users u ON c.creator_id = u.id 
+       WHERE c.stream_id = $1
+       ORDER BY c.created_at DESC 
+       LIMIT $2 OFFSET $3`,
+      [id, limit, offset]
+    );
+    
+    res.json({ clips: rows });
+  } catch (err) {
+    console.error("Get clips error:", err);
+    res.status(500).json({ error: "Failed to get clips" });
+  }
+});
+
+// --- Challenge Endpoints ---
+
+// Create challenge
+app.post("/api/challenges", adminMiddleware, async (req, res) => {
+  try {
+    const { title, description, hashtag, bannerUrl, soundUrl, startDate, endDate } = req.body;
+    
+    if (!title || !hashtag) return res.status(400).json({ error: "Title and hashtag are required" });
+    
+    const { rows } = await pool.query(
+      `INSERT INTO challenges 
+       (title, description, hashtag, banner_url, sound_url, start_date, end_date, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
        RETURNING *`,
-      [videoId, req.user.id, name || req.file.originalname, audioUrl, gain, mute, solo]
+      [
+        title,
+        description || null,
+        hashtag,
+        bannerUrl || null,
+        soundUrl || null,
+        startDate ? new Date(startDate) : new Date(),
+        endDate ? new Date(endDate) : null
+      ]
     );
-
-    res.json({ message: "Audio track added", track: rows[0] });
+    
+    const challenge = rows[0];
+    
+    res.json({ message: "Challenge created successfully", challenge });
   } catch (err) {
-    console.error("Error adding audio track:", err);
-    res.status(500).json({ error: "Failed to add audio track" });
+    console.error("Create challenge error:", err);
+    res.status(500).json({ error: "Failed to create challenge" });
   }
 });
 
-// Get audio tracks for a video
-app.get("/api/videos/:videoId/audio-tracks", authMiddleware, async (req, res) => {
+// Get active challenges
+app.get("/api/challenges", async (req, res) => {
   try {
-    const { videoId } = req.params;
+    const { limit = 20, offset = 0 } = req.query;
+    
+    const { rows } = await pool.query(
+      `SELECT * FROM challenges 
+       WHERE is_active = true AND (end_date IS NULL OR end_date > NOW())
+       ORDER BY created_at DESC 
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    
+    res.json({ challenges: rows });
+  } catch (err) {
+    console.error("Get challenges error:", err);
+    res.status(500).json({ error: "Failed to get challenges" });
+  }
+});
+
+// Enter challenge
+app.post("/api/challenges/:id/enter", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { videoId } = req.body;
+    
+    if (!videoId) return res.status(400).json({ error: "Video ID is required" });
+    
+    // Check if challenge exists and is active
+    const { rows: challengeRows } = await pool.query(
+      "SELECT * FROM challenges WHERE id = $1 AND is_active = true AND (end_date IS NULL OR end_date > NOW())",
+      [id]
+    );
+    
+    if (challengeRows.length === 0) return res.status(404).json({ error: "Challenge not found or not active" });
     
     // Check if video exists and belongs to user
     const { rows: videoRows } = await pool.query(
       "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
-      [videoId, req.user.id]
+      [videoId, userId]
     );
-
-    if (videoRows.length === 0) {
-      return res.status(404).json({ error: "Video not found" });
-    }
-
-    const { rows } = await pool.query(
-      "SELECT * FROM video_audio_tracks WHERE video_id = $1 ORDER BY created_at",
-      [videoId]
-    );
-
-    res.json(rows);
-  } catch (err) {
-    console.error("Error fetching audio tracks:", err);
-    res.status(500).json({ error: "Failed to fetch audio tracks" });
-  }
-});
-
-// Update audio track
-app.put("/api/audio-tracks/:trackId", authMiddleware, async (req, res) => {
-  try {
-    const { trackId } = req.params;
-    const { name, gain, mute, solo } = req.body;
     
-    // Check if track exists and belongs to user
-    const { rows: trackRows } = await pool.query(
-      `SELECT at.* FROM video_audio_tracks at
-       JOIN videos v ON at.video_id = v.id
-       WHERE at.id = $1 AND v.user_id = $2`,
-      [trackId, req.user.id]
+    if (videoRows.length === 0) return res.status(404).json({ error: "Video not found or does not belong to user" });
+    
+    // Check if user already entered this challenge with this video
+    const { rows: entryRows } = await pool.query(
+      "SELECT * FROM challenge_entries WHERE challenge_id = $1 AND user_id = $2 AND video_id = $3",
+      [id, userId, videoId]
     );
-
-    if (trackRows.length === 0) {
-      return res.status(404).json({ error: "Audio track not found" });
-    }
-
-    // Update track
+    
+    if (entryRows.length > 0) return res.status(400).json({ error: "Already entered this challenge with this video" });
+    
+    // Create challenge entry
     const { rows } = await pool.query(
-      `UPDATE video_audio_tracks 
-       SET name = COALESCE($1, name),
-           gain = COALESCE($2, gain),
-           mute = COALESCE($3, mute),
-           solo = COALESCE($4, solo),
-           updated_at = NOW()
-       WHERE id = $5
+      `INSERT INTO challenge_entries (challenge_id, user_id, video_id, created_at)
+       VALUES ($1, $2, $3, NOW())
        RETURNING *`,
-      [name, gain, mute, solo, trackId]
+      [id, userId, videoId]
     );
-
-    res.json({ message: "Audio track updated", track: rows[0] });
-  } catch (err) {
-    console.error("Error updating audio track:", err);
-    res.status(500).json({ error: "Failed to update audio track" });
-  }
-});
-
-// Delete audio track
-app.delete("/api/audio-tracks/:trackId", authMiddleware, async (req, res) => {
-  try {
-    const { trackId } = req.params;
     
-    // Check if track exists and belongs to user
-    const { rows: trackRows } = await pool.query(
-      `SELECT at.* FROM video_audio_tracks at
-       JOIN videos v ON at.video_id = v.id
-       WHERE at.id = $1 AND v.user_id = $2`,
-      [trackId, req.user.id]
-    );
-
-    if (trackRows.length === 0) {
-      return res.status(404).json({ error: "Audio track not found" });
-    }
-
-    const track = trackRows[0];
+    const entry = rows[0];
     
-    // Delete from S3
-    try {
-      const audioKey = track.audio_url.split('/').pop();
-      await s3.send(new DeleteObjectCommand({
-        Bucket: process.env.S3_BUCKET_NAME,
-        Key: `audio/${req.user.id}/${audioKey}`
-      }));
-    } catch (s3Err) {
-      console.error("Error deleting audio from S3:", s3Err);
-      // Continue even if S3 deletion fails
-    }
-
-    // Delete from database
-    await pool.query("DELETE FROM video_audio_tracks WHERE id = $1", [trackId]);
-
-    res.json({ message: "Audio track deleted successfully" });
-  } catch (err) {
-    console.error("Error deleting audio track:", err);
-    res.status(500).json({ error: "Failed to delete audio track" });
-  }
-});
-
-// --- Caption Management ---
-
-// Save captions for a video
-app.post("/api/videos/:videoId/captions", authMiddleware, async (req, res) => {
-  try {
-    const { videoId } = req.params;
-    const { captions, style } = req.body;
-    
-    if (!captions || !Array.isArray(captions)) {
-      return res.status(400).json({ error: "Captions array is required" });
-    }
-
-    // Check if video exists and belongs to user
-    const { rows: videoRows } = await pool.query(
-      "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
-      [videoId, req.user.id]
-    );
-
-    if (videoRows.length === 0) {
-      return res.status(404).json({ error: "Video not found" });
-    }
-
-    // Delete existing captions
-    await pool.query("DELETE FROM video_captions WHERE video_id = $1", [videoId]);
-
-    // Insert new captions
-    for (const caption of captions) {
-      await pool.query(
-        `INSERT INTO video_captions 
-         (video_id, start_time, end_time, text, created_at)
-         VALUES ($1, $2, $3, $4, NOW())`,
-        [videoId, caption.start, caption.end, caption.text]
-      );
-    }
-
-    // Save caption style if provided
-    if (style) {
-      await pool.query(
-        `INSERT INTO video_caption_styles 
-         (video_id, font_size, color, background_color, position, created_at)
-         VALUES ($1, $2, $3, $4, $5, NOW())
-         ON CONFLICT (video_id) DO UPDATE
-         SET font_size = EXCLUDED.font_size,
-             color = EXCLUDED.color,
-             background_color = EXCLUDED.background_color,
-             position = EXCLUDED.position,
-             updated_at = NOW()`,
-        [videoId, style.fontSize, style.color, style.backgroundColor, style.position]
-      );
-    }
-
-    res.json({ message: "Captions saved successfully" });
-  } catch (err) {
-    console.error("Error saving captions:", err);
-    res.status(500).json({ error: "Failed to save captions" });
-  }
-});
-
-// Get captions for a video
-app.get("/api/videos/:videoId/captions", authMiddleware, async (req, res) => {
-  try {
-    const { videoId } = req.params;
-    
-    // Check if video exists and belongs to user
-    const { rows: videoRows } = await pool.query(
-      "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
-      [videoId, req.user.id]
-    );
-
-    if (videoRows.length === 0) {
-      return res.status(404).json({ error: "Video not found" });
-    }
-
-    // Get captions
-    const { rows: captionRows } = await pool.query(
-      "SELECT * FROM video_captions WHERE video_id = $1 ORDER BY start_time",
-      [videoId]
-    );
-
-    // Get caption style
-    const { rows: styleRows } = await pool.query(
-      "SELECT * FROM video_caption_styles WHERE video_id = $1",
-      [videoId]
-    );
-
-    const captions = captionRows.map(row => ({
-      id: row.id,
-      start: row.start_time,
-      end: row.end_time,
-      text: row.text
-    }));
-
-    const style = styleRows.length > 0 ? {
-      fontSize: styleRows[0].font_size,
-      color: styleRows[0].color,
-      backgroundColor: styleRows[0].background_color,
-      position: styleRows[0].position
-    } : null;
-
-    res.json({ captions, style });
-  } catch (err) {
-    console.error("Error fetching captions:", err);
-    res.status(500).json({ error: "Failed to fetch captions" });
-  }
-});
-
-// --- Export Settings ---
-
-// Save export settings for a video
-app.post("/api/videos/:videoId/export-settings", authMiddleware, async (req, res) => {
-  try {
-    const { videoId } = req.params;
-    const { settings } = req.body;
-    
-    if (!settings) {
-      return res.status(400).json({ error: "Export settings are required" });
-    }
-
-    // Check if video exists and belongs to user
-    const { rows: videoRows } = await pool.query(
-      "SELECT * FROM videos WHERE id = $1 AND user_id = $2",
-      [videoId, req.user.id]
-    );
-
-    if (videoRows.length === 0) {
-      return res.status(404).json({ error: "Video not found" });
-    }
-
-    // Save export settings
+    // Update challenge participants count
     await pool.query(
-      `INSERT INTO video_export_settings 
-       (video_id, resolution, format, quality, fps, bitrate, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW())
-       ON CONFLICT (video_id) DO UPDATE
-       SET resolution = EXCLUDED.resolution,
-           format = EXCLUDED.format,
-           quality = EXCLUDED.quality,
-           fps = EXCLUDED.fps,
-           bitrate = EXCLUDED.bitrate,
-           updated_at = NOW()`,
-      [videoId, settings.resolution, settings.format, settings.quality, settings.fps, settings.bitrate]
+      "UPDATE challenges SET participants = participants + 1 WHERE id = $1",
+      [id]
     );
-
-    res.json({ message: "Export settings saved successfully" });
+    
+    res.json({ message: "Entered challenge successfully", entry });
   } catch (err) {
-    console.error("Error saving export settings:", err);
-    res.status(500).json({ error: "Failed to save export settings" });
+    console.error("Enter challenge error:", err);
+    res.status(500).json({ error: "Failed to enter challenge" });
   }
 });
 
-// --- Start server ---
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// Get challenge entries
+app.get("/api/challenges/:id/entries", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { limit = 20, offset = 0, sortBy = 'votes' } = req.query;
+    
+    let orderBy = 'votes DESC';
+    if (sortBy === 'recent') orderBy = 'created_at DESC';
+    
+    const { rows } = await pool.query(
+      `SELECT ce.*, v.title, v.thumbnail_url, v.views, v.likes, u.username, u.profile_url 
+       FROM challenge_entries ce 
+       JOIN videos v ON ce.video_id = v.id 
+       JOIN users u ON ce.user_id = u.id 
+       WHERE ce.challenge_id = $1
+       ORDER BY $2
+       LIMIT $3 OFFSET $4`,
+      [id, orderBy, limit, offset]
+    );
+    
+    res.json({ entries: rows });
+  } catch (err) {
+    console.error("Get challenge entries error:", err);
+    res.status(500).json({ error: "Failed to get challenge entries" });
+  }
+});
+
+// Vote for challenge entry
+app.post("/api/challenges/entries/:id/vote", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    
+    // Check if entry exists
+    const { rows: entryRows } = await pool.query(
+      "SELECT * FROM challenge_entries WHERE id = $1",
+      [id]
+    );
+    
+    if (entryRows.length === 0) return res.status(404).json({ error: "Entry not found" });
+    
+    const entry = entryRows[0];
+    
+    // Check if user already voted for this entry
+    const { rows: voteRows } = await pool.query(
+      "SELECT * FROM challenge_votes WHERE entry_id = $1 AND user_id = $2",
+      [id, userId]
+    );
+    
+    if (voteRows.length > 0) return res.status(400).json({ error: "Already voted for this entry" });
+    
+    // Add vote
+    await pool.query(
+      "INSERT INTO challenge_votes (entry_id, user_id, created_at) VALUES ($1, $2, NOW())",
+      [id, userId]
+    );
+    
+    // Update entry votes count
+    await pool.query(
+      "UPDATE challenge_entries SET votes = votes + 1 WHERE id = $1",
+      [id]
+    );
+    
+    res.json({ message: "Voted successfully" });
+  } catch (err) {
+    console.error("Vote for entry error:", err);
+    res.status(500).json({ error: "Failed to vote for entry" });
+  }
+});
+
+// --- Duet/Stitch Endpoints ---
+
+// Create duet or stitch
+app.post("/api/videos/:id/interact", authMiddleware, upload.single("video"), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { interactionType, title, description } = req.body;
+    
+    if (!interactionType || !['duet', 'stitch'].includes(interactionType)) {
+      return res.status(400).json({ error: "Interaction type must be 'duet' or 'stitch'" });
+    }
+    
+    if (!req.file) return res.status(400).json({ error: "No video file provided" });
+    
+    // Check if original video exists
+    const { rows: videoRows } = await pool.query(
+      "SELECT * FROM videos WHERE id = $1 AND is_public = true",
+      [id]
+    );
+    
+    if (videoRows.length === 0) return res.status(404).json({ error: "Video not found" });
+    
+    const originalVideo = videoRows[0];
+    
+    // Upload video to S3
+    const videoKey = `videos/${userId}/${Date.now()}-${req.file.originalname}`;
+    const videoUrl = await contentProcessor.uploadToS3(req.file.path, videoKey);
+    
+    // Create video record
+    const { rows } = await pool.query(
+      `INSERT INTO videos 
+       (user_id, title, description, video_url, is_short, is_public, processing_status, created_at)
+       VALUES ($1, $2, $3, $4, true, true, 'pending', NOW())
+       RETURNING *`,
+      [
+        userId,
+        title || `${interactionType} with ${originalVideo.title}`,
+        description || null,
+        videoUrl
+      ]
+    );
+    
+    const newVideo = rows[0];
+    
+    // Create interaction record
+    await pool.query(
+      `INSERT INTO video_interactions (original_video_id, response_video_id, user_id, interaction_type, created_at)
+       VALUES ($1, $2, $3, $4, NOW())`,
+      [id, newVideo.id, userId, interactionType]
+    );
+    
+    // Start processing video in background
+    contentProcessor.processVideo(newVideo.id)
+      .then(result => {
+        console.log(`Video ${newVideo.id} processed successfully:`, result);
+      })
+      .catch(error => {
+        console.error(`Error processing video ${newVideo.id}:`, error);
+      });
+    
+    // Create notification for original video creator
+    if (originalVideo.user_id !== userId) {
+      await pool.query(
+        `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
+         VALUES ($1, $2, 'interaction', 'New Video Interaction', '$3 created a ${4} with your video', $5, NOW())`,
+        [
+          originalVideo.user_id,
+          userId,
+          req.user.username,
+          interactionType,
+          JSON.stringify({ 
+            originalVideoId: id, 
+            responseVideoId: newVideo.id, 
+            interactionType 
+          })
+        ]
+      );
+    }
+    
+    res.json({ message: `${interactionType} created successfully`, video: newVideo });
+  } catch (err) {
+    console.error("Create interaction error:", err);
+    res.status(500).json({ error: "Failed to create interaction" });
+  }
+});
+
+// Get duets and stitches for a video
+app.get("/api/videos/:id/interactions", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { interactionType, limit = 20, offset = 0 } = req.query;
+    
+    let query = `
+      SELECT vi.*, v.title, v.thumbnail_url, v.views, v.likes, u.username, u.profile_url 
+      FROM video_interactions vi 
+      JOIN videos v ON vi.response_video_id = v.id 
+      JOIN users u ON vi.user_id = u.id 
+      WHERE vi.original_video_id = $1
+    `;
+    
+    const params = [id];
+    
+    if (interactionType && ['duet', 'stitch'].includes(interactionType)) {
+      query += " AND vi.interaction_type = $2";
+      params.push(interactionType);
+    }
+    
+    query += " ORDER BY vi.created_at DESC LIMIT $" + (params.length + 1) + " OFFSET $" + (params.length + 2);
+    params.push(limit, offset);
+    
+    const { rows } = await pool.query(query, params);
+    
+    res.json({ interactions: rows });
+  } catch (err) {
+    console.error("Get interactions error:", err);
+    res.status(500).json({ error: "Failed to get interactions" });
+  }
+});
+
+// --- Story Endpoints ---
+
+// Upload story
+app.post("/api/stories", authMiddleware, upload.single("media"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No media file provided" });
+    
+    const userId = req.user.id;
+    const mediaType = req.file.mimetype.startsWith('video/') ? 'video' : 'image';
+    
+    // Upload media to S3
+    const mediaKey = `stories/${userId}/${Date.now()}-${req.file.originalname}`;
+    const mediaUrl = await contentProcessor.uploadToS3(req.file.path, mediaKey);
+    
+    // Calculate duration for video stories
+    let duration = null;
+    if (mediaType === 'video') {
+      // In a real implementation, you would extract the duration from the video
+      duration = 30; // Default to 30 seconds for this example
+    }
+    
+    // Create story record
+    const { rows } = await pool.query(
+      `INSERT INTO stories (user_id, media_url, media_type, duration, created_at, expires_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '24 hours')
+       RETURNING *`,
+      [userId, mediaUrl, mediaType, duration]
+    );
+    
+    const story = rows[0];
+    
+    res.json({ message: "Story uploaded successfully", story });
+  } catch (err) {
+    console.error("Upload story error:", err);
+    res.status(500).json({ error: "Failed to upload story" });
+  }
+});
+
+// Get stories from followed users
+app.get("/api/stories/feed", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Get users that the current user follows
+    const { rows: followingRows } = await pool.query(
+      "SELECT following_id FROM follows WHERE follower_id = $1",
+      [userId]
+    );
+    
+    if (followingRows.length === 0) return res.json({ stories: [] });
+    
+    const followingIds = followingRows.map(row => row.following_id);
+    
+    // Get active stories from followed users
+    const { rows } = await pool.query(
+      `SELECT s.*, u.username, u.profile_url 
+       FROM stories s 
+       JOIN users u ON s.user_id = u.id 
+       WHERE s.user_id = ANY($1) AND s.is_active = true AND s.expires_at > NOW()
+       ORDER BY s.created_at DESC`,
+      [followingIds]
+    );
+    
+    // Mark stories as viewed
+    for (const story of rows) {
+      const views = story.views ? JSON.parse(story.views) : [];
+      
+      if (!views.includes(userId)) {
+        views.push(userId);
+        
+        await pool.query(
+          "UPDATE stories SET views = $1 WHERE id = $2",
+          [JSON.stringify(views), story.id]
+        );
+      }
+    }
+    
+    res.json({ stories: rows });
+  } catch (err) {
+    console.error("Get stories feed error:", err);
+    res.status(500).json({ error: "Failed to get stories feed" });
+  }
+});
+
+// Get user's stories
+app.get("/api/users/:userId/stories", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const { rows } = await pool.query(
+      `SELECT s.*, u.username, u.profile_url 
+       FROM stories s 
+       JOIN users u ON s.user_id = u.id 
+       WHERE s.user_id = $1 AND s.is_active = true AND s.expires_at > NOW()
+       ORDER BY s.created_at ASC`,
+      [userId]
+    );
+    
+    res.json({ stories: rows });
+  } catch (err) {
+    console.error("Get user stories error:", err);
+    res.status(500).json({ error: "Failed to get user stories" });
+  }
+});
+
+// React to story
+app.post("/api/stories/:id/react", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { emoji } = req.body;
+    
+    if (!emoji) return res.status(400).json({ error: "Emoji is required" });
+    
+    // Check if story exists and is active
+    const { rows: storyRows } = await pool.query(
+      "SELECT * FROM stories WHERE id = $1 AND is_active = true AND expires_at > NOW()",
+      [id]
+    );
+    
+    if (storyRows.length === 0) return res.status(404).json({ error: "Story not found or expired" });
+    
+    const story = storyRows[0];
+    
+    // Get current reactions
+    const reactions = story.reactions ? JSON.parse(story.reactions) : {};
+    
+    // Check if user already reacted with this emoji
+    if (!reactions[emoji]) reactions[emoji] = [];
+    
+    // Remove user from all other reactions
+    for (const key in reactions) {
+      if (key !== emoji) {
+        reactions[key] = reactions[key].filter(id => id !== userId);
+      }
+    }
+    
+    // Add user to this reaction if not already there
+    if (!reactions[emoji].includes(userId)) {
+      reactions[emoji].push(userId);
+    }
+    
+    // Update story reactions
+    await pool.query(
+      "UPDATE stories SET reactions = $1 WHERE id = $2",
+      [JSON.stringify(reactions), id]
+    );
+    
+    // Create notification for story owner
+    if (story.user_id !== userId) {
+      await pool.query(
+        `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
+         VALUES ($1, $2, 'story_reaction', 'Story Reaction', '$3 reacted to your story', $4, NOW())`,
+        [
+          story.user_id,
+          userId,
+          req.user.username,
+          JSON.stringify({ storyId: id, emoji })
+        ]
+      );
+    }
+    
+    res.json({ message: "Reaction added successfully", reactions });
+  } catch (err) {
+    console.error("React to story error:", err);
+    res.status(500).json({ error: "Failed to react to story" });
+  }
+});
+
+// --- Highlight Endpoints ---
+
+// Create highlight
+app.post("/api/highlights", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { title, storyIds, coverUrl } = req.body;
+    
+    if (!title || !storyIds || !Array.isArray(storyIds) || storyIds.length === 0) {
+      return res.status(400).json({ error: "Title and at least one story ID are required" });
+    }
+    
+    // Check if all stories exist and belong to user
+    const { rows: storyRows } = await pool.query(
+      "SELECT id FROM stories WHERE id = ANY($1) AND user_id = $2",
+      [storyIds, userId]
+    );
+    
+    if (storyRows.length !== storyIds.length) {
+      return res.status(400).json({ error: "One or more stories not found or do not belong to user" });
+    }
+    
+    // Create highlight record
+    const { rows } = await pool.query(
+      `INSERT INTO highlights (user_id, title, cover_url, stories, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       RETURNING *`,
+      [userId, title, coverUrl || null, JSON.stringify(storyIds)]
+    );
+    
+    const highlight = rows[0];
+    
+    res.json({ message: "Highlight created successfully", highlight });
+  } catch (err) {
+    console.error("Create highlight error:", err);
+    res.status(500).json({ error: "Failed to create highlight" });
+  }
+});
+
+// Get user's highlights
+app.get("/api/users/:userId/highlights", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const { rows } = await pool.query(
+      "SELECT * FROM highlights WHERE user_id = $1 ORDER BY created_at DESC",
+      [userId]
+    );
+    
+    // Get story details for each highlight
+    for (const highlight of rows) {
+      if (highlight.stories && highlight.stories.length > 0) {
+        const { rows: storyRows } = await pool.query(
+          `SELECT s.*, u.username, u.profile_url 
+           FROM stories s 
+           JOIN users u ON s.user_id = u.id 
+           WHERE s.id = ANY($1)`,
+          [highlight.stories]
+        );
+        
+        highlight.storyDetails = storyRows;
+      } else {
+        highlight.storyDetails = [];
+      }
+    }
+    
+    res.json({ highlights: rows });
+  } catch (err) {
+    console.error("Get user highlights error:", err);
+    res.status(500).json({ error: "Failed to get user highlights" });
+  }
+});
+
+// --- Notification Endpoints ---
+
+// Get user notifications
+app.get("/api/notifications", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { limit = 20, offset = 0, unreadOnly = false } = req.query;
+    
+    let query = `
+      SELECT n.*, u.username, u.profile_url 
+      FROM notifications n 
+      LEFT JOIN users u ON n.sender_id = u.id 
+      WHERE n.user_id = $1
+    `;
+    
+    const params = [userId];
+    
+    if (unreadOnly === 'true') {
+      query += " AND n.is_read = false";
+    }
+    
+    query += " ORDER BY n.created_at DESC LIMIT $" + (params.length + 1) + " OFFSET $" + (params.length + 2);
+    params.push(limit, offset);
+    
+    const { rows } = await pool.query(query, params);
+    
+    res.json({ notifications: rows });
+  } catch (err) {
+    console.error("Get notifications error:", err);
+    res.status(500).json({ error: "Failed to get notifications" });
+  }
+});
+
+// Mark notification as read
+app.post("/api/notifications/:id/read", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    
+    // Check if notification exists and belongs to user
+    const { rows } = await pool.query(
+      "SELECT * FROM notifications WHERE id = $1 AND user_id = $2",
+      [id, userId]
+    );
+    
+    if (rows.length === 0) return res.status(404).json({ error: "Notification not found" });
+    
+    // Mark as read
+    await pool.query(
+      "UPDATE notifications SET is_read = true WHERE id = $1",
+      [id]
+    );
+    
+    res.json({ message: "Notification marked as read" });
+  } catch (err) {
+    console.error("Mark notification as read error:", err);
+    res.status(500).json({ error: "Failed to mark notification as read" });
+  }
+});
+
+// Mark all notifications as read
+app.post("/api/notifications/read-all", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    await pool.query(
+      "UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false",
+      [userId]
+    );
+    
+    res.json({ message: "All notifications marked as read" });
+  } catch (err) {
+    console.error("Mark all notifications as read error:", err);
+    res.status(500).json({ error: "Failed to mark all notifications as read" });
+  }
+});
+
+// --- Search Endpoints ---
+
+// Search content
+app.get("/api/search", async (req, res) => {
+  try {
+    const { q, type = 'all', limit = 20, offset = 0 } = req.query;
+    
+    if (!q) return res.status(400).json({ error: "Search query is required" });
+    
+    const results = {
+      videos: [],
+      music: [],
+      users: [],
+      playlists: [],
+      livestreams: []
+    };
+    
+    // Search videos
+    if (type === 'all' || type === 'videos') {
+      const { rows: videos } = await pool.query(
+        `SELECT v.*, u.username, u.profile_url 
+         FROM videos v 
+         JOIN users u ON v.user_id = u.id 
+         WHERE v.is_public = true AND v.processing_status = 'completed' AND 
+               (v.title ILIKE $1 OR v.description ILIKE $1 OR v.tags::text ILIKE $1)
+         ORDER BY v.views DESC 
+         LIMIT $2 OFFSET $3`,
+        [`%${q}%`, limit, offset]
+      );
+      
+      results.videos = videos;
+    }
+    
+    // Search music
+    if (type === 'all' || type === 'music') {
+      const { rows: music } = await pool.query(
+        `SELECT m.*, u.username, u.profile_url 
+         FROM music m 
+         JOIN users u ON m.user_id = u.id 
+         WHERE m.title ILIKE $1 OR m.artist ILIKE $1 OR m.album ILIKE $1
+         ORDER BY m.listens DESC 
+         LIMIT $2 OFFSET $3`,
+        [`%${q}%`, limit, offset]
+      );
+      
+      results.music = music;
+    }
+    
+    // Search users
+    if (type === 'all' || type === 'users') {
+      const { rows: users } = await pool.query(
+        `SELECT id, username, profile_url, bio, is_verified 
+         FROM users 
+         WHERE username ILIKE $1 OR bio ILIKE $1
+         ORDER BY is_verified DESC, username ASC 
+         LIMIT $2 OFFSET $3`,
+        [`%${q}%`, limit, offset]
+      );
+      
+      results.users = users;
+    }
+    
+    // Search playlists
+    if (type === 'all' || type === 'playlists') {
+      const { rows: playlists } = await pool.query(
+        `SELECT p.*, u.username, u.profile_url 
+         FROM playlists p 
+         JOIN users u ON p.user_id = u.id 
+         WHERE p.is_public = true AND (p.name ILIKE $1 OR p.description ILIKE $1)
+         ORDER BY p.plays DESC 
+         LIMIT $2 OFFSET $3`,
+        [`%${q}%`, limit, offset]
+      );
+      
+      results.playlists = playlists;
+    }
+    
+    // Search livestreams
+    if (type === 'all' || type === 'livestreams') {
+      const { rows: livestreams } = await pool.query(
+        `SELECT l.*, u.username, u.profile_url 
+         FROM livestreams l 
+         JOIN users u ON l.user_id = u.id 
+         WHERE l.is_live = true AND (l.title ILIKE $1 OR l.description ILIKE $1)
+         ORDER BY l.viewers DESC 
+         LIMIT $2 OFFSET $3`,
+        [`%${q}%`, limit, offset]
+      );
+      
+      results.livestreams = livestreams;
+    }
+    
+    res.json({ results });
+  } catch (err) {
+    console.error("Search error:", err);
+    res.status(500).json({ error: "Search failed" });
+  }
+});
+
+// Get search suggestions
+app.get("/api/search/suggestions", async (req, res) => {
+  try {
+    const { q } = req.query;
+    
+    if (!q || q.length < 2) return res.json({ suggestions: [] });
+    
+    // Get popular search terms from analytics
+    const { rows } = await pool.query(
+      `SELECT DISTINCT term, COUNT(*) as count 
+       FROM search_analytics 
+       WHERE term ILIKE $1 
+       GROUP BY term 
+       ORDER BY count DESC 
+       LIMIT 10`,
+      [`%${q}%`]
+    );
+    
+    const suggestions = rows.map(row => row.term);
+    
+    res.json({ suggestions });
+  } catch (err) {
+    console.error("Get search suggestions error:", err);
+    res.status(500).json({ error: "Failed to get search suggestions" });
+  }
+});
+
+// --- Analytics Endpoints ---
+
+// Track analytics event
+app.post("/api/analytics/events", async (req, res) => {
+  try {
+    const { eventType, eventData, sessionId } = req.body;
+    let userId = null;
+    
+    // Try to get user ID from token
+    if (req.headers.authorization) {
+      try {
+        const token = req.headers.authorization.split(" ")[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.id;
+      } catch (err) {
+        // Invalid token, ignore
+      }
+    }
+    
+    // Record analytics event
+    await pool.query(
+      `INSERT INTO analytics_events (user_id, session_id, event_type, event_data, ip_address, user_agent, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [
+        userId,
+        sessionId || null,
+        eventType,
+        eventData ? JSON.stringify(eventData) : null,
+        req.ip,
+        req.get('User-Agent')
+      ]
+    );
+    
+    // If this is a search event, record the search term
+    if (eventType === 'search' && eventData && eventData.query) {
+      await pool.query(
+        `INSERT INTO search_analytics (user_id, term, results_count, created_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (user_id, term) 
+         DO UPDATE SET count = search_analytics.count + 1, last_searched = NOW()`,
+        [
+          userId,
+          eventData.query,
+          eventData.resultsCount || 0
+        ]
+      );
+    }
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Track analytics event error:", err);
+    res.status(500).json({ error: "Failed to track analytics event" });
+  }
+});
+
+// Get creator analytics
+app.get("/api/analytics/creator", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { period = '30d' } = req.query;
+    
+    // Calculate date range based on period
+    let startDate;
+    switch (period) {
+      case '7d':
+        startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      case '30d':
+        startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+        break;
+      case '90d':
+        startDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+        break;
+      default:
+        startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    }
+    
+    // Get video analytics
+    const { rows: videoAnalytics } = await pool.query(
+      `SELECT 
+         COUNT(*) as video_count,
+         SUM(views) as total_views,
+         SUM(likes) as total_likes,
+         SUM(comments_count) as total_comments,
+         SUM(shares) as total_shares
+       FROM videos 
+       WHERE user_id = $1 AND created_at >= $2`,
+      [userId, startDate]
+    );
+    
+    // Get music analytics
+    const { rows: musicAnalytics } = await pool.query(
+      `SELECT 
+         COUNT(*) as music_count,
+         SUM(listens) as total_listens,
+         SUM(likes) as total_likes,
+         SUM(shares) as total_shares
+       FROM music 
+       WHERE user_id = $1 AND created_at >= $2`,
+      [userId, startDate]
+    );
+    
+    // Get livestream analytics
+    const { rows: streamAnalytics } = await pool.query(
+      `SELECT 
+         COUNT(*) as stream_count,
+         SUM(duration) as total_duration,
+         SUM(viewers) as total_viewers,
+         SUM(peak_viewers) as total_peak_viewers
+       FROM livestreams 
+       WHERE user_id = $1 AND created_at >= $2`,
+      [userId, startDate]
+    );
+    
+    // Get follower growth
+    const { rows: followerGrowth } = await pool.query(
+      `SELECT COUNT(*) as new_followers
+       FROM follows 
+       WHERE following_id = $1 AND created_at >= $2`,
+      [userId, startDate]
+    );
+    
+    // Get earnings
+    const { rows: earningsData } = await pool.query(
+      `SELECT 
+         SUM(CASE WHEN type = 'tip' THEN amount ELSE 0 END) as tip_earnings,
+         SUM(CASE WHEN type = 'subscription' THEN amount ELSE 0 END) as subscription_earnings,
+         SUM(CASE WHEN type = 'ad' THEN amount ELSE 0 END) as ad_earnings,
+         SUM(amount) as total_earnings
+       FROM earnings 
+       WHERE user_id = $1 AND created_at >= $2`,
+      [userId, startDate]
+    );
+    
+    // Get daily analytics for charts
+    const { rows: dailyAnalytics } = await pool.query(
+      `SELECT 
+         DATE(created_at) as date,
+         SUM(views) as views,
+         SUM(likes) as likes,
+         SUM(CASE WHEN content_type = 'video' THEN 1 ELSE 0 END) as videos,
+         SUM(CASE WHEN content_type = 'music' THEN 1 ELSE 0 END) as music
+       FROM (
+         SELECT created_at, views, likes, 'video' as content_type FROM videos WHERE user_id = $1
+         UNION ALL
+         SELECT created_at, listens as views, likes, 'music' as content_type FROM music WHERE user_id = $1
+       ) as content
+       WHERE created_at >= $2
+       GROUP BY DATE(created_at)
+       ORDER BY date ASC`,
+      [userId, startDate]
+    );
+    
+    res.json({
+      period,
+      videos: videoAnalytics[0] || { video_count: 0, total_views: 0, total_likes: 0, total_comments: 0, total_shares: 0 },
+      music: musicAnalytics[0] || { music_count: 0, total_listens: 0, total_likes: 0, total_shares: 0 },
+      livestreams: streamAnalytics[0] || { stream_count: 0, total_duration: 0, total_viewers: 0, total_peak_viewers: 0 },
+      followers: { new_followers: followerGrowth[0]?.new_followers || 0 },
+      earnings: earningsData[0] || { tip_earnings: 0, subscription_earnings: 0, ad_earnings: 0, total_earnings: 0 },
+      daily: dailyAnalytics
+    });
+  } catch (err) {
+    console.error("Get creator analytics error:", err);
+    res.status(500).json({ error: "Failed to get creator analytics" });
+  }
+});
+
+// --- Subscription Endpoints ---
+
+// Get subscription tiers
+app.get("/api/subscriptions/tiers", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT * FROM subscription_tiers ORDER BY price ASC"
+    );
+    
+    res.json({ tiers: rows });
+  } catch (err) {
+    console.error("Get subscription tiers error:", err);
+    res.status(500).json({ error: "Failed to get subscription tiers" });
+  }
+});
+
+// Create subscription checkout session
+app.post("/api/subscriptions/checkout", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { tierId } = req.body;
+    
+    if (!tierId) return res.status(400).json({ error: "Tier ID is required" });
+    
+    // Get tier details
+    const { rows: tierRows } = await pool.query(
+      "SELECT * FROM subscription_tiers WHERE id = $1",
+      [tierId]
+    );
+    
+    if (tierRows.length === 0) return res.status(404).json({ error: "Subscription tier not found" });
+    
+    const tier = tierRows[0];
+    
+    // Create Stripe checkout session
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      customer_email: req.user.email,
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: tier.name,
+              description: `Subscription to ${tier.name}`,
+            },
+            unit_amount: tier.price * 100, // Convert to cents
+            recurring: {
+              interval: tier.billing_cycle,
+            },
+          },
+          quantity: 1,
+        },
+      ],
+      mode: 'subscription',
+      success_url: `${FRONTEND_URL}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${FRONTEND_URL}/subscription/cancel`,
+      metadata: {
+        userId: userId.toString(),
+        tierId: tierId.toString(),
+      },
+    });
+    
+    res.json({ sessionId: session.id });
+  } catch (err) {
+    console.error("Create subscription checkout error:", err);
+    res.status(500).json({ error: "Failed to create subscription checkout" });
+  }
+});
+
+// Handle Stripe webhook
+app.post("/api/webhooks/stripe", express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.log(`Webhook signature verification failed.`, err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  
+  // Handle the event
+  switch (event.type) {
+    case 'checkout.session.completed':
+      const session = event.data.object;
+      
+      // Get user and tier IDs from metadata
+      const userId = parseInt(session.metadata.userId);
+      const tierId = parseInt(session.metadata.tierId);
+      
+      // Get subscription details
+      const subscription = await stripe.subscriptions.retrieve(session.subscription);
+      
+      // Create user subscription record
+      await pool.query(
+        `INSERT INTO user_subscriptions 
+         (user_id, tier_id, stripe_subscription_id, status, current_period_start, current_period_end, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())
+         ON CONFLICT (user_id) 
+         DO UPDATE SET 
+           tier_id = $2,
+           stripe_subscription_id = $3,
+           status = $4,
+           current_period_start = $5,
+           current_period_end = $6,
+           updated_at = NOW()`,
+        [
+          userId,
+          tierId,
+          subscription.id,
+          subscription.status,
+          new Date(subscription.current_period_start * 1000),
+          new Date(subscription.current_period_end * 1000)
+        ]
+      );
+      
+      // Update user role
+      const { rows: tierRows } = await pool.query(
+        "SELECT * FROM subscription_tiers WHERE id = $1",
+        [tierId]
+      );
+      
+      if (tierRows.length > 0) {
+        const tier = tierRows[0];
+        await pool.query(
+          "UPDATE users SET role = $1, subscription_plan = $2, subscription_expires = $3 WHERE id = $4",
+          [
+            tier.name === 'Elite' ? 'elite' : 'premium',
+            tier.name.toLowerCase(),
+            new Date(subscription.current_period_end * 1000),
+            userId
+          ]
+        );
+      }
+      
+      console.log(`User ${userId} subscribed to tier ${tierId}`);
+      break;
+      
+    case 'invoice.payment_succeeded':
+      const invoice = event.data.object;
+      
+      // Update subscription period
+      if (invoice.subscription) {
+        const subscription = await stripe.subscriptions.retrieve(invoice.subscription);
+        
+        await pool.query(
+          `UPDATE user_subscriptions 
+           SET status = $1, current_period_start = $2, current_period_end = $3, updated_at = NOW()
+           WHERE stripe_subscription_id = $4`,
+          [
+            subscription.status,
+            new Date(subscription.current_period_start * 1000),
+            new Date(subscription.current_period_end * 1000),
+            subscription.id
+          ]
+        );
+        
+        // Update user subscription expiry
+        await pool.query(
+          "UPDATE users SET subscription_expires = $1 WHERE id = (SELECT user_id FROM user_subscriptions WHERE stripe_subscription_id = $2)",
+          [new Date(subscription.current_period_end * 1000), subscription.id]
+        );
+      }
+      
+      break;
+      
+    case 'customer.subscription.deleted':
+      const deletedSubscription = event.data.object;
+      
+      // Update subscription status
+      await pool.query(
+        "UPDATE user_subscriptions SET status = 'canceled', updated_at = NOW() WHERE stripe_subscription_id = $1",
+        [deletedSubscription.id]
+      );
+      
+      // Downgrade user to free tier
+      await pool.query(
+        "UPDATE users SET role = 'free', subscription_plan = 'free' WHERE id = (SELECT user_id FROM user_subscriptions WHERE stripe_subscription_id = $1)",
+        [deletedSubscription.id]
+      );
+      
+      console.log(`Subscription ${deletedSubscription.id} was canceled`);
+      break;
+      
+    default:
+      console.log(`Unhandled event type ${event.type}`);
+  }
+  
+  // Return a 200 response to acknowledge receipt of the event
+  res.send();
+});
+
+// --- Channel Points Endpoints ---
+
+// Get channel rewards for a streamer
+app.get("/api/users/:userId/rewards", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const { rows } = await pool.query(
+      "SELECT * FROM channel_rewards WHERE streamer_id = $1 AND is_enabled = true ORDER BY cost ASC",
+      [userId]
+    );
+    
+    res.json({ rewards: rows });
+  } catch (err) {
+    console.error("Get channel rewards error:", err);
+    res.status(500).json({ error: "Failed to get channel rewards" });
+  }
+});
+
+// Create channel reward
+app.post("/api/rewards", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { title, description, iconUrl, cost } = req.body;
+    
+    if (!title || !cost) return res.status(400).json({ error: "Title and cost are required" });
+    
+    const { rows } = await pool.query(
+      `INSERT INTO channel_rewards (streamer_id, title, description, icon_url, cost, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING *`,
+      [userId, title, description || null, iconUrl || null, cost]
+    );
+    
+    const reward = rows[0];
+    
+    res.json({ message: "Channel reward created successfully", reward });
+  } catch (err) {
+    console.error("Create channel reward error:", err);
+    res.status(500).json({ error: "Failed to create channel reward" });
+  }
+});
+
+// Redeem channel reward
+app.post("/api/rewards/:id/redeem", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    
+    // Get reward details
+    const { rows: rewardRows } = await pool.query(
+      "SELECT * FROM channel_rewards WHERE id = $1 AND is_enabled = true",
+      [id]
+    );
+    
+    if (rewardRows.length === 0) return res.status(404).json({ error: "Reward not found" });
+    
+    const reward = rewardRows[0];
+    
+    // Get user's channel points for this streamer
+    const { rows: pointsRows } = await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN type = 'earn' THEN points ELSE -points END), 0) as balance
+       FROM channel_points_transactions 
+       WHERE user_id = $1 AND streamer_id = $2`,
+      [userId, reward.streamer_id]
+    );
+    
+    const balance = pointsRows[0]?.balance || 0;
+    
+    if (balance < reward.cost) return res.status(400).json({ error: "Insufficient channel points" });
+    
+    // Record redemption
+    await pool.query(
+      `INSERT INTO channel_points_transactions (user_id, streamer_id, reward_id, points, type, description, created_at)
+       VALUES ($1, $2, $3, $4, 'spend', $5, NOW())`,
+      [userId, reward.streamer_id, id, reward.cost, `Redeemed: ${reward.title}`]
+    );
+    
+    // Update reward redemption count
+    await pool.query(
+      "UPDATE channel_rewards SET redemptions = redemptions + 1 WHERE id = $1",
+      [id]
+    );
+    
+    // Create notification for streamer
+    await pool.query(
+      `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
+       VALUES ($1, $2, 'reward_redeemed', 'Reward Redeemed', '$3 redeemed your reward: $4', $5, NOW())`,
+      [
+        reward.streamer_id,
+        userId,
+        req.user.username,
+        reward.title,
+        JSON.stringify({ rewardId: id, rewardTitle: reward.title })
+      ]
+    );
+    
+    // Emit to Socket.io
+    io.to(`streamer-${reward.streamer_id}`).emit('reward_redeemed', {
+      userId,
+      username: req.user.username,
+      rewardId: id,
+      rewardTitle: reward.title
+    });
+    
+    res.json({ message: "Reward redeemed successfully" });
+  } catch (err) {
+    console.error("Redeem reward error:", err);
+    res.status(500).json({ error: "Failed to redeem reward" });
+  }
+});
+
+// Get user's channel points for a streamer
+app.get("/api/users/:userId/channel-points/:streamerId", authMiddleware, async (req, res) => {
+  try {
+    const { userId, streamerId } = req.params;
+    
+    // Only allow users to check their own points
+    if (parseInt(userId) !== req.user.id) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+    
+    const { rows } = await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN type = 'earn' THEN points ELSE -points END), 0) as balance
+       FROM channel_points_transactions 
+       WHERE user_id = $1 AND streamer_id = $2`,
+      [userId, streamerId]
+    );
+    
+    const balance = rows[0]?.balance || 0;
+    
+    res.json({ balance });
+  } catch (err) {
+    console.error("Get channel points error:", err);
+    res.status(500).json({ error: "Failed to get channel points" });
+  }
+});
+
+// --- Emote Endpoints ---
+
+// Get emotes for a streamer
+app.get("/api/users/:userId/emotes", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const { rows } = await pool.query(
+      "SELECT * FROM emotes WHERE streamer_id = $1 ORDER BY name ASC",
+      [userId]
+    );
+    
+    res.json({ emotes: rows });
+  } catch (err) {
+    console.error("Get emotes error:", err);
+    res.status(500).json({ error: "Failed to get emotes" });
+  }
+});
+
+// Get global emotes
+app.get("/api/emotes/global", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT * FROM emotes WHERE is_global = true ORDER BY name ASC"
+    );
+    
+    res.json({ emotes: rows });
+  } catch (err) {
+    console.error("Get global emotes error:", err);
+    res.status(500).json({ error: "Failed to get global emotes" });
+  }
+});
+
+// Create emote
+app.post("/api/emotes", authMiddleware, upload.single("image"), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { name, tier = 1, isGlobal = false } = req.body;
+    
+    if (!name || !req.file) return res.status(400).json({ error: "Name and image are required" });
+    
+    // Only admins can create global emotes
+    if (isGlobal && req.user.role !== 'admin') {
+      return res.status(403).json({ error: "Only admins can create global emotes" });
+    }
+    
+    // Upload image to S3
+    const imageKey = `emotes/${userId}/${Date.now()}-${req.file.originalname}`;
+    const imageUrl = await contentProcessor.uploadToS3(req.file.path, imageKey);
+    
+    // Create emote record
+    const { rows } = await pool.query(
+      `INSERT INTO emotes (streamer_id, name, image_url, tier, is_global, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING *`,
+      [isGlobal ? null : userId, name, imageUrl, tier, isGlobal]
+    );
+    
+    const emote = rows[0];
+    
+    res.json({ message: "Emote created successfully", emote });
+  } catch (err) {
+    console.error("Create emote error:", err);
+    res.status(500).json({ error: "Failed to create emote" });
+  }
+});
+
+// --- Offline Download Endpoints ---
+
+// Request offline download
+app.post("/api/downloads/request", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { contentType, contentId } = req.body;
+    
+    if (!contentType || !contentId) return res.status(400).json({ error: "Content type and ID are required" });
+    
+    // Check if user has premium subscription
+    const { rows: userRows } = await pool.query(
+      "SELECT * FROM users WHERE id = $1",
+      [userId]
+    );
+    
+    if (userRows.length === 0) return res.status(404).json({ error: "User not found" });
+    
+    const user = userRows[0];
+    
+    if (user.role === 'free') {
+      return res.status(403).json({ error: "Premium subscription required for offline downloads" });
+    }
+    
+    // Check if content exists
+    let contentExists = false;
+    
+    switch (contentType) {
+      case 'video':
+        const { rows: videoRows } = await pool.query(
+          "SELECT * FROM videos WHERE id = $1 AND is_public = true AND download_allowed = true",
+          [contentId]
+        );
+        contentExists = videoRows.length > 0;
+        break;
+        
+      case 'music':
+        const { rows: musicRows } = await pool.query(
+          "SELECT * FROM music WHERE id = $1",
+          [contentId]
+        );
+        contentExists = musicRows.length > 0;
+        break;
+        
+      case 'podcast':
+        const { rows: podcastRows } = await pool.query(
+          "SELECT * FROM podcast_episodes WHERE id = $1",
+          [contentId]
+        );
+        contentExists = podcastRows.length > 0;
+        break;
+        
+      default:
+        return res.status(400).json({ error: "Invalid content type" });
+    }
+    
+    if (!contentExists) return res.status(404).json({ error: "Content not found or not available for download" });
+    
+    // Generate download token
+    const downloadToken = uuidv4();
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+    
+    // Create download record
+    await pool.query(
+      `INSERT INTO offline_downloads (user_id, content_type, content_id, download_token, expires_at, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (user_id, content_type, content_id) 
+       DO UPDATE SET 
+         download_token = $4,
+         expires_at = $5,
+         created_at = NOW()`,
+      [userId, contentType, contentId, downloadToken, expiresAt]
+    );
+    
+    res.json({ 
+      message: "Download requested successfully", 
+      downloadToken,
+      expiresAt
+    });
+  } catch (err) {
+    console.error("Request download error:", err);
+    res.status(500).json({ error: "Failed to request download" });
+  }
+});
+
+// Get download URL
+app.get("/api/downloads/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+    
+    // Get download record
+    const { rows } = await pool.query(
+      "SELECT * FROM offline_downloads WHERE download_token = $1 AND expires_at > NOW()",
+      [token]
+    );
+    
+    if (rows.length === 0) return res.status(404).json({ error: "Download not found or expired" });
+    
+    const download = rows[0];
+    
+    // Get content URL
+    let contentUrl = null;
+    
+    switch (download.content_type) {
+      case 'video':
+        const { rows: videoRows } = await pool.query(
+          "SELECT video_url FROM videos WHERE id = $1",
+          [download.content_id]
+        );
+        if (videoRows.length > 0) contentUrl = videoRows[0].video_url;
+        break;
+        
+      case 'music':
+        const { rows: musicRows } = await pool.query(
+          "SELECT music_url FROM music WHERE id = $1",
+          [download.content_id]
+        );
+        if (musicRows.length > 0) contentUrl = musicRows[0].music_url;
+        break;
+        
+      case 'podcast':
+        const { rows: podcastRows } = await pool.query(
+          "SELECT audio_url FROM podcast_episodes WHERE id = $1",
+          [download.content_id]
+        );
+        if (podcastRows.length > 0) contentUrl = podcastRows[0].audio_url;
+        break;
+    }
+    
+    if (!contentUrl) return res.status(404).json({ error: "Content not found" });
+    
+    // Generate presigned URL for S3 download
+    const urlParts = new URL(contentUrl);
+    const key = urlParts.pathname.substring(1); // Remove leading slash
+    
+    const getCommand = new GetObjectCommand({
+      Bucket: S3_BUCKET_NAME,
+      Key: key
+    });
+    
+    const downloadUrl = await getSignedUrl(s3, getCommand, { expiresIn: 3600 }); // 1 hour
+    
+    res.json({ downloadUrl });
+  } catch (err) {
+    console.error("Get download URL error:", err);
+    res.status(500).json({ error: "Failed to get download URL" });
+  }
+});
+
+// --- Content Moderation Endpoints ---
+
+// Report content
+app.post("/api/reports", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { contentType, contentId, reason, description } = req.body;
+    
+    if (!contentType || !contentId || !reason) {
+      return res.status(400).json({ error: "Content type, content ID, and reason are required" });
+    }
+    
+    // Check if user already reported this content
+    const { rows: existingRows } = await pool.query(
+      "SELECT * FROM content_reports WHERE reporter_id = $1 AND content_type = $2 AND content_id = $3",
+      [userId, contentType, contentId]
+    );
+    
+    if (existingRows.length > 0) {
+      return res.status(400).json({ error: "You have already reported this content" });
+    }
+    
+    // Create report
+    const { rows } = await pool.query(
+      `INSERT INTO content_reports (reporter_id, content_type, content_id, reason, description, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING *`,
+      [userId, contentType, contentId, reason, description || null]
+    );
+    
+    const report = rows[0];
+    
+    res.json({ message: "Content reported successfully", report });
+  } catch (err) {
+    console.error("Report content error:", err);
+    res.status(500).json({ error: "Failed to report content" });
+  }
+});
+
+// Get content reports (admin only)
+app.get("/api/reports", adminMiddleware, async (req, res) => {
+  try {
+    const { status = 'pending', limit = 20, offset = 0 } = req.query;
+    
+    const { rows } = await pool.query(
+      `SELECT cr.*, u.username as reporter_username, u.profile_url as reporter_profile_url
+       FROM content_reports cr
+       JOIN users u ON cr.reporter_id = u.id
+       WHERE cr.status = $1
+       ORDER BY cr.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [status, limit, offset]
+    );
+    
+    res.json({ reports: rows });
+  } catch (err) {
+    console.error("Get reports error:", err);
+    res.status(500).json({ error: "Failed to get reports" });
+  }
+});
+
+// Take moderation action (admin only)
+app.post("/api/moderation/actions", adminMiddleware, async (req, res) => {
+  try {
+    const moderatorId = req.admin.id; // In a real implementation, you'd get this from a logged-in admin
+    const { targetUserId, contentType, contentId, action, reason, duration } = req.body;
+    
+    if (!targetUserId || !action || !reason) {
+      return res.status(400).json({ error: "Target user ID, action, and reason are required" });
+    }
+    
+    // Create moderation action record
+    const { rows } = await pool.query(
+      `INSERT INTO moderation_actions (moderator_id, target_user_id, content_type, content_id, action, reason, duration, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       RETURNING *`,
+      [moderatorId, targetUserId, contentType || null, contentId || null, action, reason, duration || null]
+    );
+    
+    const moderationAction = rows[0];
+    
+    // Apply action based on type
+    switch (action) {
+      case 'remove_content':
+        if (contentType && contentId) {
+          switch (contentType) {
+            case 'video':
+              await pool.query("UPDATE videos SET is_public = false WHERE id = $1", [contentId]);
+              break;
+            case 'music':
+              await pool.query("DELETE FROM music WHERE id = $1", [contentId]);
+              break;
+            case 'comment':
+              await pool.query("UPDATE comments SET is_deleted = true WHERE id = $1", [contentId]);
+              break;
+          }
+        }
+        break;
+        
+      case 'suspend_user':
+        const suspendUntil = duration ? new Date(Date.now() + duration * 24 * 60 * 60 * 1000) : null;
+        await pool.query(
+          "UPDATE users SET status = 'suspended', suspend_until = $1, suspension_reason = $2 WHERE id = $3",
+          [suspendUntil, reason, targetUserId]
+        );
+        break;
+        
+      case 'ban_user':
+        await pool.query(
+          "UPDATE users SET status = 'banned', suspension_reason = $1 WHERE id = $2",
+          [reason, targetUserId]
+        );
+        break;
+    }
+    
+    // Update report status if applicable
+    if (contentType && contentId) {
+      await pool.query(
+        "UPDATE content_reports SET status = 'resolved', updated_at = NOW() WHERE content_type = $1 AND content_id = $2",
+        [contentType, contentId]
+      );
+    }
+    
+    res.json({ message: "Moderation action applied successfully", action: moderationAction });
+  } catch (err) {
+    console.error("Take moderation action error:", err);
+    res.status(500).json({ error: "Failed to take moderation action" });
+  }
+});
+
+// --- Content Filter Endpoints ---
+
+// Get user's content filters
+app.get("/api/filters", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    const { rows } = await pool.query(
+      "SELECT * FROM content_filters WHERE user_id = $1 AND is_active = true",
+      [userId]
+    );
+    
+    res.json({ filters: rows });
+  } catch (err) {
+    console.error("Get content filters error:", err);
+    res.status(500).json({ error: "Failed to get content filters" });
+  }
+});
+
+// Create content filter
+app.post("/api/filters", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { filterType, filterValue } = req.body;
+    
+    if (!filterType || !filterValue) {
+      return res.status(400).json({ error: "Filter type and value are required" });
+    }
+    
+    // Check if filter already exists
+    const { rows: existingRows } = await pool.query(
+      "SELECT * FROM content_filters WHERE user_id = $1 AND filter_type = $2 AND filter_value = $3",
+      [userId, filterType, filterValue]
+    );
+    
+    if (existingRows.length > 0) {
+      return res.status(400).json({ error: "Filter already exists" });
+    }
+    
+    // Create filter
+    const { rows } = await pool.query(
+      `INSERT INTO content_filters (user_id, filter_type, filter_value, created_at)
+       VALUES ($1, $2, $3, NOW())
+       RETURNING *`,
+      [userId, filterType, filterValue]
+    );
+    
+    const filter = rows[0];
+    
+    res.json({ message: "Filter created successfully", filter });
+  } catch (err) {
+    console.error("Create content filter error:", err);
+    res.status(500).json({ error: "Failed to create content filter" });
+  }
+});
+
+// Delete content filter
+app.delete("/api/filters/:id", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    
+    // Check if filter exists and belongs to user
+    const { rows } = await pool.query(
+      "SELECT * FROM content_filters WHERE id = $1 AND user_id = $2",
+      [id, userId]
+    );
+    
+    if (rows.length === 0) return res.status(404).json({ error: "Filter not found" });
+    
+    // Delete filter
+    await pool.query("DELETE FROM content_filters WHERE id = $1", [id]);
+    
+    res.json({ message: "Filter deleted successfully" });
+  } catch (err) {
+    console.error("Delete content filter error:", err);
+    res.status(500).json({ error: "Failed to delete content filter" });
+  }
+});
+
+// --- Socket.IO Setup ---
+
+const server = http.createServer(app);
+const io = new SocketServer(server, { 
+  cors: { 
+    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    methods: ["GET", "POST"]
+  } 
+});
+
+// Socket authentication
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth.token;
+    if (!token) return next(new Error("Authentication error"));
+    
+    const decoded = jwt.verify(token, JWT_SECRET);
+    socket.userId = decoded.id;
+    next();
+  } catch (err) {
+    next(new Error("Authentication error"));
+  }
+});
+
+io.on("connection", (socket) => {
+  console.log(`Socket connected: ${socket.id} (User: ${socket.userId})`);
+  
+  // Join user-specific room
+  socket.join(`user-${socket.userId}`);
+  
+  // Join streamer room if user is a streamer
+  pool.query("SELECT * FROM users WHERE id = $1 AND (is_creator = true OR is_musician = true)", [socket.userId])
+    .then(({ rows }) => {
+      if (rows.length > 0) {
+        socket.join(`streamer-${socket.userId}`);
+      }
+    })
+    .catch(err => console.error("Error checking if user is streamer:", err));
+  
+  // Handle joining a livestream
+  socket.on("join-stream", async (data) => {
+    try {
+      const { streamId } = data;
+      
+      // Check if stream exists and is live
+      const { rows } = await pool.query(
+        "SELECT * FROM livestreams WHERE id = $1 AND is_live = true",
+        [streamId]
+      );
+      
+      if (rows.length === 0) return socket.emit("error", "Stream not found or not live");
+      
+      const stream = rows[0];
+      
+      // Join stream room
+      socket.join(`stream-${streamId}`);
+      
+      // Increment viewer count
+      await pool.query(
+        "UPDATE livestreams SET viewers = viewers + 1 WHERE id = $1",
+        [streamId]
+      );
+      
+      // Get updated viewer count
+      const { rows: updatedStream } = await pool.query(
+        "SELECT viewers FROM livestreams WHERE id = $1",
+        [streamId]
+      );
+      
+      // Notify all clients in the stream
+      io.to(`stream-${streamId}`).emit("viewer-count-updated", {
+        streamId,
+        viewers: updatedStream[0].viewers
+      });
+      
+      // Notify streamer
+      io.to(`streamer-${stream.user_id}`).emit("viewer-joined", {
+        userId: socket.userId,
+        viewers: updatedStream[0].viewers
+      });
+      
+      // Send current viewer count to the user
+      socket.emit("joined-stream", {
+        streamId,
+        viewers: updatedStream[0].viewers
+      });
+    } catch (err) {
+      console.error("Error joining stream:", err);
+      socket.emit("error", "Failed to join stream");
+    }
+  });
+  
+  // Handle leaving a livestream
+  socket.on("leave-stream", async (data) => {
+    try {
+      const { streamId } = data;
+      
+      // Leave stream room
+      socket.leave(`stream-${streamId}`);
+      
+      // Check if stream exists
+      const { rows } = await pool.query(
+        "SELECT * FROM livestreams WHERE id = $1",
+        [streamId]
+      );
+      
+      if (rows.length === 0) return;
+      
+      const stream = rows[0];
+      
+      // Decrement viewer count
+      await pool.query(
+        "UPDATE livestreams SET viewers = GREATEST(viewers - 1, 0) WHERE id = $1",
+        [streamId]
+      );
+      
+      // Get updated viewer count
+      const { rows: updatedStream } = await pool.query(
+        "SELECT viewers FROM livestreams WHERE id = $1",
+        [streamId]
+      );
+      
+      // Notify all clients in the stream
+      io.to(`stream-${streamId}`).emit("viewer-count-updated", {
+        streamId,
+        viewers: updatedStream[0].viewers
+      });
+      
+      // Notify streamer
+      io.to(`streamer-${stream.user_id}`).emit("viewer-left", {
+        userId: socket.userId,
+        viewers: updatedStream[0].viewers
+      });
+    } catch (err) {
+      console.error("Error leaving stream:", err);
+    }
+  });
+  
+  // Handle sending chat message in stream
+  socket.on("stream-chat", async (data) => {
+    try {
+      const { streamId, message } = data;
+      
+      if (!message || message.trim() === "") return;
+      
+      // Check if stream exists and is live
+      const { rows } = await pool.query(
+        "SELECT * FROM livestreams WHERE id = $1 AND is_live = true",
+        [streamId]
+      );
+      
+      if (rows.length === 0) return socket.emit("error", "Stream not found or not live");
+      
+      const stream = rows[0];
+      
+      // Get user info
+      const { rows: userRows } = await pool.query(
+        "SELECT username, profile_url FROM users WHERE id = $1",
+        [socket.userId]
+      );
+      
+      if (userRows.length === 0) return;
+      
+      const user = userRows[0];
+      
+      // Create chat message
+      const chatMessage = {
+        id: uuidv4(),
+        userId: socket.userId,
+        username: user.username,
+        profileUrl: user.profile_url,
+        message,
+        timestamp: new Date()
+      };
+      
+      // Broadcast to all clients in the stream
+      io.to(`stream-${streamId}`).emit("stream-chat-message", chatMessage);
+      
+      // Save message to database (optional)
+      // In a real implementation, you might want to save chat messages
+    } catch (err) {
+      console.error("Error sending stream chat message:", err);
+      socket.emit("error", "Failed to send message");
+    }
+  });
+  
+  // Handle sending a reaction in stream
+  socket.on("stream-reaction", async (data) => {
+    try {
+      const { streamId, emoji } = data;
+      
+      // Check if stream exists and is live
+      const { rows } = await pool.query(
+        "SELECT * FROM livestreams WHERE id = $1 AND is_live = true",
+        [streamId]
+      );
+      
+      if (rows.length === 0) return;
+      
+      // Broadcast to all clients in the stream
+      io.to(`stream-${streamId}`).emit("stream-reaction", {
+        userId: socket.userId,
+        emoji,
+        timestamp: new Date()
+      });
+    } catch (err) {
+      console.error("Error sending stream reaction:", err);
+    }
+  });
+  
+  // Handle sending a donation in stream
+  socket.on("stream-donation", async (data) => {
+    try {
+      const { streamId, amount, message } = data;
+      
+      if (!amount || amount <= 0) return;
+      
+      // Check if stream exists and is live
+      const { rows } = await pool.query(
+        "SELECT * FROM livestreams WHERE id = $1 AND is_live = true",
+        [streamId]
+      );
+      
+      if (rows.length === 0) return socket.emit("error", "Stream not found or not live");
+      
+      const stream = rows[0];
+      
+      // Get user's wallet balance
+      const { rows: walletRows } = await pool.query(
+        "SELECT coins FROM wallets WHERE user_id = $1",
+        [socket.userId]
+      );
+      
+      const balance = walletRows[0]?.coins || 0;
+      
+      if (balance < amount) return socket.emit("error", "Insufficient balance");
+      
+      // Deduct from user's wallet
+      await pool.query(
+        "UPDATE wallets SET coins = coins - $1, last_updated = NOW() WHERE user_id = $2",
+        [amount, socket.userId]
+      );
+      
+      // Add to streamer's wallet
+      await pool.query(
+        `INSERT INTO wallets (user_id, coins, last_updated)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (user_id) 
+         DO UPDATE SET coins = wallets.coins + $2, last_updated = NOW()`,
+        [stream.user_id, amount]
+      );
+      
+      // Record transaction
+      await pool.query(
+        "INSERT INTO coin_transactions (user_id, amount, type, description, created_at) VALUES ($1, $2, 'spend', $3, NOW())",
+        [socket.userId, -amount, `Donation to ${stream.user_id}`]
+      );
+      
+      await pool.query(
+        "INSERT INTO coin_transactions (user_id, amount, type, description, created_at) VALUES ($1, $2, 'tip_received', $3, NOW())",
+        [stream.user_id, amount, `Donation from ${socket.userId}`]
+      );
+      
+      // Update creator stats
+      await pool.query(
+        `UPDATE creator_stats 
+         SET total_tips = COALESCE(total_tips, 0) + $1, updated_at = NOW() 
+         WHERE user_id = $1`,
+        [stream.user_id, amount]
+      );
+      
+      // Get user info
+      const { rows: userRows } = await pool.query(
+        "SELECT username, profile_url FROM users WHERE id = $1",
+        [socket.userId]
+      );
+      
+      if (userRows.length === 0) return;
+      
+      const user = userRows[0];
+      
+      // Create donation notification
+      const donation = {
+        id: uuidv4(),
+        userId: socket.userId,
+        username: user.username,
+        profileUrl: user.profile_url,
+        amount,
+        message: message || "",
+        timestamp: new Date()
+      };
+      
+      // Broadcast to all clients in the stream
+      io.to(`stream-${streamId}`).emit("stream-donation", donation);
+      
+      // Notify streamer
+      io.to(`streamer-${stream.user_id}`).emit("donation-received", donation);
+      
+      // Create notification
+      await pool.query(
+        `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
+         VALUES ($1, $2, 'donation', 'New Donation', '$3 donated $4 to your stream', $5, NOW())`,
+        [
+          stream.user_id,
+          socket.userId,
+          user.username,
+          amount,
+          JSON.stringify({ amount, message: message || "" })
+        ]
+      );
+    } catch (err) {
+      console.error("Error sending stream donation:", err);
+      socket.emit("error", "Failed to send donation");
+    }
+  });
+  
+  // Handle disconnect
+  socket.on("disconnect", () => {
+    console.log(`Socket disconnected: ${socket.id} (User: ${socket.userId})`);
+  });
+});
+
+// --- Start Server ---
+
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  
+  // Update trending scores on startup
+  setTimeout(() => {
+    recommendationEngine.updateTrendingScores();
+  }, 5000);
+});
