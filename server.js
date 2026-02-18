@@ -33,6 +33,9 @@ import { createHmac } from "crypto";
 import { Worker } from "worker_threads";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
+// server.js or index.js
+require('dotenv').config();
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -792,6 +795,89 @@ export const upload = multer({
   }
 });
 
+// Place this BEFORE express.json() middleware
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.log(`Webhook signature verification failed.`, err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle the event
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      const paymentIntent = event.data.object;
+      const { viewerId, creatorId, paymentType } = paymentIntent.metadata;
+      
+      console.log(`PaymentIntent for ${paymentIntent.amount} was successful!`);
+      
+      // --- YOUR BUSINESS LOGIC ---
+      // 1. Update your database
+      await pool.query(
+        "INSERT INTO money_transactions (user_id, payment_intent_id, amount, status, type, created_at) VALUES ($1, $2, $3, $4, $5, NOW())",
+        [viewerId, paymentIntent.id, paymentIntent.amount / 100, 'succeeded', paymentType]
+      );
+      
+      // 2. Grant access to content, record donation, etc.
+      if (paymentType === 'video_purchase') {
+        // Grant viewer access to the video
+      } else if (paymentType === 'donation') {
+        // You already handled the coin deduction in your socket handler,
+        // but you could add a record here for real-money donations.
+      }
+      
+      // 3. Send notifications
+      io.to(`user-${creatorId}`).emit("payment-received", {
+        from: viewerId,
+        amount: paymentIntent.amount,
+        type: paymentType
+      });
+      break;
+
+    case 'account.updated':
+      // A creator completed or updated their onboarding
+      const account = event.data.object;
+      if (account.payouts_enabled) {
+        console.log(`Creator ${account.id} can now receive payouts!`);
+        // Update your database to reflect this
+        await pool.query(
+          "UPDATE users SET stripe_payouts_enabled = true WHERE stripe_account_id = $1",
+          [account.id]
+        );
+      }
+      break;
+
+    // ... handle other event types
+    default:
+      console.log(`Unhandled event type ${event.type}`);
+  }
+
+  // Return a 200 response to acknowledge receipt of the event
+  res.json({ received: true });
+});
+
+// Example: Taking a 10% platform fee
+const platformFeePercent = 0.10;
+const platformFeeAmount = Math.floor(amount * platformFeePercent);
+const creatorPayoutAmount = amount - platformFeeAmount;
+
+const paymentIntent = await stripe.paymentIntents.create({
+  amount: amount, // The full amount is charged to the customer
+  currency: 'usd',
+  // ... metadata
+  transfer_data: {
+    destination: rows[0].stripe_account_id,
+    amount: creatorPayoutAmount, // Only transfer the creator's share
+  },
+  application_fee_amount: platformFeeAmount, // Explicitly record your fee
+});
+
+
+
 app.use(passport.initialize());
 app.use(passport.session());
 
@@ -1154,6 +1240,129 @@ class RecommendationEngine {
          WHERE c.id = ANY($1)`,
         [contentIds]
       );
+
+      // POST /api/stripe/create-payment-intent
+app.post("/api/stripe/create-payment-intent", authMiddleware, async (req, res) => {
+  try {
+    const { amount, currency = 'usd', creatorId, paymentType } = req.body; // amount in cents
+    const viewerId = req.user.id;
+
+    // Get the creator's Stripe account ID
+    const { rows } = await pool.query(
+      "SELECT stripe_account_id FROM users WHERE id = $1",
+      [creatorId]
+    );
+
+    if (!rows[0]?.stripe_account_id) {
+      return res.status(400).json({ error: "Creator does not have a payment account" });
+    }
+
+    // Create the PaymentIntent
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount,
+      currency,
+      metadata: {
+        viewerId,
+        creatorId,
+        paymentType, // e.g., 'video_purchase', 'donation'
+      },
+      // This is the magic for Stripe Connect!
+      // It tells Stripe to hold the funds for a transfer.
+      transfer_data: {
+        destination: rows[0].stripe_account_id,
+        // You can take a platform fee here. e.g., 10%:
+        // amount: Math.floor(amount * 0.90), // Transfer 90% to creator
+      },
+    });
+
+    res.json({
+      clientSecret: paymentIntent.client_secret,
+    });
+  } catch (err) {
+    console.error("Error creating payment intent:", err);
+    res.status(500).json({ error: "Failed to create payment intent" });
+  }
+});
+
+      // POST /api/stripe/create-login-link
+app.post("/api/stripe/create-login-link", authMiddleware, async (req, res) => {
+  try {
+    const creatorId = req.user.id;
+
+    // Get the user's Stripe account ID from your DB
+    const { rows } = await pool.query(
+      "SELECT stripe_account_id FROM users WHERE id = $1",
+      [creatorId]
+    );
+
+    if (!rows[0]?.stripe_account_id) {
+      return res.status(404).json({ error: "Stripe account not found" });
+    }
+
+    // Create a login link
+    const loginLink = await stripe.accounts.createLoginLink(
+      rows[0].stripe_account_id
+    );
+
+    res.json({ url: loginLink.url });
+  } catch (err) {
+    console.error("Error creating Stripe login link:", err);
+    res.status(500).json({ error: "Failed to create login link" });
+  }
+});
+
+      // POST /api/stripe/create-account
+app.post("/api/stripe/create-account", authMiddleware, async (req, res) => {
+  try {
+    const creatorId = req.user.id;
+
+    // Check if the user already has a Stripe account
+    const { rows } = await pool.query(
+      "SELECT stripe_account_id FROM users WHERE id = $1",
+      [creatorId]
+    );
+    if (rows[0]?.stripe_account_id) {
+      return res.status(400).json({ error: "User already has a Stripe account" });
+    }
+
+    // Create an Express account
+    const account = await stripe.accounts.create({
+      type: 'express',
+      country: 'US', // Adjust based on your platform's default country
+      email: req.user.email,
+      capabilities: {
+        card_payments: { requested: true },
+        transfers: { requested: true },
+      },
+      business_type: 'individual', // Or 'company'
+    });
+
+    // Save the new account ID to your database
+    await pool.query(
+      "UPDATE users SET stripe_account_id = $1 WHERE id = $2",
+      [account.id, creatorId]
+    );
+
+    // Create an Account Link for the creator to onboard
+    const accountLink = await stripe.accountLinks.create({
+      account: account.id,
+      refresh_url: `${process.env.FRONTEND_URL}/reauth-stripe`, // If the link expires
+      return_url: `${process.env.FRONTEND_URL}/dashboard`, // Where to go after success
+      type: 'account_onboarding',
+    });
+
+    // Send the URL to the frontend so the creator can complete onboarding
+    res.json({ url: accountLink.url });
+
+  } catch (err) {
+    console.error("Error creating Stripe account:", err);
+    res.status(500).json({ error: "Failed to create payment account" });
+  }
+});
+
+      
+
+
 
       // Map scores to content details
       const contentMap = new Map(contentDetails.map(c => [c.id, c]));
