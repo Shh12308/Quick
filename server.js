@@ -24,6 +24,16 @@ import helmet from "helmet";
 app.use(helmet());
 import rateLimit from "express-rate-limit";
 import axios from "axios";
+import { createClient } from "redis";
+import { createAdapter } from "@socket.io/redis-adapter";
+
+const pubClient = createClient({ url: process.env.REDIS_URL });
+const subClient = pubClient.duplicate();
+
+await pubClient.connect();
+await subClient.connect();
+
+io.adapter(createAdapter(pubClient, subClient));
 import OpenAI from "openai";
 import FormData from "form-data";
 import Redis from "ioredis";
@@ -749,6 +759,25 @@ await pool.query("CREATE INDEX IF NOT EXISTS idx_email_confirmations_token ON em
   }
 }
 
+function generateAgoraToken(channelName, userId) {
+  const appId = process.env.AGORA_APP_ID;
+  const appCertificate = process.env.AGORA_APP_CERT;
+
+  const role = RtcRole.PUBLISHER;
+  const expirationTimeInSeconds = 3600;
+  const currentTimestamp = Math.floor(Date.now() / 1000);
+  const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+  return RtcTokenBuilder.buildTokenWithUid(
+    appId,
+    appCertificate,
+    channelName,
+    userId,
+    role,
+    privilegeExpiredTs
+  );
+}
+
 // Initialize tables on server start
 initializeTables();
 
@@ -797,6 +826,11 @@ export const upload = multer({
     }
   }
 });
+
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 500
+}));
 
 // Place this BEFORE express.json() middleware
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
