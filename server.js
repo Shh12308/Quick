@@ -20,6 +20,9 @@ import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } fro
 import os from "os";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
+import helmet from "helmet";
+app.use(helmet());
+import rateLimit from "express-rate-limit";
 import axios from "axios";
 import OpenAI from "openai";
 import FormData from "form-data";
