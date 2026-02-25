@@ -3161,6 +3161,20 @@ app.post("/api/livestreams/:id/end", authMiddleware, async (req, res) => {
   }
 });
 
+// Node.js example
+app.post("/group/rename", authMiddleware, async (req,res)=>{
+  const { groupId, newName } = req.body;
+  // verify requester is admin
+  await db.query("UPDATE groups SET group_name=$1 WHERE id=$2", [newName, groupId]);
+  io.to(`group:${groupId}`).emit("group_renamed", { groupId, newName });
+  res.json({ success: true });
+});
+
+io.to(`group:${groupId}`).emit("user_status_change", {
+  userId,
+  status: "left" | "banned" | "deleted" | "blocked"
+});
+
 // Get active livestreams
 app.get("/api/livestreams/active", async (req, res) => {
   try {
