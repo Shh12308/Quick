@@ -2349,543 +2349,2092 @@ app.post("/api/profile/update", authMiddleware, async (req, res) => {
 
 // --- Video Endpoints ---
 
-// Upload video
-app.post("/api/videos/upload", authMiddleware, upload.single("video"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No video file provided" });
-    
-    const userId = req.user.id;
-    const { title, description, tags, category, isShort = false, isPublic = true } = req.body;
-    
-    if (!title) return res.status(400).json({ error: "Title is required" });
-    
-    // Upload video to S3
-    const videoKey = `videos/${userId}/${Date.now()}-${req.file.originalname}`;
-    const videoUrl = await contentProcessor.uploadToS3(req.file.path, videoKey);
-    
-    // Create video record
-    const { rows } = await pool.query(
-      `INSERT INTO videos 
-       (user_id, title, description, video_url, tags, category, is_short, is_public, processing_status, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW())
-       RETURNING *`,
-      [
-        userId,
-        title,
-        description || null,
-        videoUrl,
-        tags ? JSON.stringify(tags) : null,
-        category || null,
-        isShort,
-        isPublic
-      ]
-    );
-    
-    const video = rows[0];
-    
-    // Start processing video in background
-    contentProcessor.processVideo(video.id)
-      .then(result => {
-        console.log(`Video ${video.id} processed successfully:`, result);
-      })
-      .catch(error => {
-        console.error(`Error processing video ${video.id}:`, error);
-      });
-    
-    // Update creator stats
-    await ensureCreatorStats(userId);
-    
-    res.json({ message: "Video uploaded successfully", video });
-  } catch (err) {
-    console.error("Video upload error:", err);
-    res.status(500).json({ error: "Video upload failed" });
-  }
+const { body, param, query, validationResult } = require('express-validator');
+const rateLimit = require('express-rate-limit');
+
+// Rate limiting configuration
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // Limit each IP to 5 uploads per window
+  message: 'Too many upload attempts, please try again later',
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
-// Get video by ID
-app.get("/api/videos/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
+const interactionLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 30, // Limit each IP to 30 interactions per minute
+  message: 'Too many interactions, please try again later',
+});
+
+// Validation middleware
+const handleValidationErrors = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({
+      error: 'Validation failed',
+      details: errors.array()
+    });
+  }
+  next();
+};
+
+// Upload video with comprehensive validation and error handling
+app.post("/api/videos/upload", 
+  authMiddleware,
+  uploadLimiter,
+  upload.single("video"),
+  [
+    body('title').trim().isLength({ min: 1, max: 100 }).withMessage('Title must be 1-100 characters'),
+    body('description').optional().trim().isLength({ max: 500 }).withMessage('Description must be less than 500 characters'),
+    body('tags').optional().isArray().withMessage('Tags must be an array'),
+    body('tags.*').optional().trim().isLength({ min: 1, max: 30 }).withMessage('Each tag must be 1-30 characters'),
+    body('category').optional().trim().isLength({ max: 50 }).withMessage('Category must be less than 50 characters'),
+    body('isShort').optional().isBoolean().withMessage('isShort must be boolean'),
+    body('isPublic').optional().isBoolean().withMessage('isPublic must be boolean'),
+    body('ageRestriction').optional().isIn(['none', 'mild', 'restricted']).withMessage('Invalid age restriction'),
+    body('language').optional().isLength({ min: 2, max: 5 }).withMessage('Invalid language code'),
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    const client = await pool.connect();
     
-    // Increment view count
-    await pool.query(
-      "UPDATE videos SET views = views + 1 WHERE id = $1",
-      [id]
-    );
-    
-    // Get video details
-    const { rows } = await pool.query(
-      `SELECT v.*, u.username, u.profile_url 
-       FROM videos v 
-       JOIN users u ON v.user_id = u.id 
-       WHERE v.id = $1 AND v.is_public = true`,
-      [id]
-    );
-    
-    if (rows.length === 0) return res.status(404).json({ error: "Video not found" });
-    
-    const video = rows[0];
-    
-    // Record view history if user is authenticated
-    if (req.headers.authorization) {
-      try {
-        const token = req.headers.authorization.split(" ")[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-        
-        await pool.query(
-          `INSERT INTO watch_history (user_id, content_type, content_id, created_at)
-           VALUES ($1, 'video', $2, NOW())
-           ON CONFLICT (user_id, content_type, content_id) 
-           DO UPDATE SET created_at = NOW()`,
-          [decoded.id, id]
-        );
-      } catch (err) {
-        // Invalid token, ignore
+    try {
+      await client.query('BEGIN');
+      
+      if (!req.file) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: "No video file provided" });
       }
-    }
-    
-    res.json({ video });
-  } catch (err) {
-    console.error("Get video error:", err);
-    res.status(500).json({ error: "Failed to get video" });
-  }
-});
-
-// Get videos for a user
-app.get("/api/users/:userId/videos", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { limit = 20, offset = 0 } = req.query;
-    
-    const { rows } = await pool.query(
-      `SELECT v.*, u.username, u.profile_url 
-       FROM videos v 
-       JOIN users u ON v.user_id = u.id 
-       WHERE v.user_id = $1 AND v.is_public = true AND v.processing_status = 'completed'
-       ORDER BY v.created_at DESC 
-       LIMIT $2 OFFSET $3`,
-      [userId, limit, offset]
-    );
-    
-    res.json({ videos: rows });
-  } catch (err) {
-    console.error("Get user videos error:", err);
-    res.status(500).json({ error: "Failed to get user videos" });
-  }
-});
-
-// Get recommended videos (For You Page)
-app.get("/api/videos/recommended", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { limit = 20 } = req.query;
-    
-    const recommendations = await recommendationEngine.generateRecommendations(userId, 'video', limit);
-    
-    res.json({ videos: recommendations });
-  } catch (err) {
-    console.error("Get recommended videos error:", err);
-    res.status(500).json({ error: "Failed to get recommended videos" });
-  }
-});
-
-// Get trending videos
-app.get("/api/videos/trending", async (req, res) => {
-  try {
-    const { limit = 20, period = 'day' } = req.query;
-    
-    const { rows } = await pool.query(
-      `SELECT v.*, u.username, u.profile_url 
-       FROM videos v 
-       JOIN users u ON v.user_id = u.id 
-       JOIN trending t ON v.id = t.content_id 
-       WHERE t.content_type = 'video' AND t.period = $1 AND v.is_public = true AND v.processing_status = 'completed'
-       ORDER BY t.score DESC 
-       LIMIT $2`,
-      [period, limit]
-    );
-    
-    res.json({ videos: rows });
-  } catch (err) {
-    console.error("Get trending videos error:", err);
-    res.status(500).json({ error: "Failed to get trending videos" });
-  }
-});
-
-// Like/unlike video
-app.post("/api/videos/:id/like", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { id } = req.params;
-    const { action } = req.body; // 'like' or 'unlike'
-    
-    // Check if video exists
-    const { rows: videoRows } = await pool.query(
-      "SELECT * FROM videos WHERE id = $1",
-      [id]
-    );
-    
-    if (videoRows.length === 0) return res.status(404).json({ error: "Video not found" });
-    
-    const video = videoRows[0];
-    
-    // Check if user already liked this video
-    const { rows: likeRows } = await pool.query(
-      "SELECT * FROM likes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
-      [userId, id]
-    );
-    
-    const alreadyLiked = likeRows.length > 0;
-    
-    if (action === 'like' && !alreadyLiked) {
-      // Add like
-      await pool.query(
-        "INSERT INTO likes (user_id, content_type, content_id, created_at) VALUES ($1, 'video', $2, NOW())",
-        [userId, id]
+      
+      // Validate file
+      const allowedMimeTypes = ['video/mp4', 'video/webm', 'video/ogg', 'video/quicktime'];
+      if (!allowedMimeTypes.includes(req.file.mimetype)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: "Invalid video file type" });
+      }
+      
+      const maxSize = 2 * 1024 * 1024 * 1024; // 2GB
+      if (req.file.size > maxSize) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: "Video file too large (max 2GB)" });
+      }
+      
+      const userId = req.user.id;
+      const { 
+        title, 
+        description, 
+        tags, 
+        category, 
+        isShort = false, 
+        isPublic = true,
+        ageRestriction = 'none',
+        language = 'en'
+      } = req.body;
+      
+      // Check user's upload quota
+      const { rows: userStats } = await client.query(
+        'SELECT upload_quota_used, upload_quota_limit FROM creator_stats WHERE user_id = $1',
+        [userId]
       );
       
-      // Update video likes count
-      await pool.query(
-        "UPDATE videos SET likes = likes + 1 WHERE id = $1",
+      if (userStats.length > 0 && userStats[0].upload_quota_used >= userStats[0].upload_quota_limit) {
+        await client.query('ROLLBACK');
+        return res.status(429).json({ error: "Upload quota exceeded" });
+      }
+      
+      // Generate unique video key
+      const videoKey = `videos/${userId}/${Date.now()}-${req.file.originalname}`;
+      
+      // Upload video to S3 with metadata
+      const videoUrl = await contentProcessor.uploadToS3(req.file.path, videoKey, {
+        contentType: req.file.mimetype,
+        metadata: {
+          originalName: req.file.originalname,
+          uploadedBy: userId,
+          title: title,
+          category: category || 'general'
+        }
+      });
+      
+      // Create video record with additional fields
+      const { rows } = await client.query(
+        `INSERT INTO videos 
+         (user_id, title, description, video_url, video_key, tags, category, 
+          is_short, is_public, age_restriction, language, processing_status, 
+          file_size, duration, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, NULL, NOW())
+         RETURNING *`,
+        [
+          userId,
+          title,
+          description || null,
+          videoUrl,
+          videoKey,
+          tags ? JSON.stringify(tags) : null,
+          category || null,
+          isShort,
+          isPublic,
+          ageRestriction,
+          language,
+          req.file.size
+        ]
+      );
+      
+      const video = rows[0];
+      
+      // Update upload quota
+      await client.query(
+        `UPDATE creator_stats 
+         SET upload_quota_used = upload_quota_used + $1, 
+             videos_count = videos_count + 1,
+             updated_at = NOW()
+         WHERE user_id = $2`,
+        [req.file.size, userId]
+      );
+      
+      await client.query('COMMIT');
+      
+      // Start processing video in background with error handling
+      contentProcessor.processVideo(video.id)
+        .then(async (result) => {
+          console.log(`Video ${video.id} processed successfully:`, result);
+          
+          // Update video with processing results
+          await pool.query(
+            `UPDATE videos 
+             SET processing_status = 'completed',
+                 duration = $1,
+                 thumbnail_url = $2,
+                 resolution = $3,
+                 file_size = $4,
+                 processed_at = NOW()
+             WHERE id = $5`,
+            [result.duration, result.thumbnailUrl, result.resolution, result.fileSize, video.id]
+          );
+          
+          // Update trending scores
+          await updateTrendingScores(video.id, 'video');
+        })
+        .catch(async (error) => {
+          console.error(`Error processing video ${video.id}:`, error);
+          
+          // Update video with error status
+          await pool.query(
+            `UPDATE videos 
+             SET processing_status = 'failed',
+                 error_message = $1,
+                 processed_at = NOW()
+             WHERE id = $2`,
+            [error.message, video.id]
+          );
+        });
+      
+      // Clean up temporary file
+      fs.unlink(req.file.path, (err) => {
+        if (err) console.error('Failed to clean up temp file:', err);
+      });
+      
+      res.status(201).json({ 
+        message: "Video uploaded successfully", 
+        video: {
+          id: video.id,
+          title: video.title,
+          status: 'processing',
+          uploadDate: video.created_at
+        }
+      });
+      
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error("Video upload error:", err);
+      
+      // Clean up on error
+      if (req.file && req.file.path) {
+        fs.unlink(req.file.path, () => {});
+      }
+      
+      res.status(500).json({ 
+        error: "Video upload failed",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Get video by ID with enhanced features
+app.get("/api/videos/:id", 
+  [
+    param('id').isInt().withMessage('Invalid video ID'),
+    query('includeRecommendations').optional().isBoolean().withMessage('includeRecommendations must be boolean')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { includeRecommendations = false } = req.query;
+      
+      // Get video with detailed information
+      const { rows } = await pool.query(
+        `SELECT v.*, 
+                u.username, 
+                u.profile_url,
+                u.verified,
+                u.subscriber_count,
+                cs.total_views,
+                cs.total_likes
+         FROM videos v 
+         JOIN users u ON v.user_id = u.id 
+         LEFT JOIN creator_stats cs ON u.id = cs.user_id
+         WHERE v.id = $1 AND v.is_public = true AND v.processing_status = 'completed'`,
         [id]
       );
       
-      // Update creator stats
+      if (rows.length === 0) {
+        return res.status(404).json({ error: "Video not found or not available" });
+      }
+      
+      const video = rows[0];
+      
+      // Check age restriction
+      let userAge = null;
+      let userId = null;
+      
+      if (req.headers.authorization) {
+        try {
+          const token = req.headers.authorization.split(" ")[1];
+          const decoded = jwt.verify(token, JWT_SECRET);
+          userAge = decoded.age;
+          userId = decoded.id;
+          
+          // Record view history for authenticated users
+          await pool.query(
+            `INSERT INTO watch_history (user_id, content_type, content_id, created_at)
+             VALUES ($1, 'video', $2, NOW())
+             ON CONFLICT (user_id, content_type, content_id) 
+             DO UPDATE SET created_at = NOW(), watch_count = watch_history.watch_count + 1`,
+            [userId, id]
+          );
+          
+          // Check if user has liked/disliked this video
+          const { rows: reactions } = await pool.query(
+            `SELECT reaction_type FROM content_reactions 
+             WHERE user_id = $1 AND content_id = $2 AND content_type = 'video'`,
+            [userId, id]
+          );
+          
+          video.userReaction = reactions.length > 0 ? reactions[0].reaction_type : null;
+          
+        } catch (err) {
+          // Invalid token, continue as anonymous
+        }
+      }
+      
+      // Age restriction check
+      if (video.age_restriction !== "none") {
+        if (!userAge) {
+          return res.status(403).json({ 
+            error: "Age-restricted content",
+            requiresAuth: true,
+            ageRestriction: video.age_restriction
+          });
+        }
+        
+        if (video.age_restriction === "mild" && userAge < 13) {
+          return res.status(403).json({ error: "Content requires age 13+" });
+        }
+        
+        if (video.age_restriction === "restricted" && userAge < 18) {
+          return res.status(403).json({ error: "Content requires age 18+" });
+        }
+      }
+      
+      // Increment view count atomically
       await pool.query(
-        `UPDATE creator_stats 
-         SET total_likes = total_likes + 1, updated_at = NOW() 
-         WHERE user_id = $1`,
-        [video.user_id]
+        `UPDATE videos 
+         SET views = views + 1, 
+             last_viewed_at = NOW(),
+             trending_score = trending_score + 1
+         WHERE id = $1`,
+        [id]
       );
       
-      // Create notification
-      if (video.user_id !== userId) {
-        await pool.query(
+      // Parse tags
+      if (video.tags) {
+        try {
+          video.tags = JSON.parse(video.tags);
+        } catch (err) {
+          video.tags = [];
+        }
+      }
+      
+      // Get recommendations if requested
+      let recommendations = [];
+      if (includeRecommendations) {
+        const { rows: recRows } = await pool.query(
+          `SELECT id, title, thumbnail_url, duration, views, 
+                  likes, username, profile_url
+           FROM get_video_recommendations($1, $2, 10)`,
+          [id, userId || null]
+        );
+        recommendations = recRows;
+      }
+      
+      // Get related videos based on category and tags
+      const { rows: relatedVideos } = await pool.query(
+        `SELECT id, title, thumbnail_url, duration, views, 
+                likes, username, profile_url
+         FROM get_related_videos($1, $2, 5)`,
+        [id, video.category || null]
+      );
+      
+      res.json({ 
+        video: {
+          ...video,
+          recommendations,
+          relatedVideos
+        }
+      });
+      
+    } catch (err) {
+      console.error("Get video error:", err);
+      res.status(500).json({ 
+        error: "Failed to get video",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  }
+);
+
+// Get videos for a user with pagination and filtering
+app.get("/api/users/:userId/videos", 
+  [
+    param('userId').isInt().withMessage('Invalid user ID'),
+    query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be 1-100'),
+    query('offset').optional().isInt({ min: 0 }).withMessage('Offset must be non-negative'),
+    query('sort').optional().isIn(['newest', 'oldest', 'popular', 'views']).withMessage('Invalid sort option'),
+    query('category').optional().trim().isLength({ max: 50 }).withMessage('Invalid category')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+      const { 
+        limit = 20, 
+        offset = 0, 
+        sort = 'newest',
+        category
+      } = req.query;
+      
+      // Build dynamic query
+      let orderBy = 'v.created_at DESC';
+      switch (sort) {
+        case 'oldest':
+          orderBy = 'v.created_at ASC';
+          break;
+        case 'popular':
+          orderBy = 'v.likes DESC, v.views DESC';
+          break;
+        case 'views':
+          orderBy = 'v.views DESC';
+          break;
+      }
+      
+      const whereConditions = ['v.user_id = $1', 'v.is_public = true', 'v.processing_status = \'completed\''];
+      const queryParams = [userId];
+      
+      if (category) {
+        whereConditions.push('v.category = $' + (queryParams.length + 1));
+        queryParams.push(category);
+      }
+      
+      const query = `
+        SELECT v.*, 
+               u.username, 
+               u.profile_url,
+               u.verified
+        FROM videos v 
+        JOIN users u ON v.user_id = u.id 
+        WHERE ${whereConditions.join(' AND ')}
+        ORDER BY ${orderBy}
+        LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}
+      `;
+      
+      queryParams.push(limit, offset);
+      
+      const { rows } = await pool.query(query, queryParams);
+      
+      // Get total count for pagination
+      const countQuery = `
+        SELECT COUNT(*) as total
+        FROM videos v
+        WHERE ${whereConditions.join(' AND ')}
+      `;
+      
+      const { rows: countRows } = await pool.query(countQuery, queryParams.slice(0, -2));
+      const total = parseInt(countRows[0].total);
+      
+      res.json({ 
+        videos: rows,
+        pagination: {
+          total,
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+          hasMore: offset + limit < total
+        }
+      });
+      
+    } catch (err) {
+      console.error("Get user videos error:", err);
+      res.status(500).json({ 
+        error: "Failed to get user videos",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  }
+);
+
+// Get recommended videos (For You Page) with caching
+app.get("/api/videos/recommended", 
+  authMiddleware,
+  [
+    query('limit').optional().isInt({ min: 1, max: 50 }).withMessage('Limit must be 1-50'),
+    query('refresh').optional().isBoolean().withMessage('Refresh must be boolean')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const { limit = 20, refresh = false } = req.query;
+      
+      // Check cache first
+      const cacheKey = `recommendations:${userId}`;
+      if (!refresh) {
+        const cached = await redis.get(cacheKey);
+        if (cached) {
+          return res.json({ videos: JSON.parse(cached), cached: true });
+        }
+      }
+      
+      // Generate recommendations
+      const recommendations = await recommendationEngine.generateRecommendations(userId, 'video', limit);
+      
+      // Cache for 5 minutes
+      await redis.setex(cacheKey, 300, JSON.stringify(recommendations));
+      
+      res.json({ videos: recommendations, cached: false });
+      
+    } catch (err) {
+      console.error("Get recommended videos error:", err);
+      res.status(500).json({ 
+        error: "Failed to get recommended videos",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  }
+);
+
+// Get trending videos with multiple time periods
+app.get("/api/videos/trending", 
+  [
+    query('limit').optional().isInt({ min: 1, max: 50 }).withMessage('Limit must be 1-50'),
+    query('period').optional().isIn(['hour', 'day', 'week', 'month']).withMessage('Invalid period'),
+    query('category').optional().trim().isLength({ max: 50 }).withMessage('Invalid category')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { limit = 20, period = 'day', category } = req.query;
+      
+      // Check cache
+      const cacheKey = `trending:video:${period}:${category || 'all'}`;
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return res.json({ videos: JSON.parse(cached), cached: true });
+      }
+      
+      // Build query with optional category filter
+      let whereClause = "t.content_type = 'video' AND t.period = $1 AND v.is_public = true AND v.processing_status = 'completed'";
+      const queryParams = [period];
+      
+      if (category) {
+        whereClause += " AND v.category = $" + (queryParams.length + 1);
+        queryParams.push(category);
+      }
+      
+      const { rows } = await pool.query(
+        `SELECT v.*, 
+                u.username, 
+                u.profile_url,
+                u.verified,
+                t.score as trending_score,
+                t.rank_position
+         FROM videos v 
+         JOIN users u ON v.user_id = u.id 
+         JOIN trending t ON v.id = t.content_id 
+         WHERE ${whereClause}
+         ORDER BY t.score DESC, t.rank_position ASC
+         LIMIT $${queryParams.length + 1}`,
+        [...queryParams, limit]
+      );
+      
+      // Cache for 15 minutes
+      await redis.setex(cacheKey, 900, JSON.stringify(rows));
+      
+      res.json({ videos: rows, cached: false, period });
+      
+    } catch (err) {
+      console.error("Get trending videos error:", err);
+      res.status(500).json({ 
+        error: "Failed to get trending videos",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  }
+);
+
+// Like/unlike video with improved error handling and notifications
+app.post("/api/videos/:id/react", 
+  authMiddleware,
+  interactionLimiter,
+  [
+    param('id').isInt().withMessage('Invalid video ID'),
+    body('reaction').isIn(['like', 'dislike', 'none']).withMessage('Invalid reaction type')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      
+      const userId = req.user.id;
+      const { id } = req.params;
+      const { reaction } = req.body;
+      
+      // Check if video exists and is accessible
+      const { rows: videoRows } = await client.query(
+        "SELECT * FROM videos WHERE id = $1 AND is_public = true AND processing_status = 'completed'",
+        [id]
+      );
+      
+      if (videoRows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: "Video not found" });
+      }
+      
+      const video = videoRows[0];
+      
+      // Check if user can interact (not own video)
+      if (video.user_id === userId) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: "Cannot react to your own video" });
+      }
+      
+      // Get current reaction
+      const { rows: currentReaction } = await client.query(
+        "SELECT reaction_type FROM content_reactions WHERE user_id = $1 AND content_id = $2 AND content_type = 'video'",
+        [userId, id]
+      );
+      
+      const previousReaction = currentReaction.length > 0 ? currentReaction[0].reaction_type : null;
+      
+      // Update or remove reaction
+      if (reaction === 'none') {
+        if (previousReaction) {
+          await client.query(
+            "DELETE FROM content_reactions WHERE user_id = $1 AND content_id = $2 AND content_type = 'video'",
+            [userId, id]
+          );
+          
+          // Update counts
+          if (previousReaction === 'like') {
+            await client.query("UPDATE videos SET likes = GREATEST(likes - 1, 0) WHERE id = $1", [id]);
+          } else if (previousReaction === 'dislike') {
+            await client.query("UPDATE videos SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1", [id]);
+          }
+        }
+      } else {
+        if (previousReaction === reaction) {
+          // Same reaction, remove it
+          await client.query(
+            "DELETE FROM content_reactions WHERE user_id = $1 AND content_id = $2 AND content_type = 'video'",
+            [userId, id]
+          );
+          
+          if (reaction === 'like') {
+            await client.query("UPDATE videos SET likes = GREATEST(likes - 1, 0) WHERE id = $1", [id]);
+          } else if (reaction === 'dislike') {
+            await client.query("UPDATE videos SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1", [id]);
+          }
+        } else {
+          // Different or new reaction
+          if (previousReaction) {
+            // Update existing
+            await client.query(
+              "UPDATE content_reactions SET reaction_type = $1, created_at = NOW() WHERE user_id = $2 AND content_id = $3 AND content_type = 'video'",
+              [reaction, userId, id]
+            );
+            
+            // Adjust counts
+            if (previousReaction === 'like' && reaction === 'dislike') {
+              await client.query("UPDATE videos SET likes = GREATEST(likes - 1, 0), dislikes = dislikes + 1 WHERE id = $1", [id]);
+            } else if (previousReaction === 'dislike' && reaction === 'like') {
+              await client.query("UPDATE videos SET dislikes = GREATEST(dislikes - 1, 0), likes = likes + 1 WHERE id = $1", [id]);
+            }
+          } else {
+            // New reaction
+            await client.query(
+              "INSERT INTO content_reactions (user_id, content_id, content_type, reaction_type, created_at) VALUES ($1, $2, 'video', $3, NOW())",
+              [userId, id, reaction]
+            );
+            
+            if (reaction === 'like') {
+              await client.query("UPDATE videos SET likes = likes + 1 WHERE id = $1", [id]);
+            } else if (reaction === 'dislike') {
+              await client.query("UPDATE videos SET dislikes = dislikes + 1 WHERE id = $1", [id]);
+            }
+          }
+        }
+      }
+      
+      // Get updated counts
+      const { rows: updatedVideo } = await client.query(
+        "SELECT likes, dislikes FROM videos WHERE id = $1",
+        [id]
+      );
+      
+      // Create notification for like (not for dislike or removal)
+      if (reaction === 'like' && previousReaction !== 'like') {
+        await client.query(
           `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
-           VALUES ($1, $2, 'like', 'New Like', '$3 liked your video', $4, NOW())`,
+           VALUES ($1, $2, 'like', 'New Like', $3, $4, NOW())
+           ON CONFLICT (user_id, sender_id, type, data) DO NOTHING`,
           [
             video.user_id,
             userId,
-            req.user.username,
-            JSON.stringify({ contentId: id, contentType: 'video' })
+            `${req.user.username} liked your video "${video.title}"`,
+            JSON.stringify({ 
+              contentId: id, 
+              contentType: 'video',
+              action: 'liked'
+            })
           ]
         );
       }
-    } else if (action === 'unlike' && alreadyLiked) {
-      // Remove like
-      await pool.query(
-        "DELETE FROM likes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
-        [userId, id]
-      );
       
-      // Update video likes count
-      await pool.query(
-        "UPDATE videos SET likes = GREATEST(likes - 1, 0) WHERE id = $1",
+      await client.query('COMMIT');
+      
+      // Clear relevant caches
+      await redis.del(`video:${id}:reactions`);
+      await redis.del(`user:${video.user_id}:stats`);
+      
+      res.json({ 
+        success: true,
+        reaction: reaction === 'none' ? null : reaction,
+        counts: updatedVideo[0]
+      });
+      
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error("React to video error:", err);
+      res.status(500).json({ 
+        error: "Failed to react to video",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Add comment with improved moderation and notifications
+app.post("/api/videos/:id/comments", 
+  authMiddleware,
+  interactionLimiter,
+  [
+    param('id').isInt().withMessage('Invalid video ID'),
+    body('content').trim().isLength({ min: 1, max: 1000 }).withMessage('Comment must be 1-1000 characters'),
+    body('parentId').optional().isInt().withMessage('Invalid parent comment ID'),
+    body('timestamp').optional().isFloat({ min: 0 }).withMessage('Invalid timestamp')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      
+      const userId = req.user.id;
+      const { id } = req.params;
+      const { content, parentId, timestamp } = req.body;
+      
+      // Check if video exists
+      const { rows: videoRows } = await client.query(
+        "SELECT * FROM videos WHERE id = $1 AND is_public = true AND processing_status = 'completed'",
         [id]
       );
       
-      // Update creator stats
-      await pool.query(
-        `UPDATE creator_stats 
-         SET total_likes = GREATEST(total_likes - 1, 0), updated_at = NOW() 
-         WHERE user_id = $1`,
-        [video.user_id]
-      );
-    }
-    
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Like video error:", err);
-    res.status(500).json({ error: "Failed to like video" });
-  }
-});
-
-// Add comment to video
-app.post("/api/videos/:id/comments", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { id } = req.params;
-    const { content, parentId } = req.body;
-    
-    if (!content) return res.status(400).json({ error: "Comment content is required" });
-    
-    // Check if video exists
-    const { rows: videoRows } = await pool.query(
-      "SELECT * FROM videos WHERE id = $1",
-      [id]
-    );
-    
-    if (videoRows.length === 0) return res.status(404).json({ error: "Video not found" });
-    
-    const video = videoRows[0];
-    
-    // If this is a reply, check if parent comment exists
-    if (parentId) {
-      const { rows: parentRows } = await pool.query(
-        "SELECT * FROM comments WHERE id = $1 AND content_type = 'video' AND content_id = $2",
-        [parentId, id]
+      if (videoRows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: "Video not found" });
+      }
+      
+      const video = videoRows[0];
+      
+      // If this is a reply, validate parent comment
+      let parentComment = null;
+      if (parentId) {
+        const { rows: parentRows } = await client.query(
+          "SELECT * FROM comments WHERE id = $1 AND content_type = 'video' AND content_id = $2 AND is_deleted = false",
+          [parentId, id]
+        );
+        
+        if (parentRows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: "Parent comment not found" });
+        }
+        
+        parentComment = parentRows[0];
+      }
+      
+      // Check for spam/inappropriate content
+      const isSpam = await contentModerator.checkComment(content, userId);
+      if (isSpam) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: "Comment contains inappropriate content" });
+      }
+      
+      // Add comment
+      const { rows } = await client.query(
+        `INSERT INTO comments 
+         (user_id, content_type, content_id, parent_id, content, timestamp, created_at)
+         VALUES ($1, 'video', $2, $3, $4, $5, NOW())
+         RETURNING *`,
+        [userId, id, parentId || null, content, timestamp || null]
       );
       
-      if (parentRows.length === 0) return res.status(404).json({ error: "Parent comment not found" });
-    }
-    
-    // Add comment
-    const { rows } = await pool.query(
-      `INSERT INTO comments (user_id, content_type, content_id, parent_id, content, created_at)
-       VALUES ($1, 'video', $2, $3, $4, NOW())
-       RETURNING *`,
-      [userId, id, parentId || null, content]
-    );
-    
-    const comment = rows[0];
-    
-    // Update video comments count
-    await pool.query(
-      "UPDATE videos SET comments_count = comments_count + 1 WHERE id = $1",
-      [id]
-    );
-    
-    // If this is a reply, update parent comment's replies count
-    if (parentId) {
-      await pool.query(
-        "UPDATE comments SET replies_count = replies_count + 1 WHERE id = $1",
-        [parentId]
-      );
-    }
-    
-    // Create notification for video owner if not commenting on own video
-    if (video.user_id !== userId) {
-      await pool.query(
-        `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
-         VALUES ($1, $2, 'comment', 'New Comment', '$3 commented on your video', $4, NOW())`,
-        [
-          video.user_id,
-          userId,
-          req.user.username,
-          JSON.stringify({ contentId: id, contentType: 'video', commentId: comment.id })
-        ]
-      );
-    }
-    
-    // If this is a reply, create notification for parent comment author if not replying to own comment
-    if (parentId) {
-      const { rows: parentRows } = await pool.query(
-        "SELECT user_id FROM comments WHERE id = $1",
-        [parentId]
+      const comment = rows[0];
+      
+      // Update video comments count
+      await client.query(
+        "UPDATE videos SET comments_count = comments_count + 1 WHERE id = $1",
+        [id]
       );
       
-      if (parentRows.length > 0 && parentRows[0].user_id !== userId) {
-        await pool.query(
-          `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
-           VALUES ($1, $2, 'reply', 'New Reply', '$3 replied to your comment', $4, NOW())`,
-          [
-            parentRows[0].user_id,
-            userId,
-            req.user.username,
-            JSON.stringify({ contentId: id, contentType: 'video', commentId: comment.id, parentId })
-          ]
+      // If this is a reply, update parent comment's replies count
+      if (parentId) {
+        await client.query(
+          "UPDATE comments SET replies_count = replies_count + 1 WHERE id = $1",
+          [parentId]
         );
       }
-    }
-    
-    res.json({ comment });
-  } catch (err) {
-    console.error("Add comment error:", err);
-    res.status(500).json({ error: "Failed to add comment" });
-  }
-});
-
-// Get comments for video
-app.get("/api/videos/:id/comments", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { limit = 20, offset = 0 } = req.query;
-    
-    // Get top-level comments
-    const { rows } = await pool.query(
-      `SELECT c.*, u.username, u.profile_url 
-       FROM comments c 
-       JOIN users u ON c.user_id = u.id 
-       WHERE c.content_type = 'video' AND c.content_id = $1 AND c.parent_id IS NULL AND c.is_deleted = false
-       ORDER BY c.created_at DESC 
-       LIMIT $2 OFFSET $3`,
-      [id, limit, offset]
-    );
-    
-    // Get replies for each comment
-    for (const comment of rows) {
-      const { rows: replies } = await pool.query(
-        `SELECT c.*, u.username, u.profile_url 
-         FROM comments c 
-         JOIN users u ON c.user_id = u.id 
-         WHERE c.parent_id = $1 AND c.is_deleted = false
-         ORDER BY c.created_at ASC 
-         LIMIT 5`,
+      
+      // Create notifications
+      const notifications = [];
+      
+      // Notify video owner if not commenting on own video
+      if (video.user_id !== userId) {
+        notifications.push({
+          userId: video.user_id,
+          senderId: userId,
+          type: 'comment',
+          title: 'New Comment',
+          message: `${req.user.username} commented on your video "${video.title}"`,
+          data: JSON.stringify({ 
+            contentId: id, 
+            contentType: 'video', 
+            commentId: comment.id,
+            isReply: !!parentId
+          })
+        });
+      }
+      
+      // If this is a reply, notify parent comment author
+      if (parentId && parentComment && parentComment.user_id !== userId && parentComment.user_id !== video.user_id) {
+        notifications.push({
+          userId: parentComment.user_id,
+          senderId: userId,
+          type: 'reply',
+          title: 'New Reply',
+          message: `${req.user.username} replied to your comment`,
+          data: JSON.stringify({ 
+            contentId: id, 
+            contentType: 'video', 
+            commentId: comment.id,
+            parentId
+          })
+        });
+      }
+      
+      // Batch insert notifications
+      if (notifications.length > 0) {
+        const notificationValues = notifications.map(n => 
+          `(${n.userId}, ${n.senderId}, '${n.type}', '${n.title}', '${n.message}', '${n.data}', NOW())`
+        ).join(', ');
+        
+        await client.query(
+          `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
+           VALUES ${notificationValues}
+           ON CONFLICT (user_id, sender_id, type, data) DO NOTHING`
+        );
+      }
+      
+      await client.query('COMMIT');
+      
+      // Get comment with user info
+      const { rows: commentWithUser } = await pool.query(
+        `SELECT c.*, u.username, u.profile_url, u.verified
+         FROM comments c
+         JOIN users u ON c.user_id = u.id
+         WHERE c.id = $1`,
         [comment.id]
       );
       
-      comment.replies = replies;
+      // Clear caches
+      await redis.del(`video:${id}:comments`);
+      await redis.del(`user:${video.user_id}:stats`);
+      
+      res.status(201).json({ comment: commentWithUser[0] });
+      
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error("Add comment error:", err);
+      res.status(500).json({ 
+        error: "Failed to add comment",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    } finally {
+      client.release();
     }
-    
-    res.json({ comments: rows });
-  } catch (err) {
-    console.error("Get comments error:", err);
-    res.status(500).json({ error: "Failed to get comments" });
   }
-});
+);
+
+// Get comments for video with optimized queries and pagination
+app.get("/api/videos/:id/comments", 
+  [
+    param('id').isInt().withMessage('Invalid video ID'),
+    query('limit').optional().isInt({ min: 1, max: 50 }).withMessage('Limit must be 1-50'),
+    query('offset').optional().isInt({ min: 0 }).withMessage('Offset must be non-negative'),
+    query('sort').optional().isIn(['newest', 'oldest', 'popular']).withMessage('Invalid sort option')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { limit = 20, offset = 0, sort = 'newest' } = req.query;
+      
+      // Check cache first
+      const cacheKey = `video:${id}:comments:${limit}:${offset}:${sort}`;
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return res.json({ comments: JSON.parse(cached), cached: true });
+      }
+      
+      // Build sort clause
+      let orderBy = 'c.created_at DESC';
+      switch (sort) {
+        case 'oldest':
+          orderBy = 'c.created_at ASC';
+          break;
+        case 'popular':
+          orderBy = 'c.likes DESC, c.created_at DESC';
+          break;
+      }
+      
+      // Get top-level comments with user info and like status
+      let query = `
+        SELECT c.*, 
+               u.username, 
+               u.profile_url,
+               u.verified,
+               CASE WHEN cr.user_id IS NOT NULL THEN true ELSE false END as user_liked
+        FROM comments c 
+        JOIN users u ON c.user_id = u.id 
+        LEFT JOIN content_reactions cr ON cr.content_id = c.id AND cr.content_type = 'comment' AND cr.reaction_type = 'like'
+        WHERE c.content_type = 'video' AND c.content_id = $1 AND c.parent_id IS NULL AND c.is_deleted = false
+        ORDER BY ${orderBy}
+        LIMIT $2 OFFSET $3
+      `;
+      
+      const { rows } = await pool.query(query, [id, limit, offset]);
+      
+      // Get replies for each comment (optimized with single query)
+      if (rows.length > 0) {
+        const commentIds = rows.map(c => c.id);
+        const { rows: replies } = await pool.query(
+          `SELECT c.*, 
+                  u.username, 
+                  u.profile_url,
+                  u.verified,
+                  CASE WHEN cr.user_id IS NOT NULL THEN true ELSE false END as user_liked
+           FROM comments c 
+           JOIN users u ON c.user_id = u.id
+           LEFT JOIN content_reactions cr ON cr.content_id = c.id AND cr.content_type = 'comment' AND cr.reaction_type = 'like'
+           WHERE c.parent_id = ANY($1) AND c.is_deleted = false
+           ORDER BY c.created_at ASC`,
+          [commentIds]
+        );
+        
+        // Group replies by parent comment
+        const repliesByParent = {};
+        replies.forEach(reply => {
+          if (!repliesByParent[reply.parent_id]) {
+            repliesByParent[reply.parent_id] = [];
+          }
+          repliesByParent[reply.parent_id].push(reply);
+        });
+        
+        // Attach replies to comments
+        rows.forEach(comment => {
+          comment.replies = repliesByParent[comment.id] || [];
+          comment.hasMoreReplies = comment.replies_count > comment.replies.length;
+        });
+      }
+      
+      // Get total count for pagination
+      const { rows: countRows } = await pool.query(
+        "SELECT COUNT(*) as total FROM comments WHERE content_type = 'video' AND content_id = $1 AND parent_id IS NULL AND is_deleted = false",
+        [id]
+      );
+      
+      const total = parseInt(countRows[0].total);
+      
+      const response = {
+        comments: rows,
+        pagination: {
+          total,
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+          hasMore: offset + limit < total
+        }
+      };
+      
+      // Cache for 2 minutes
+      await redis.setex(cacheKey, 120, JSON.stringify(rows));
+      
+      res.json(response);
+      
+    } catch (err) {
+      console.error("Get comments error:", err);
+      res.status(500).json({ 
+        error: "Failed to get comments",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  }
+);
+
+// Helper function to update trending scores
+async function updateTrendingScores(contentId, contentType) {
+  try {
+    await pool.query('SELECT update_trending_scores($1, $2)', [contentId, contentType]);
+  } catch (err) {
+    console.error('Failed to update trending scores:', err);
+  }
+}
 
 // --- Music Endpoints ---
 
-// Upload music
-app.post("/api/music/upload", authMiddleware, upload.fields([
-  { name: 'audio', maxCount: 1 },
-  { name: 'cover', maxCount: 1 }
-]), async (req, res) => {
-  try {
-    if (!req.files.audio || !req.files.audio[0]) return res.status(400).json({ error: "No audio file provided" });
-    
-    const userId = req.user.id;
-    const { title, artist, album, genre, lyrics, explicit = false } = req.body;
-    
-    if (!title || !artist) return res.status(400).json({ error: "Title and artist are required" });
-    
-    // Upload audio to S3
-    const audioKey = `music/${userId}/${Date.now()}-${req.files.audio[0].originalname}`;
-    const audioUrl = await contentProcessor.uploadToS3(req.files.audio[0].path, audioKey);
-    
-    // Upload cover to S3 if provided
-    let coverUrl = null;
-    if (req.files.cover && req.files.cover[0]) {
-      const coverKey = `covers/${userId}/${Date.now()}-${req.files.cover[0].originalname}`;
-      coverUrl = await contentProcessor.uploadToS3(req.files.cover[0].path, coverKey);
-    }
-    
-    // Create music record
-    const { rows } = await pool.query(
-      `INSERT INTO music 
-       (user_id, title, artist, album, genre, music_url, cover_url, lyrics, explicit, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-       RETURNING *`,
-      [
-        userId,
-        title,
-        artist,
-        album || null,
-        genre || null,
-        audioUrl,
-        coverUrl,
-        lyrics || null,
-        explicit
-      ]
-    );
-    
-    const music = rows[0];
-    
-    // Start processing music in background
-    contentProcessor.processMusic(music.id)
-      .then(result => {
-        console.log(`Music ${music.id} processed successfully:`, result);
-      })
-      .catch(error => {
-        console.error(`Error processing music ${music.id}:`, error);
-      });
-    
-    // Update creator stats
-    await ensureCreatorStats(userId);
-    
-    res.json({ message: "Music uploaded successfully", music });
-  } catch (err) {
-    console.error("Music upload error:", err);
-    res.status(500).json({ error: "Music upload failed" });
-  }
-});
-
-// Get music by ID
-app.get("/api/music/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    // Increment listen count
-    await pool.query(
-      "UPDATE music SET listens = listens + 1 WHERE id = $1",
-      [id]
-    );
-    
-    // Get music details
-    const { rows } = await pool.query(
-      `SELECT m.*, u.username, u.profile_url 
-       FROM music m 
-       JOIN users u ON m.user_id = u.id 
-       WHERE m.id = $1`,
-      [id]
-    );
-    
-    if (rows.length === 0) return res.status(404).json({ error: "Music not found" });
-    
-    const music = rows[0];
-    
-    // Record listen history if user is authenticated
-    if (req.headers.authorization) {
-      try {
-        const token = req.headers.authorization.split(" ")[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-        
-        await pool.query(
-          `INSERT INTO watch_history (user_id, content_type, content_id, created_at)
-           VALUES ($1, 'music', $2, NOW())
-           ON CONFLICT (user_id, content_type, content_id) 
-           DO UPDATE SET created_at = NOW()`,
-          [decoded.id, id]
-        );
-      } catch (err) {
-        // Invalid token, ignore
+// Upload music with enhanced security and processing
+app.post("/api/music/upload", 
+  authMiddleware,
+  uploadQuotaLimiter,
+  upload.fields([
+    { name: 'audio', maxCount: 1 },
+    { name: 'cover', maxCount: 1 }
+  ]),
+  [
+    body('title').trim().isLength({ min: 1, max: 200 }).withMessage('Title must be 1-200 characters'),
+    body('artist').trim().isLength({ min: 1, max: 100 }).withMessage('Artist must be 1-100 characters'),
+    body('album').optional().trim().isLength({ max: 100 }).withMessage('Album must be max 100 characters'),
+    body('genre').optional().trim().isLength({ max: 50 }).withMessage('Genre must be max 50 characters'),
+    body('lyrics').optional().trim().isLength({ max: 10000 }).withMessage('Lyrics must be max 10000 characters'),
+    body('explicit').optional().isBoolean().withMessage('Explicit must be boolean'),
+    body('tags').optional().custom(value => {
+      if (typeof value === 'string') {
+        try {
+          JSON.parse(value);
+          return true;
+        } catch (err) {
+          throw new Error('Tags must be valid JSON array');
+        }
       }
+      return true;
+    })
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      
+      if (!req.files.audio || !req.files.audio[0]) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: "No audio file provided" });
+      }
+      
+      const userId = req.user.id;
+      const { 
+        title, 
+        artist, 
+        album, 
+        genre, 
+        lyrics, 
+        explicit = false,
+        tags = '[]',
+        duration,
+        releaseDate
+      } = req.body;
+      
+      // Validate file types
+      const audioFile = req.files.audio[0];
+      const allowedAudioTypes = ['audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/flac'];
+      if (!allowedAudioTypes.includes(audioFile.mimetype)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: "Invalid audio file type" });
+      }
+      
+      // Validate cover image if provided
+      if (req.files.cover && req.files.cover[0]) {
+        const coverFile = req.files.cover[0];
+        const allowedImageTypes = ['image/jpeg', 'image/png', 'image/webp'];
+        if (!allowedImageTypes.includes(coverFile.mimetype)) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: "Invalid cover image type" });
+        }
+      }
+      
+      // Check user quota
+      const { rows: quotaRows } = await client.query(
+        "SELECT upload_count, upload_limit FROM upload_quotas WHERE user_id = $1",
+        [userId]
+      );
+      
+      if (quotaRows.length > 0 && quotaRows[0].upload_count >= quotaRows[0].upload_limit) {
+        await client.query('ROLLBACK');
+        return res.status(429).json({ error: "Upload quota exceeded" });
+      }
+      
+      // Parse tags
+      let parsedTags = [];
+      try {
+        parsedTags = JSON.parse(tags);
+        if (!Array.isArray(parsedTags)) parsedTags = [];
+        parsedTags = parsedTags.slice(0, 10); // Limit to 10 tags
+      } catch (err) {
+        parsedTags = [];
+      }
+      
+      // Generate unique keys
+      const timestamp = Date.now();
+      const audioKey = `music/${userId}/${timestamp}-${audioFile.originalname}`;
+      
+      // Upload audio to S3
+      const audioUrl = await contentProcessor.uploadToS3(audioFile.path, audioKey);
+      
+      // Upload cover to S3 if provided
+      let coverUrl = null;
+      if (req.files.cover && req.files.cover[0]) {
+        const coverFile = req.files.cover[0];
+        const coverKey = `covers/music/${userId}/${timestamp}-${coverFile.originalname}`;
+        coverUrl = await contentProcessor.uploadToS3(coverFile.path, coverKey);
+      }
+      
+      // Create music record
+      const { rows } = await client.query(
+        `INSERT INTO music 
+         (user_id, title, artist, album, genre, music_url, cover_url, lyrics, explicit, 
+          tags, duration, release_date, processing_status, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'processing', NOW())
+         RETURNING *`,
+        [
+          userId,
+          title,
+          artist,
+          album || null,
+          genre || null,
+          audioUrl,
+          coverUrl,
+          lyrics || null,
+          explicit,
+          JSON.stringify(parsedTags),
+          duration ? parseFloat(duration) : null,
+          releaseDate ? new Date(releaseDate) : null
+        ]
+      );
+      
+      const music = rows[0];
+      
+      // Update upload quota
+      await client.query(
+        `INSERT INTO upload_quotas (user_id, upload_count, upload_limit, last_upload)
+         VALUES ($1, 1, 100, NOW())
+         ON CONFLICT (user_id) 
+         DO UPDATE SET upload_count = upload_quotas.upload_count + 1, last_upload = NOW()`,
+        [userId]
+      );
+      
+      // Update creator stats
+      await ensureCreatorStats(userId);
+      
+      await client.query('COMMIT');
+      
+      // Start processing music in background
+      contentProcessor.processMusic(music.id)
+        .then(async (result) => {
+          console.log(`Music ${music.id} processed successfully:`, result);
+          
+          // Update processing status
+          await pool.query(
+            "UPDATE music SET processing_status = 'completed', processed_at = NOW() WHERE id = $1",
+            [music.id]
+          );
+          
+          // Update trending scores
+          await updateTrendingScores(music.id, 'music');
+          
+          // Clear cache
+          await redis.del(`user:${userId}:music`);
+        })
+        .catch(async (error) => {
+          console.error(`Error processing music ${music.id}:`, error);
+          
+          // Update processing status to failed
+          await pool.query(
+            "UPDATE music SET processing_status = 'failed', error_message = $1 WHERE id = $2",
+            [error.message, music.id]
+          );
+        });
+      
+      // Clean up temp files
+      fs.unlink(audioFile.path, () => {});
+      if (req.files.cover && req.files.cover[0]) {
+        fs.unlink(req.files.cover[0].path, () => {});
+      }
+      
+      res.status(201).json({ 
+        message: "Music uploaded successfully", 
+        music: {
+          id: music.id,
+          title: music.title,
+          artist: music.artist,
+          status: 'processing',
+          uploadDate: music.created_at
+        }
+      });
+      
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error("Music upload error:", err);
+      
+      // Clean up on error
+      if (req.files.audio && req.files.audio[0]) {
+        fs.unlink(req.files.audio[0].path, () => {});
+      }
+      if (req.files.cover && req.files.cover[0]) {
+        fs.unlink(req.files.cover[0].path, () => {});
+      }
+      
+      res.status(500).json({ 
+        error: "Music upload failed",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    } finally {
+      client.release();
     }
-    
-    res.json({ music });
-  } catch (err) {
-    console.error("Get music error:", err);
-    res.status(500).json({ error: "Failed to get music" });
   }
-});
+);
 
-// Get recommended music
-app.get("/api/music/recommended", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { limit = 20 } = req.query;
-    
-    const recommendations = await recommendationEngine.generateRecommendations(userId, 'music', limit);
-    
-    res.json({ music: recommendations });
-  } catch (err) {
-    console.error("Get recommended music error:", err);
-    res.status(500).json({ error: "Failed to get recommended music" });
+// Get music by ID with enhanced features
+app.get("/api/music/:id", 
+  [
+    param('id').isInt().withMessage('Invalid music ID'),
+    query('includeRecommendations').optional().isBoolean().withMessage('includeRecommendations must be boolean')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { includeRecommendations = false } = req.query;
+      
+      // Get music with detailed information
+      const { rows } = await pool.query(
+        `SELECT m.*, 
+                u.username, 
+                u.profile_url,
+                u.verified,
+                u.subscriber_count,
+                cs.total_listens,
+                cs.total_likes
+         FROM music m 
+         JOIN users u ON m.user_id = u.id 
+         LEFT JOIN creator_stats cs ON u.id = cs.user_id
+         WHERE m.id = $1 AND m.processing_status = 'completed'`,
+        [id]
+      );
+      
+      if (rows.length === 0) {
+        return res.status(404).json({ error: "Music not found or not available" });
+      }
+      
+      const music = rows[0];
+      
+      // Check age restriction for explicit content
+      let userAge = null;
+      let userId = null;
+      
+      if (req.headers.authorization) {
+        try {
+          const token = req.headers.authorization.split(" ")[1];
+          const decoded = jwt.verify(token, JWT_SECRET);
+          userAge = decoded.age;
+          userId = decoded.id;
+          
+          // Record listen history for authenticated users
+          await pool.query(
+            `INSERT INTO watch_history (user_id, content_type, content_id, created_at)
+             VALUES ($1, 'music', $2, NOW())
+             ON CONFLICT (user_id, content_type, content_id) 
+             DO UPDATE SET created_at = NOW(), watch_count = watch_history.watch_count + 1`,
+            [userId, id]
+          );
+          
+          // Check if user has liked this music
+          const { rows: reactions } = await pool.query(
+            `SELECT reaction_type FROM content_reactions 
+             WHERE user_id = $1 AND content_id = $2 AND content_type = 'music'`,
+            [userId, id]
+          );
+          
+          music.userReaction = reactions.length > 0 ? reactions[0].reaction_type : null;
+          
+        } catch (err) {
+          // Invalid token, continue as anonymous
+        }
+      }
+      
+      // Age restriction check for explicit content
+      if (music.explicit) {
+        if (!userAge) {
+          return res.status(403).json({ 
+            error: "Explicit content requires authentication",
+            requiresAuth: true
+          });
+        }
+        
+        if (userAge < 18) {
+          return res.status(403).json({ error: "Explicit content requires age 18+" });
+        }
+      }
+      
+      // Increment listen count atomically
+      await pool.query(
+        `UPDATE music 
+         SET listens = listens + 1, 
+             last_listened_at = NOW(),
+             trending_score = trending_score + 1
+         WHERE id = $1`,
+        [id]
+      );
+      
+      // Parse tags
+      if (music.tags) {
+        try {
+          music.tags = JSON.parse(music.tags);
+        } catch (err) {
+          music.tags = [];
+        }
+      }
+      
+      // Get recommendations if requested
+      let recommendations = [];
+      if (includeRecommendations) {
+        const { rows: recRows } = await pool.query(
+          `SELECT id, title, artist, cover_url, duration, listens, 
+                  likes, username, profile_url
+           FROM get_music_recommendations($1, $2, 10)`,
+          [id, userId || null]
+        );
+        recommendations = recRows;
+      }
+      
+      // Get related music based on genre and artist
+      const { rows: relatedMusic } = await pool.query(
+        `SELECT id, title, artist, cover_url, duration, listens, 
+                likes, username, profile_url
+         FROM get_related_music($1, $2, 5)`,
+        [id, music.genre || null]
+      );
+      
+      res.json({ 
+        music: {
+          ...music,
+          recommendations,
+          relatedMusic
+        }
+      });
+      
+    } catch (err) {
+      console.error("Get music error:", err);
+      res.status(500).json({ 
+        error: "Failed to get music",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
   }
-});
+);
 
-// Get trending music
-app.get("/api/music/trending", async (req, res) => {
-  try {
-    const { limit = 20, period = 'day' } = req.query;
-    
-    const { rows } = await pool.query(
-      `SELECT m.*, u.username, u.profile_url 
-       FROM music m 
-       JOIN users u ON m.user_id = u.id 
-       JOIN trending t ON m.id = t.content_id 
-       WHERE t.content_type = 'music' AND t.period = $1
-       ORDER BY t.score DESC 
-       LIMIT $2`,
-      [period, limit]
-    );
-    
-    res.json({ music: rows });
-  } catch (err) {
-    console.error("Get trending music error:", err);
-    res.status(500).json({ error: "Failed to get trending music" });
+// Get music for a user with pagination and filtering
+app.get("/api/users/:userId/music", 
+  [
+    param('userId').isInt().withMessage('Invalid user ID'),
+    query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be 1-100'),
+    query('offset').optional().isInt({ min: 0 }).withMessage('Offset must be non-negative'),
+    query('sort').optional().isIn(['newest', 'oldest', 'popular', 'listens']).withMessage('Invalid sort option'),
+    query('genre').optional().trim().isLength({ max: 50 }).withMessage('Invalid genre'),
+    query('explicit').optional().isBoolean().withMessage('Explicit must be boolean')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+      const { 
+        limit = 20, 
+        offset = 0, 
+        sort = 'newest',
+        genre,
+        explicit
+      } = req.query;
+      
+      // Build dynamic query
+      let orderBy = 'm.created_at DESC';
+      switch (sort) {
+        case 'oldest':
+          orderBy = 'm.created_at ASC';
+          break;
+        case 'popular':
+          orderBy = 'm.likes DESC, m.listens DESC';
+          break;
+        case 'listens':
+          orderBy = 'm.listens DESC';
+          break;
+      }
+      
+      const whereConditions = ['m.user_id = $1', 'm.processing_status = \'completed\''];
+      const queryParams = [userId];
+      
+      if (genre) {
+        whereConditions.push('m.genre = $' + (queryParams.length + 1));
+        queryParams.push(genre);
+      }
+      
+      if (explicit !== undefined) {
+        whereConditions.push('m.explicit = $' + (queryParams.length + 1));
+        queryParams.push(explicit === 'true');
+      }
+      
+      const query = `
+        SELECT m.*, 
+               u.username, 
+               u.profile_url,
+               u.verified
+        FROM music m 
+        JOIN users u ON m.user_id = u.id 
+        WHERE ${whereConditions.join(' AND ')}
+        ORDER BY ${orderBy}
+        LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}
+      `;
+      
+      queryParams.push(limit, offset);
+      
+      const { rows } = await pool.query(query, queryParams);
+      
+      // Get total count for pagination
+      const countQuery = `
+        SELECT COUNT(*) as total
+        FROM music m
+        WHERE ${whereConditions.join(' AND ')}
+      `;
+      
+      const { rows: countRows } = await pool.query(countQuery, queryParams.slice(0, -2));
+      const total = parseInt(countRows[0].total);
+      
+      res.json({ 
+        music: rows,
+        pagination: {
+          total,
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+          hasMore: offset + limit < total
+        }
+      });
+      
+    } catch (err) {
+      console.error("Get user music error:", err);
+      res.status(500).json({ 
+        error: "Failed to get user music",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
   }
-});
+);
+
+// Get recommended music (For You Page) with caching
+app.get("/api/music/recommended", 
+  authMiddleware,
+  [
+    query('limit').optional().isInt({ min: 1, max: 50 }).withMessage('Limit must be 1-50'),
+    query('refresh').optional().isBoolean().withMessage('Refresh must be boolean'),
+    query('genre').optional().trim().isLength({ max: 50 }).withMessage('Invalid genre')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const { limit = 20, refresh = false, genre } = req.query;
+      
+      // Check cache first
+      const cacheKey = `recommendations:music:${userId}:${genre || 'all'}`;
+      if (!refresh) {
+        const cached = await redis.get(cacheKey);
+        if (cached) {
+          return res.json({ music: JSON.parse(cached), cached: true });
+        }
+      }
+      
+      // Generate recommendations
+      const recommendations = await recommendationEngine.generateRecommendations(
+        userId, 
+        'music', 
+        limit, 
+        genre ? { genre } : {}
+      );
+      
+      // Cache for 5 minutes
+      await redis.setex(cacheKey, 300, JSON.stringify(recommendations));
+      
+      res.json({ music: recommendations, cached: false });
+      
+    } catch (err) {
+      console.error("Get recommended music error:", err);
+      res.status(500).json({ 
+        error: "Failed to get recommended music",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  }
+);
+
+// Get trending music with multiple time periods and caching
+app.get("/api/music/trending", 
+  [
+    query('limit').optional().isInt({ min: 1, max: 50 }).withMessage('Limit must be 1-50'),
+    query('period').optional().isIn(['hour', 'day', 'week', 'month']).withMessage('Invalid period'),
+    query('genre').optional().trim().isLength({ max: 50 }).withMessage('Invalid genre'),
+    query('explicit').optional().isBoolean().withMessage('Explicit must be boolean')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { limit = 20, period = 'day', genre, explicit } = req.query;
+      
+      // Check cache
+      const cacheKey = `trending:music:${period}:${genre || 'all'}:${explicit || 'all'}`;
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return res.json({ music: JSON.parse(cached), cached: true });
+      }
+      
+      // Build query with optional filters
+      let whereClause = "t.content_type = 'music' AND t.period = $1 AND m.processing_status = 'completed'";
+      const queryParams = [period];
+      
+      if (genre) {
+        whereClause += " AND m.genre = $" + (queryParams.length + 1);
+        queryParams.push(genre);
+      }
+      
+      if (explicit !== undefined) {
+        whereClause += " AND m.explicit = $" + (queryParams.length + 1);
+        queryParams.push(explicit === 'true');
+      }
+      
+      const { rows } = await pool.query(
+        `SELECT m.*, 
+                u.username, 
+                u.profile_url,
+                u.verified,
+                t.score as trending_score,
+                t.rank_position
+         FROM music m 
+         JOIN users u ON m.user_id = u.id 
+         JOIN trending t ON m.id = t.content_id 
+         WHERE ${whereClause}
+         ORDER BY t.score DESC, t.rank_position ASC
+         LIMIT $${queryParams.length + 1}`,
+        [...queryParams, limit]
+      );
+      
+      // Cache for 15 minutes
+      await redis.setex(cacheKey, 900, JSON.stringify(rows));
+      
+      res.json({ music: rows, cached: false, period });
+      
+    } catch (err) {
+      console.error("Get trending music error:", err);
+      res.status(500).json({ 
+        error: "Failed to get trending music",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  }
+);
+
+// Like/unlike music with improved error handling and notifications
+app.post("/api/music/:id/react", 
+  authMiddleware,
+  interactionLimiter,
+  [
+    param('id').isInt().withMessage('Invalid music ID'),
+    body('reaction').isIn(['like', 'dislike', 'none']).withMessage('Invalid reaction type')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      
+      const userId = req.user.id;
+      const { id } = req.params;
+      const { reaction } = req.body;
+      
+      // Check if music exists and is accessible
+      const { rows: musicRows } = await client.query(
+        "SELECT * FROM music WHERE id = $1 AND processing_status = 'completed'",
+        [id]
+      );
+      
+      if (musicRows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: "Music not found" });
+      }
+      
+      const music = musicRows[0];
+      
+      // Check if user can interact (not own music)
+      if (music.user_id === userId) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: "Cannot react to your own music" });
+      }
+      
+      // Get current reaction
+      const { rows: currentReaction } = await client.query(
+        "SELECT reaction_type FROM content_reactions WHERE user_id = $1 AND content_id = $2 AND content_type = 'music'",
+        [userId, id]
+      );
+      
+      const previousReaction = currentReaction.length > 0 ? currentReaction[0].reaction_type : null;
+      
+      // Update or remove reaction
+      if (reaction === 'none') {
+        if (previousReaction) {
+          await client.query(
+            "DELETE FROM content_reactions WHERE user_id = $1 AND content_id = $2 AND content_type = 'music'",
+            [userId, id]
+          );
+          
+          // Update counts
+          if (previousReaction === 'like') {
+            await client.query("UPDATE music SET likes = GREATEST(likes - 1, 0) WHERE id = $1", [id]);
+          } else if (previousReaction === 'dislike') {
+            await client.query("UPDATE music SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1", [id]);
+          }
+        }
+      } else {
+        if (previousReaction === reaction) {
+          // Same reaction, remove it
+          await client.query(
+            "DELETE FROM content_reactions WHERE user_id = $1 AND content_id = $2 AND content_type = 'music'",
+            [userId, id]
+          );
+          
+          if (reaction === 'like') {
+            await client.query("UPDATE music SET likes = GREATEST(likes - 1, 0) WHERE id = $1", [id]);
+          } else if (reaction === 'dislike') {
+            await client.query("UPDATE music SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1", [id]);
+          }
+        } else {
+          // Different or new reaction
+          if (previousReaction) {
+            // Update existing
+            await client.query(
+              "UPDATE content_reactions SET reaction_type = $1, created_at = NOW() WHERE user_id = $2 AND content_id = $3 AND content_type = 'music'",
+              [reaction, userId, id]
+            );
+            
+            // Adjust counts
+            if (previousReaction === 'like' && reaction === 'dislike') {
+              await client.query("UPDATE music SET likes = GREATEST(likes - 1, 0), dislikes = dislikes + 1 WHERE id = $1", [id]);
+            } else if (previousReaction === 'dislike' && reaction === 'like') {
+              await client.query("UPDATE music SET dislikes = GREATEST(dislikes - 1, 0), likes = likes + 1 WHERE id = $1", [id]);
+            }
+          } else {
+            // New reaction
+            await client.query(
+              "INSERT INTO content_reactions (user_id, content_id, content_type, reaction_type, created_at) VALUES ($1, $2, 'music', $3, NOW())",
+              [userId, id, reaction]
+            );
+            
+            if (reaction === 'like') {
+              await client.query("UPDATE music SET likes = likes + 1 WHERE id = $1", [id]);
+            } else if (reaction === 'dislike') {
+              await client.query("UPDATE music SET dislikes = dislikes + 1 WHERE id = $1", [id]);
+            }
+          }
+        }
+      }
+      
+      // Get updated counts
+      const { rows: updatedMusic } = await client.query(
+        "SELECT likes, dislikes FROM music WHERE id = $1",
+        [id]
+      );
+      
+      // Create notification for like (not for dislike or removal)
+      if (reaction === 'like' && previousReaction !== 'like') {
+        await client.query(
+          `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
+           VALUES ($1, $2, 'like', 'New Like', $3, $4, NOW())
+           ON CONFLICT (user_id, sender_id, type, data) DO NOTHING`,
+          [
+            music.user_id,
+            userId,
+            `${req.user.username} liked your music "${music.title}"`,
+            JSON.stringify({ 
+              contentId: id, 
+              contentType: 'music',
+              action: 'liked'
+            })
+          ]
+        );
+      }
+      
+      await client.query('COMMIT');
+      
+      // Clear relevant caches
+      await redis.del(`music:${id}:reactions`);
+      await redis.del(`user:${music.user_id}:stats`);
+      
+      res.json({ 
+        success: true,
+        reaction: reaction === 'none' ? null : reaction,
+        counts: updatedMusic[0]
+      });
+      
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error("React to music error:", err);
+      res.status(500).json({ 
+        error: "Failed to react to music",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Add comment to music with improved moderation and notifications
+app.post("/api/music/:id/comments", 
+  authMiddleware,
+  interactionLimiter,
+  [
+    param('id').isInt().withMessage('Invalid music ID'),
+    body('content').trim().isLength({ min: 1, max: 1000 }).withMessage('Comment must be 1-1000 characters'),
+    body('parentId').optional().isInt().withMessage('Invalid parent comment ID'),
+    body('timestamp').optional().isFloat({ min: 0 }).withMessage('Invalid timestamp')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      
+      const userId = req.user.id;
+      const { id } = req.params;
+      const { content, parentId, timestamp } = req.body;
+      
+      // Check if music exists
+      const { rows: musicRows } = await client.query(
+        "SELECT * FROM music WHERE id = $1 AND processing_status = 'completed'",
+        [id]
+      );
+      
+      if (musicRows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: "Music not found" });
+      }
+      
+      const music = musicRows[0];
+      
+      // If this is a reply, validate parent comment
+      let parentComment = null;
+      if (parentId) {
+        const { rows: parentRows } = await client.query(
+          "SELECT * FROM comments WHERE id = $1 AND content_type = 'music' AND content_id = $2 AND is_deleted = false",
+          [parentId, id]
+        );
+        
+        if (parentRows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: "Parent comment not found" });
+        }
+        
+        parentComment = parentRows[0];
+      }
+      
+      // Check for spam/inappropriate content
+      const isSpam = await contentModerator.checkComment(content, userId);
+      if (isSpam) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: "Comment contains inappropriate content" });
+      }
+      
+      // Add comment
+      const { rows } = await client.query(
+        `INSERT INTO comments 
+         (user_id, content_type, content_id, parent_id, content, timestamp, created_at)
+         VALUES ($1, 'music', $2, $3, $4, $5, NOW())
+         RETURNING *`,
+        [userId, id, parentId || null, content, timestamp || null]
+      );
+      
+      const comment = rows[0];
+      
+      // Update music comments count
+      await client.query(
+        "UPDATE music SET comments_count = comments_count + 1 WHERE id = $1",
+        [id]
+      );
+      
+      // If this is a reply, update parent comment's replies count
+      if (parentId) {
+        await client.query(
+          "UPDATE comments SET replies_count = replies_count + 1 WHERE id = $1",
+          [parentId]
+        );
+      }
+      
+      // Create notifications
+      const notifications = [];
+      
+      // Notify music owner if not commenting on own music
+      if (music.user_id !== userId) {
+        notifications.push({
+          userId: music.user_id,
+          senderId: userId,
+          type: 'comment',
+          title: 'New Comment',
+          message: `${req.user.username} commented on your music "${music.title}"`,
+          data: JSON.stringify({ 
+            contentId: id, 
+            contentType: 'music', 
+            commentId: comment.id,
+            isReply: !!parentId
+          })
+        });
+      }
+      
+      // If this is a reply, notify parent comment author
+      if (parentId && parentComment && parentComment.user_id !== userId && parentComment.user_id !== music.user_id) {
+        notifications.push({
+          userId: parentComment.user_id,
+          senderId: userId,
+          type: 'reply',
+          title: 'New Reply',
+          message: `${req.user.username} replied to your comment`,
+          data: JSON.stringify({ 
+            contentId: id, 
+            contentType: 'music', 
+            commentId: comment.id,
+            parentId
+          })
+        });
+      }
+      
+      // Batch insert notifications
+      if (notifications.length > 0) {
+        const notificationValues = notifications.map(n => 
+          `(${n.userId}, ${n.senderId}, '${n.type}', '${n.title}', '${n.message}', '${n.data}', NOW())`
+        ).join(', ');
+        
+        await client.query(
+          `INSERT INTO notifications (user_id, sender_id, type, title, message, data, created_at)
+           VALUES ${notificationValues}
+           ON CONFLICT (user_id, sender_id, type, data) DO NOTHING`
+        );
+      }
+      
+      await client.query('COMMIT');
+      
+      // Get comment with user info
+      const { rows: commentWithUser } = await pool.query(
+        `SELECT c.*, u.username, u.profile_url, u.verified
+         FROM comments c
+         JOIN users u ON c.user_id = u.id
+         WHERE c.id = $1`,
+        [comment.id]
+      );
+      
+      // Clear caches
+      await redis.del(`music:${id}:comments`);
+      await redis.del(`user:${music.user_id}:stats`);
+      
+      res.status(201).json({ comment: commentWithUser[0] });
+      
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error("Add music comment error:", err);
+      res.status(500).json({ 
+        error: "Failed to add comment",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Get comments for music with optimized queries and pagination
+app.get("/api/music/:id/comments", 
+  [
+    param('id').isInt().withMessage('Invalid music ID'),
+    query('limit').optional().isInt({ min: 1, max: 50 }).withMessage('Limit must be 1-50'),
+    query('offset').optional().isInt({ min: 0 }).withMessage('Offset must be non-negative'),
+    query('sort').optional().isIn(['newest', 'oldest', 'popular']).withMessage('Invalid sort option')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { limit = 20, offset = 0, sort = 'newest' } = req.query;
+      
+      // Check cache first
+      const cacheKey = `music:${id}:comments:${limit}:${offset}:${sort}`;
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return res.json({ comments: JSON.parse(cached), cached: true });
+      }
+      
+      // Build sort clause
+      let orderBy = 'c.created_at DESC';
+      switch (sort) {
+        case 'oldest':
+          orderBy = 'c.created_at ASC';
+          break;
+        case 'popular':
+          orderBy = 'c.likes DESC, c.created_at DESC';
+          break;
+      }
+      
+      // Get top-level comments with user info and like status
+      let query = `
+        SELECT c.*, 
+               u.username, 
+               u.profile_url,
+               u.verified,
+               CASE WHEN cr.user_id IS NOT NULL THEN true ELSE false END as user_liked
+        FROM comments c 
+        JOIN users u ON c.user_id = u.id 
+        LEFT JOIN content_reactions cr ON cr.content_id = c.id AND cr.content_type = 'comment' AND cr.reaction_type = 'like'
+        WHERE c.content_type = 'music' AND c.content_id = $1 AND c.parent_id IS NULL AND c.is_deleted = false
+        ORDER BY ${orderBy}
+        LIMIT $2 OFFSET $3
+      `;
+      
+      const { rows } = await pool.query(query, [id, limit, offset]);
+      
+      // Get replies for each comment (optimized with single query)
+      if (rows.length > 0) {
+        const commentIds = rows.map(c => c.id);
+        const { rows: replies } = await pool.query(
+          `SELECT c.*, 
+                  u.username, 
+                  u.profile_url,
+                  u.verified,
+                  CASE WHEN cr.user_id IS NOT NULL THEN true ELSE false END as user_liked
+           FROM comments c 
+           JOIN users u ON c.user_id = u.id
+           LEFT JOIN content_reactions cr ON cr.content_id = c.id AND cr.content_type = 'comment' AND cr.reaction_type = 'like'
+           WHERE c.parent_id = ANY($1) AND c.is_deleted = false
+           ORDER BY c.created_at ASC`,
+          [commentIds]
+        );
+        
+        // Group replies by parent comment
+        const repliesByParent = {};
+        replies.forEach(reply => {
+          if (!repliesByParent[reply.parent_id]) {
+            repliesByParent[reply.parent_id] = [];
+          }
+          repliesByParent[reply.parent_id].push(reply);
+        });
+        
+        // Attach replies to comments
+        rows.forEach(comment => {
+          comment.replies = repliesByParent[comment.id] || [];
+          comment.hasMoreReplies = comment.replies_count > comment.replies.length;
+        });
+      }
+      
+      // Get total count for pagination
+      const { rows: countRows } = await pool.query(
+        "SELECT COUNT(*) as total FROM comments WHERE content_type = 'music' AND content_id = $1 AND parent_id IS NULL AND is_deleted = false",
+        [id]
+      );
+      
+      const total = parseInt(countRows[0].total);
+      
+      const response = {
+        comments: rows,
+        pagination: {
+          total,
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+          hasMore: offset + limit < total
+        }
+      };
+      
+      // Cache for 2 minutes
+      await redis.setex(cacheKey, 120, JSON.stringify(rows));
+      
+      res.json(response);
+      
+    } catch (err) {
+      console.error("Get music comments error:", err);
+      res.status(500).json({ 
+        error: "Failed to get comments",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  }
+);
+
+// Search music with advanced filters
+app.get("/api/music/search", 
+  [
+    query('q').trim().isLength({ min: 1, max: 100 }).withMessage('Search query must be 1-100 characters'),
+    query('limit').optional().isInt({ min: 1, max: 50 }).withMessage('Limit must be 1-50'),
+    query('offset').optional().isInt({ min: 0 }).withMessage('Offset must be non-negative'),
+    query('genre').optional().trim().isLength({ max: 50 }).withMessage('Invalid genre'),
+    query('artist').optional().trim().isLength({ max: 100 }).withMessage('Invalid artist'),
+    query('explicit').optional().isBoolean().withMessage('Explicit must be boolean'),
+    query('sort').optional().isIn(['relevance', 'newest', 'popular']).withMessage('Invalid sort option')
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { q, limit = 20, offset = 0, genre, artist, explicit, sort = 'relevance' } = req.query;
+      
+      // Check cache
+      const cacheKey = `search:music:${q}:${limit}:${offset}:${genre || 'all'}:${artist || 'all'}:${explicit || 'all'}:${sort}`;
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return res.json({ music: JSON.parse(cached), cached: true });
+      }
+      
+      // Build search query
+      let whereClause = "m.processing_status = 'completed' AND (m.title ILIKE $1 OR m.artist ILIKE $1 OR m.album ILIKE $1)";
+      const queryParams = [`%${q}%`];
+      
+      if (genre) {
+        whereClause += " AND m.genre = $" + (queryParams.length + 1);
+        queryParams.push(genre);
+      }
+      
+      if (artist) {
+        whereClause += " AND m.artist ILIKE $" + (queryParams.length + 1);
+        queryParams.push(`%${artist}%`);
+      }
+      
+      if (explicit !== undefined) {
+        whereClause += " AND m.explicit = $" + (queryParams.length + 1);
+        queryParams.push(explicit === 'true');
+      }
+      
+      // Build order by
+      let orderBy = '';
+      switch (sort) {
+        case 'relevance':
+          orderBy = "CASE WHEN m.title ILIKE $1 THEN 1 WHEN m.artist ILIKE $1 THEN 2 ELSE 3 END, m.listens DESC";
+          break;
+        case 'newest':
+          orderBy = "m.created_at DESC";
+          break;
+        case 'popular':
+          orderBy = "m.listens DESC, m.likes DESC";
+          break;
+      }
+      
+      const query = `
+        SELECT m.*, 
+               u.username, 
+               u.profile_url,
+               u.verified,
+               ts_rank_cd(to_tsvector('english', m.title || ' ' || m.artist || ' ' || COALESCE(m.album, '')), plainto_tsquery('english', $1)) as relevance_score
+        FROM music m 
+        JOIN users u ON m.user_id = u.id 
+        WHERE ${whereClause}
+        ORDER BY ${orderBy}
+        LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}
+      `;
+      
+      queryParams.push(limit, offset);
+      
+      const { rows } = await pool.query(query, queryParams);
+      
+      // Get total count
+      const countQuery = `
+        SELECT COUNT(*) as total
+        FROM music m
+        WHERE ${whereClause}
+      `;
+      
+      const { rows: countRows } = await pool.query(countQuery, queryParams.slice(0, -2));
+      const total = parseInt(countRows[0].total);
+      
+      const response = {
+        music: rows,
+        pagination: {
+          total,
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+          hasMore: offset + limit < total
+        },
+        query: q,
+        filters: { genre, artist, explicit, sort }
+      };
+      
+      // Cache for 5 minutes
+      await redis.setex(cacheKey, 300, JSON.stringify(rows));
+      
+      res.json(response);
+      
+    } catch (err) {
+      console.error("Search music error:", err);
+      res.status(500).json({ 
+        error: "Failed to search music",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  }
+);
 
 // --- Playlist Endpoints ---
 
