@@ -7417,6 +7417,382 @@ app.get("/api/comments/:id/reaction-status", authMiddleware, async (req, res) =>
   }
 });
 
+/* --------------------------
+   DATABASE
+---------------------------*/
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL
+});
+
+/* --------------------------
+   REDIS (SOCKET SCALING)
+---------------------------*/
+
+const pubClient = createClient({
+  url: process.env.REDIS_URL
+});
+
+const subClient = pubClient.duplicate();
+
+await pubClient.connect();
+await subClient.connect();
+
+/* --------------------------
+   SOCKET.IO
+---------------------------*/
+
+const io = new Server(server, {
+  cors: {
+    origin: "*"
+  }
+});
+
+io.adapter(createAdapter(pubClient, subClient));
+
+/* --------------------------
+   SOCKET CONNECTION
+---------------------------*/
+
+io.on("connection", (socket) => {
+
+  const userId = socket.handshake.auth.userId;
+
+  socket.userId = userId;
+
+  socket.join(`user-${userId}`);
+
+  console.log("User connected:", userId);
+
+  /* ==========================
+     PRIVATE MESSAGE
+  ==========================*/
+
+  socket.on("private-message", async (data) => {
+
+    try {
+
+      const { recipientId, ciphertext, nonce } = data;
+
+      const messageId = uuidv4();
+
+      await pool.query(
+        `INSERT INTO private_messages
+        (id,sender_id,recipient_id,ciphertext,nonce,created_at)
+        VALUES ($1,$2,$3,$4,$5,NOW())`,
+        [
+          messageId,
+          userId,
+          recipientId,
+          ciphertext,
+          nonce
+        ]
+      );
+
+      io.to(`user-${recipientId}`).emit(
+        "private-message",
+        {
+          id: messageId,
+          senderId: userId,
+          ciphertext,
+          nonce,
+          createdAt: Date.now()
+        }
+      );
+
+    } catch (err) {
+
+      console.error(err);
+
+    }
+
+  });
+
+  /* ==========================
+     GROUP JOIN
+  ==========================*/
+
+  socket.on("join-group", (groupId) => {
+
+    socket.join(`group-${groupId}`);
+
+  });
+
+  /* ==========================
+     GROUP MESSAGE
+  ==========================*/
+
+  socket.on("group-message", async (data) => {
+
+    const { groupId, ciphertext, nonce } = data;
+
+    const messageId = uuidv4();
+
+    await pool.query(
+      `INSERT INTO group_messages
+       (id,group_id,sender_id,ciphertext,nonce,created_at)
+       VALUES ($1,$2,$3,$4,$5,NOW())`,
+      [
+        messageId,
+        groupId,
+        userId,
+        ciphertext,
+        nonce
+      ]
+    );
+
+    io.to(`group-${groupId}`).emit(
+      "group-message",
+      {
+        id: messageId,
+        senderId: userId,
+        ciphertext,
+        nonce
+      }
+    );
+
+  });
+
+  /* ==========================
+     REACTIONS
+  ==========================*/
+
+  socket.on("add-reaction", async (data) => {
+
+    const { messageId, reaction } = data;
+
+    const reactionId = uuidv4();
+
+    await pool.query(
+      `INSERT INTO message_reactions
+      (id,message_id,user_id,reaction)
+      VALUES ($1,$2,$3,$4)`,
+      [
+        reactionId,
+        messageId,
+        userId,
+        reaction
+      ]
+    );
+
+    io.emit("message-reaction", {
+      messageId,
+      userId,
+      reaction
+    });
+
+  });
+
+  /* ==========================
+     EDIT MESSAGE
+  ==========================*/
+
+  socket.on("edit-message", async (data) => {
+
+    const { messageId, ciphertext, nonce } = data;
+
+    const result = await pool.query(
+      `UPDATE private_messages
+       SET ciphertext=$1,
+           nonce=$2,
+           edited_at=NOW()
+       WHERE id=$3
+       AND sender_id=$4`,
+      [
+        ciphertext,
+        nonce,
+        messageId,
+        userId
+      ]
+    );
+
+    if (result.rowCount > 0) {
+
+      io.emit("message-edited", {
+        messageId,
+        ciphertext,
+        nonce
+      });
+
+    }
+
+  });
+
+  /* ==========================
+     DELETE MESSAGE
+  ==========================*/
+
+  socket.on("delete-message", async ({ messageId }) => {
+
+    await pool.query(
+      `DELETE FROM private_messages
+       WHERE id=$1
+       AND sender_id=$2`,
+      [
+        messageId,
+        userId
+      ]
+    );
+
+    io.emit("message-deleted", {
+      messageId
+    });
+
+  });
+
+  /* ==========================
+     SELF DESTRUCT MESSAGE
+  ==========================*/
+
+  socket.on("send-expiring-message", async (data) => {
+
+    const {
+      recipientId,
+      ciphertext,
+      nonce,
+      expiresIn
+    } = data;
+
+    const messageId = uuidv4();
+
+    const expiresAt = new Date(
+      Date.now() + expiresIn
+    );
+
+    await pool.query(
+      `INSERT INTO private_messages
+       (id,sender_id,recipient_id,ciphertext,nonce,expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        messageId,
+        userId,
+        recipientId,
+        ciphertext,
+        nonce,
+        expiresAt
+      ]
+    );
+
+    io.to(`user-${recipientId}`).emit(
+      "private-message",
+      {
+        id: messageId,
+        senderId: userId,
+        ciphertext,
+        nonce,
+        expiresAt
+      }
+    );
+
+  });
+
+  /* ==========================
+     TYPING
+  ==========================*/
+
+  socket.on("typing", (data) => {
+
+    socket.to(`user-${data.userId}`)
+    .emit("typing", {
+      from: userId
+    });
+
+  });
+
+  /* ==========================
+     READ RECEIPTS
+  ==========================*/
+
+  socket.on("read-messages", ({ senderId }) => {
+
+    io.to(`user-${senderId}`).emit(
+      "messages-read",
+      {
+        readerId: userId
+      }
+    );
+
+  });
+
+  /* ==========================
+     CALL SIGNALING
+  ==========================*/
+
+  socket.on("call-user", (data) => {
+
+    const { userId: targetUser, channel } = data;
+
+    io.to(`user-${targetUser}`)
+    .emit("incoming-call", {
+      from: userId,
+      channel
+    });
+
+  });
+
+  socket.on("accept-call", (data) => {
+
+    const { callerId } = data;
+
+    io.to(`user-${callerId}`)
+    .emit("call-accepted", {
+      by: userId
+    });
+
+  });
+
+  socket.on("disconnect", () => {
+
+    console.log("User disconnected:", userId);
+
+  });
+
+});
+
+/* --------------------------
+   AUTO DELETE EXPIRED
+---------------------------*/
+
+setInterval(async () => {
+
+  try {
+
+    const result = await pool.query(
+      `DELETE FROM private_messages
+       WHERE expires_at IS NOT NULL
+       AND expires_at < NOW()`
+    );
+
+    if (result.rowCount > 0) {
+
+      console.log(
+        "Expired messages deleted:",
+        result.rowCount
+      );
+
+    }
+
+  } catch (err) {
+
+    console.error(err);
+
+  }
+
+}, 10000);
+
+/* --------------------------
+   START SERVER
+---------------------------*/
+
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => {
+
+  console.log("Server running on port", PORT);
+
+});
+      
+
 // Add these tables to your database initialization function
 
 // Dislikes table
