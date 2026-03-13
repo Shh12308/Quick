@@ -897,6 +897,33 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
   res.json({ received: true });
 });
 
+
+export function processVideo(input, outputDir) {
+
+  return new Promise((resolve, reject) => {
+
+    ffmpeg(input)
+
+      .output(`${outputDir}/720p.m3u8`)
+      .videoCodec("libx264")
+      .size("1280x720")
+
+      .outputOptions([
+        "-profile:v baseline",
+        "-level 3.0",
+        "-start_number 0",
+        "-hls_time 10",
+        "-hls_list_size 0",
+        "-f hls"
+      ])
+
+      .on("end", () => resolve())
+      .on("error", reject)
+
+      .run();
+
+  });
+
 // Example: Taking a 10% platform fee
 const platformFeePercent = 0.10;
 const platformFeeAmount = Math.floor(amount * platformFeePercent);
@@ -7195,7 +7222,78 @@ app.post("/api/confirm-email", async (req, res) => {
   }
 });
 
-// --- Dislike Functionality ---
+app.get("/search", async (req,res)=>{
+
+ const result = await client.search({
+  index:"videos",
+  query:{
+   match:{
+    title:req.query.q
+   }
+  }
+ });
+
+ res.json(result.hits.hits);
+
+});
+
+      app.get("/feed", async (req, res) => {
+
+  const { rows } = await pool.query(`
+    SELECT * FROM videos
+    ORDER BY views DESC
+    LIMIT 20
+  `);
+
+  res.json(rows);
+
+});
+
+      import { Queue } from "bullmq";
+
+const messageQueue = new Queue(
+  "messages",
+  {
+    connection: {
+      host: "localhost",
+      port: 6379
+    }
+  }
+);
+
+      await messageQueue.add("sendMessage", {
+
+  senderId,
+  recipientId,
+  message
+
+});
+
+      import { Worker } from "bullmq";
+
+const worker = new Worker(
+  "messages",
+
+  async job => {
+
+    const data = job.data;
+
+    await pool.query(
+      `INSERT INTO private_messages
+       (id,sender_id,recipient_id,ciphertext)
+       VALUES ($1,$2,$3,$4)`,
+      [
+        crypto.randomUUID(),
+        data.senderId,
+        data.recipientId,
+        data.message
+      ]
+    );
+
+  }
+);
+
+      
 
 // Dislike/undislike video
 app.post("/api/videos/:id/dislike", authMiddleware, async (req, res) => {
