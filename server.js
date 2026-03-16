@@ -5005,6 +5005,56 @@ app.post("/api/challenges/:id/enter", authMiddleware, async (req, res) => {
   }
 });
 
+  app.post("/token", (req, res) => {
+  const { channelName, uid } = req.body;
+  const expirationTime = 3600; // seconds
+  const token = Agora.RtcTokenBuilder.buildTokenWithUid(
+    APP_ID,
+    APP_CERTIFICATE,
+    channelName,
+    uid,
+    Agora.RtcRole.PUBLISHER,
+    expirationTime
+  );
+  res.json({ token });
+});
+
+// Send Push Notification (iOS/Android)
+app.post("/call", async (req, res) => {
+  const { targetDevice, platform, callerName } = req.body;
+
+  if(platform === "ios"){
+    // VoIP PushKit payload (APNs)
+    await fetch("https://api.push.apple.com/3/device/"+targetDevice, {
+      method: "POST",
+      headers: {
+        "apns-topic": "com.your.app.voip",
+        "Authorization": "bearer YOUR_APNS_AUTH_KEY"
+      },
+      body: JSON.stringify({
+        aps: { "alert": `${callerName} is calling`, "sound": "default" },
+        type: "voip"
+      })
+    });
+  } else {
+    // FCM push for Android
+    await fetch("https://fcm.googleapis.com/fcm/send", {
+      method: "POST",
+      headers: {
+        "Authorization": "key=YOUR_FCM_SERVER_KEY",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        to: targetDevice,
+        data: { callerName, callType: "video" }
+      })
+    });
+  }
+
+  res.send("Call notification sent");
+});
+
+
 // Get challenge entries
 app.get("/api/challenges/:id/entries", async (req, res) => {
   try {
