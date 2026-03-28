@@ -924,14 +924,19 @@ const platformFeeAmount = Math.floor(amount * platformFeePercent);
 const creatorPayoutAmount = amount - platformFeeAmount;
 
 const paymentIntent = await stripe.paymentIntents.create({
-  amount: amount, // The full amount is charged to the customer
+  amount: amount,             // total amount charged to the customer (in cents)
   currency: 'usd',
-  // ... metadata
-  transfer_data: {
-    destination: rows[0].stripe_account_id,
-    amount: creatorPayoutAmount, // Only transfer the creator's share
+  metadata: {
+    viewerId,
+    creatorId,
+    paymentType,             // e.g., 'video_purchase', 'donation'
   },
-  application_fee_amount: platformFeeAmount, // Explicitly record your fee
+  transfer_data: {
+    destination: rows[0].stripe_account_id, // Creator’s Stripe account
+    // Do NOT include `amount` here unless you want a partial transfer
+    // Stripe automatically transfers the remainder after application_fee_amount
+  },
+  application_fee_amount: platformFeeAmount, // platform fee in cents
 });
 
 
