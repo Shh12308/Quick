@@ -1299,10 +1299,10 @@ class RecommendationEngine {
         [contentIds]
       );
 
-      // POST /api/stripe/create-payment-intent
+
 app.post("/api/stripe/create-payment-intent", authMiddleware, async (req, res) => {
   try {
-    const { amount, currency = 'usd', creatorId, paymentType } = req.body; // amount in cents
+    const { amount, currency = "usd", creatorId, paymentType } = req.body; // amount in cents
     const viewerId = req.user.id;
 
     // Get the creator's Stripe account ID
@@ -1315,7 +1315,7 @@ app.post("/api/stripe/create-payment-intent", authMiddleware, async (req, res) =
       return res.status(400).json({ error: "Creator does not have a payment account" });
     }
 
-    // Create the PaymentIntent
+    // Create the PaymentIntent with Stripe Connect
     const paymentIntent = await stripe.paymentIntents.create({
       amount,
       currency,
@@ -1324,18 +1324,14 @@ app.post("/api/stripe/create-payment-intent", authMiddleware, async (req, res) =
         creatorId,
         paymentType, // e.g., 'video_purchase', 'donation'
       },
-      // This is the magic for Stripe Connect!
-      // It tells Stripe to hold the funds for a transfer.
       transfer_data: {
         destination: rows[0].stripe_account_id,
-        // You can take a platform fee here. e.g., 10%:
-        // amount: Math.floor(amount * 0.90), // Transfer 90% to creator
+        // optional: take a platform fee
+        // amount: Math.floor(amount * 0.90), // 90% to creator
       },
     });
 
-    res.json({
-      clientSecret: paymentIntent.client_secret,
-    });
+    res.json({ clientSecret: paymentIntent.client_secret });
   } catch (err) {
     console.error("Error creating payment intent:", err);
     res.status(500).json({ error: "Failed to create payment intent" });
