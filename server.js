@@ -1,5 +1,6 @@
 import express from "express";
 import pg from "pg";
+import { Queue } from "bullmq";
 import argon2 from "argon2";
 import jwt from "jsonwebtoken";
 import passport from "passport";
@@ -7271,8 +7272,6 @@ app.get("/search", async (req,res)=>{
   res.json(rows);
 
 });
-
-      import { Queue } from "bullmq";
 
 const messageQueue = new Queue(
   "messages",
