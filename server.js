@@ -47,9 +47,6 @@ import { createHmac } from "crypto";
 import { Worker } from "worker_threads";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
-// server.js or index.js
-require('dotenv').config();
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
