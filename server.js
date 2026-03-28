@@ -9,7 +9,7 @@ import { Strategy as GitHubStrategy } from "passport-github2";
 import http from "http";
 import nodemailer from "nodemailer";
 import multer from "multer";
-import stripe from "stripe";
+import Stripe from "stripe";
 import path from "path";
 import dayjs from "dayjs";
 import fs from "fs";
