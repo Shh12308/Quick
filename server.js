@@ -923,24 +923,6 @@ const platformFeePercent = 0.10;
 const platformFeeAmount = Math.floor(amount * platformFeePercent);
 const creatorPayoutAmount = amount - platformFeeAmount;
 
-const paymentIntent = await stripe.paymentIntents.create({
-  amount: amount,             // total amount charged to the customer (in cents)
-  currency: 'usd',
-  metadata: {
-    viewerId,
-    creatorId,
-    paymentType,             // e.g., 'video_purchase', 'donation'
-  },
-  transfer_data: {
-    destination: rows[0].stripe_account_id, // Creator’s Stripe account
-    // Do NOT include `amount` here unless you want a partial transfer
-    // Stripe automatically transfers the remainder after application_fee_amount
-  },
-  application_fee_amount: platformFeeAmount, // platform fee in cents
-});
-
-
-
 app.use(passport.initialize());
 app.use(passport.session());
 
@@ -1307,10 +1289,10 @@ class RecommendationEngine {
 
 app.post("/api/stripe/create-payment-intent", authMiddleware, async (req, res) => {
   try {
-    const { amount, currency = "usd", creatorId, paymentType } = req.body; // amount in cents
+    const { amount, creatorId, paymentType } = req.body;
     const viewerId = req.user.id;
 
-    // Get the creator's Stripe account ID
+    // Get creator's Stripe account
     const { rows } = await pool.query(
       "SELECT stripe_account_id FROM users WHERE id = $1",
       [creatorId]
@@ -1320,20 +1302,16 @@ app.post("/api/stripe/create-payment-intent", authMiddleware, async (req, res) =
       return res.status(400).json({ error: "Creator does not have a payment account" });
     }
 
-    // Create the PaymentIntent with Stripe Connect
+    // Example: calculate platform fee
+    const platformFeeAmount = Math.floor(amount * 0.10); // 10% fee
+
+    // Create PaymentIntent
     const paymentIntent = await stripe.paymentIntents.create({
-      amount,
-      currency,
-      metadata: {
-        viewerId,
-        creatorId,
-        paymentType, // e.g., 'video_purchase', 'donation'
-      },
-      transfer_data: {
-        destination: rows[0].stripe_account_id,
-        // optional: take a platform fee
-        // amount: Math.floor(amount * 0.90), // 90% to creator
-      },
+      amount, // total charge
+      currency: "usd",
+      metadata: { viewerId, creatorId, paymentType },
+      transfer_data: { destination: rows[0].stripe_account_id },
+      application_fee_amount: platformFeeAmount,
     });
 
     res.json({ clientSecret: paymentIntent.client_secret });
