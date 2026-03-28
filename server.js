@@ -1,6 +1,7 @@
 import express from "express";
 import pg from "pg";
 import { Queue } from "bullmq";
+import { Worker } from "bullmq";
 import argon2 from "argon2";
 import jwt from "jsonwebtoken";
 import passport from "passport";
