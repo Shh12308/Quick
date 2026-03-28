@@ -24,19 +24,10 @@ import os from "os";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 import helmet from "helmet";
-app.use(helmet());
 import rateLimit from "express-rate-limit";
 import axios from "axios";
 import { createClient } from "redis";
 import { createAdapter } from "@socket.io/redis-adapter";
-
-const pubClient = createClient({ url: process.env.REDIS_URL });
-const subClient = pubClient.duplicate();
-
-await pubClient.connect();
-await subClient.connect();
-
-io.adapter(createAdapter(pubClient, subClient));
 import OpenAI from "openai";
 import FormData from "form-data";
 import Redis from "ioredis";
@@ -46,36 +37,35 @@ import { createWorker } from "tesseract.js";
 import sharp from "sharp";
 import { createCanvas, loadImage } from "canvas";
 import { createHmac } from "crypto";
-import { Worker } from "worker_threads";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
+import session from "express-session";
+import RedisStore from "connect-redis";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const app = express();               // ✅ FIRST
+const app = express(); // ✅ initialize app first
+
+app.use(helmet());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Initialize Redis for caching and session storage
+// Redis setup
+const pubClient = createClient({ url: process.env.REDIS_URL });
+const subClient = pubClient.duplicate();
+await pubClient.connect();
+await subClient.connect();
+
+// Redis adapter for Socket.IO
+io.adapter(createAdapter(pubClient, subClient));
+
+// Redis caching and session
 const redis = new Redis(process.env.REDIS_URL);
-const cache = new NodeCache({ stdTTL: 600 }); // Cache with 10 minute TTL
-
-// Initialize PostgreSQL pool
-const pool = new pg.Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASS,
-  port: process.env.DB_PORT,
-  max: 20, // Maximum number of clients in the pool
-  idleTimeoutMillis: 30000, // How long a client is allowed to remain idle before being closed
-  connectionTimeoutMillis: 2000, // How long to wait when connecting a new client
-});
-
-// Session configuration with Redis store
-import session from "express-session";
-import RedisStore from "connect-redis";
+const cache = new NodeCache({ stdTTL: 600 });
 
 app.use(
   session({
@@ -92,10 +82,19 @@ app.use(
   })
 );
 
-const { RtcRole, RtcTokenBuilder } = pkg;
+// PostgreSQL pool
+const pool = new pg.Pool({
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASS,
+  port: process.env.DB_PORT,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
 
-import dotenv from "dotenv";
-dotenv.config();
+const { RtcRole, RtcTokenBuilder } = pkg;
 
 const {
   DB_USER,
