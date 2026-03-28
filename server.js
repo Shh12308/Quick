@@ -9,6 +9,7 @@ import { Strategy as GitHubStrategy } from "passport-github2";
 import http from "http";
 import nodemailer from "nodemailer";
 import multer from "multer";
+import stripe from "stripe";
 import path from "path";
 import dayjs from "dayjs";
 import fs from "fs";
@@ -165,10 +166,6 @@ const s3 = new S3Client({
 
 // OpenAI client
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
-// Stripe client
-import Stripe from "stripe";
-const stripe = Stripe(STIPE_SECRET_KEY);
 
 // Create tables if they don't exist
 async function initializeTables() {
