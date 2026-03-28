@@ -13,6 +13,7 @@
     "agora-access-token": "^2.0.4",
     "argon2": "^0.30.0",
     "axios": "^1.7.6",
+    "bullmq": "^2.16.0",
     "dayjs": "^1.11.11",
     "express": "^4.18.2",
     "express-session": "^1.17.3",
