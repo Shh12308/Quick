@@ -7291,8 +7291,6 @@ const messageQueue = new Queue(
 
 });
 
-      import { Worker } from "bullmq";
-
 const worker = new Worker(
   "messages",
 
