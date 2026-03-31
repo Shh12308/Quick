@@ -17,6 +17,7 @@
   "bullmq": "^5.58.5",
     "@socket.io/redis-adapter": "^8.0.0",
   "helmet": "^7.0.0",
+    "tesseract.js": "^4.0.2",
   "dayjs": "^1.11.11",
     "node-cache": "^5.1.2",
     "express-rate-limit": "^7.0.0",
