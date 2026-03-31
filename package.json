@@ -13,6 +13,7 @@
   "agora-access-token": "^2.0.4",
   "argon2": "^0.30.0",
   "axios": "^1.7.6",
+    "node-cache": "^5.1.2",
   "bullmq": "^5.58.5",
     "@socket.io/redis-adapter": "^8.0.0",
   "helmet": "^7.0.0",
