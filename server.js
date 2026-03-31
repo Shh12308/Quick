@@ -7897,20 +7897,7 @@ setInterval(async () => {
   }
 
 }, 10000);
-
-/* --------------------------
-   START SERVER
----------------------------*/
-
-const PORT = process.env.PORT || 3000;
-
-server.listen(PORT, () => {
-
-  console.log("Server running on port", PORT);
-
-});
       
-
 // Add these tables to your database initialization function
 
 // Dislikes table
@@ -8024,3 +8011,4 @@ server.listen(PORT, () => {
     recommendationEngine.updateTrendingScores();
   }, 5000);
 });
+
