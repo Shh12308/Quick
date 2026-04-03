@@ -46,16 +46,18 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const io = new Server(server, {
-  cors: {
-    origin: "*"
-  }
-})
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express(); // ✅ initialize app first
+
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: "*"
+  }
+});
 
 app.use(helmet());
 app.use(express.json({ limit: '50mb' }));
