@@ -31,6 +31,7 @@ import { createAdapter } from "@socket.io/redis-adapter";
 import OpenAI from "openai";
 import FormData from "form-data";
 import Redis from "ioredis";
+import { Server } from "socket.io";
 import NodeCache from "node-cache";
 import cron from "node-cron";
 import { createWorker } from "tesseract.js";
