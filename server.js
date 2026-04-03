@@ -45,6 +45,12 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+const io = new Server(server, {
+  cors: {
+    origin: "*"
+  }
+})
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
