@@ -1331,6 +1331,31 @@ app.post("/api/stripe/create-payment-intent", authMiddleware, async (req, res) =
   }
 });
 
+      app.post("/api/subscriptions/create-session", authMiddleware, async (req, res) => {
+  try {
+    const { priceId } = req.body;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price: priceId, // your Stripe price ID
+          quantity: 1,
+        },
+      ],
+      success_url: `${process.env.FRONTEND_URL}/payment-result?success=true`,
+      cancel_url: `${process.env.FRONTEND_URL}/payment-result?success=false`,
+      customer_email: req.user.email,
+    });
+
+    res.json({ sessionId: session.id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to create session" });
+  }
+});
+
       // POST /api/stripe/create-login-link
 app.post("/api/stripe/create-login-link", authMiddleware, async (req, res) => {
   try {
