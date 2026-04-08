@@ -1331,16 +1331,29 @@ app.post("/api/stripe/create-payment-intent", authMiddleware, async (req, res) =
   }
 });
 
-      app.post("/api/subscriptions/create-session", authMiddleware, async (req, res) => {
+app.post("/api/subscriptions/checkout", authMiddleware, async (req, res) => {
   try {
-    const { priceId } = req.body;
+    const { tierId } = req.body;
+
+    // Map tierId → Stripe price IDs
+    const priceMap = {
+      1: "price_monthly_id",
+      2: "price_yearly_id",
+      3: "price_elite_id"
+    };
+
+    const priceId = priceMap[tierId];
+
+    if (!priceId) {
+      return res.status(400).json({ error: "Invalid tier" });
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       payment_method_types: ["card"],
       line_items: [
         {
-          price: priceId, // your Stripe price ID
+          price: priceId,
           quantity: 1,
         },
       ],
@@ -1350,9 +1363,10 @@ app.post("/api/stripe/create-payment-intent", authMiddleware, async (req, res) =
     });
 
     res.json({ sessionId: session.id });
+
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Failed to create session" });
+    res.status(500).json({ error: "Failed to create checkout session" });
   }
 });
 
