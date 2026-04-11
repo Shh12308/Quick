@@ -5041,6 +5041,55 @@ app.post("/api/challenges/:id/enter", authMiddleware, async (req, res) => {
   res.json({ token });
 });
 
+app.post("/call/create", async (req, res) => {
+  const { caller, receiver, channel } = req.body;
+
+  const call = {
+    id: Date.now().toString(),
+    caller,
+    receiver,
+    channel,
+    status: "ringing",
+    startedAt: Date.now()
+  };
+
+  // SAVE TO DB (MongoDB / Firebase / PostgreSQL)
+  await db.collection("calls").insertOne(call);
+
+  res.json(call);
+});
+
+  app.post("/call/update", async (req, res) => {
+  const { id, status } = req.body;
+
+  await db.collection("calls").updateOne(
+    { id },
+    {
+      $set: {
+        status,
+        endedAt: Date.now()
+      }
+    }
+  );
+
+  res.json({ success: true });
+});
+
+  app.get("/call/missed/:userId", async (req, res) => {
+  const { userId } = req.params;
+
+  const calls = await db.collection("calls")
+    .find({
+      receiver: userId,
+      status: "missed"
+    })
+    .toArray();
+
+  res.json(calls);
+});
+
+  
+
 // Send Push Notification (iOS/Android)
 app.post("/call", async (req, res) => {
   const { targetDevice, platform, callerName, channel } = req.body;
