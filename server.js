@@ -5043,23 +5043,34 @@ app.post("/api/challenges/:id/enter", authMiddleware, async (req, res) => {
 
 // Send Push Notification (iOS/Android)
 app.post("/call", async (req, res) => {
-  const { targetDevice, platform, callerName } = req.body;
+  const { targetDevice, platform, callerName, channel } = req.body;
 
-  if(platform === "ios"){
-    // VoIP PushKit payload (APNs)
-    await fetch("https://api.push.apple.com/3/device/"+targetDevice, {
+  const payload = {
+    type: "incoming_call",
+    caller: callerName,
+    channel: channel
+  };
+
+  if (platform === "ios") {
+    // ✅ Proper VoIP Push (APNs)
+    await fetch(`https://api.push.apple.com/3/device/${targetDevice}`, {
       method: "POST",
       headers: {
         "apns-topic": "com.your.app.voip",
+        "apns-push-type": "voip",
+        "apns-priority": "10",
         "Authorization": "bearer YOUR_APNS_AUTH_KEY"
       },
       body: JSON.stringify({
-        aps: { "alert": `${callerName} is calling`, "sound": "default" },
-        type: "voip"
+        aps: {
+          "content-available": 1
+        },
+        ...payload
       })
     });
+
   } else {
-    // FCM push for Android
+    // ✅ Android (FCM)
     await fetch("https://fcm.googleapis.com/fcm/send", {
       method: "POST",
       headers: {
@@ -5068,7 +5079,8 @@ app.post("/call", async (req, res) => {
       },
       body: JSON.stringify({
         to: targetDevice,
-        data: { callerName, callType: "video" }
+        priority: "high",
+        data: payload
       })
     });
   }
