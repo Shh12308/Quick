@@ -211,6 +211,56 @@ async function initializeTables() {
       )
     `);
 
+        // --- Chats Table ---
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chats (
+        id SERIAL PRIMARY KEY,
+        creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(10) CHECK (type IN ('dm', 'group')),
+        name VARCHAR(255),
+        avatar TEXT,
+        participants INTEGER[] DEFAULT '{}', -- Array of user IDs
+        admin_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        pinned_by INTEGER[] DEFAULT '{}',
+        muted_by JSONB DEFAULT '{}', -- { user_id: timestamp }
+        last_message_id INTEGER REFERENCES chat_messages(id) ON DELETE SET NULL,
+        last_message_at TIMESTAMP,
+        is_archived BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // --- Chat Messages Table ---
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id SERIAL PRIMARY KEY,
+        chat_id INTEGER REFERENCES chats(id) ON DELETE CASCADE,
+        sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(20) CHECK (type IN ('text', 'image', 'video', 'voice', 'gif')),
+        content TEXT,
+        media_url TEXT,
+        is_deleted BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // --- Call Records Table ---
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS call_records (
+        id SERIAL PRIMARY KEY,
+        channel_name VARCHAR(255) UNIQUE NOT NULL,
+        caller_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        receiver_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        type VARCHAR(10) CHECK (type IN ('audio', 'video')),
+        status VARCHAR(20) DEFAULT 'ended', -- 'ringing', 'ongoing', 'ended', 'missed'
+        started_at TIMESTAMP,
+        ended_at TIMESTAMP,
+        duration INTEGER,
+        recording_url TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
     // --- Products Table (Supports both Physical & Digital) ---
 await pool.query(`
   CREATE TABLE IF NOT EXISTS products (
@@ -7373,6 +7423,325 @@ app.delete("/api/filters/:id", authMiddleware, async (req, res) => {
   }
 });
 
+  // --- Message Requests (Friend Requests / Follow Requests) ---
+app.get("/api/messages/requests", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Assuming you have a 'follows' or 'friend_requests' table.
+    // For this snippet, we'll return users who follow the current user but the user hasn't followed back yet.
+    const { rows } = await pool.query(`
+      SELECT u.id, u.username, u.profile_url, u.bio 
+      FROM follows f
+      JOIN users u ON f.follower_id = u.id
+      WHERE f.following_id = $1
+        AND NOT EXISTS (
+          SELECT 1 FROM follows back_f 
+          WHERE back_f.follower_id = $1 AND back_f.following_id = u.id
+        )
+    `, [userId]);
+
+    res.json(rows);
+  } catch (err) {
+    console.error("Get requests error:", err);
+    res.status(500).json({ error: "Failed to fetch requests" });
+  }
+});
+
+// --- Get Chats List ---
+app.get("/api/chats", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { rows } = await pool.query(`
+      SELECT 
+        c.*,
+        CASE 
+          WHEN cm.type = 'text' THEN cm.content
+          WHEN cm.type = 'image' THEN '📷 Photo'
+          WHEN cm.type = 'video' THEN '🎥 Video'
+          ELSE 'Start a conversation'
+        END as last_message_text,
+        cm.created_at as last_message_at,
+        u.username as name, 
+        u.profile_url as avatar,
+        u.is_online as isOnline,
+        CASE 
+          WHEN c.type = 'dm' THEN u2.id 
+          ELSE NULL 
+        END as remote_user_id
+      FROM chats c
+      JOIN participants p ON c.id = p.chat_id
+      JOIN users u ON (c.type = 'dm' AND (p.user_id != u.id OR c.creator_id = u.id))
+      LEFT JOIN users u2 ON (c.type = 'dm' AND p.user_id != u.id AND c.creator_id != u.id)
+      LEFT JOIN chat_messages cm ON c.last_message_id = cm.id
+      WHERE p.user_id = $1 AND c.is_archived = false
+      GROUP BY c.id
+      ORDER BY 
+        c.pinned_by && $1 = ANY(c.pinned_by) DESC NULLS LAST, 
+        MAX(cm.created_at) DESC
+    `, [userId]);
+
+    // Map results to match frontend ChatItem structure
+    const chats = rows.map(c => ({
+      ...c,
+      id: c.id.toString(), // Ensure ID is string for frontend if needed
+      pinned: c.pinned_by && c.pinned_by.includes(userId),
+      isActive: c.is_online, // Map boolean
+      lastMessage: {
+        text: c.last_message_text,
+        type: c.last_message_type === 'text' ? 'text' : c.last_message_type, // simple logic
+        timestamp: c.last_message_at
+      },
+      privacyMode: 'show', // Default or fetch from preferences
+      remoteUserId: c.remote_user_id ? c.remote_user_id.toString() : null
+    }));
+
+    res.json(chats);
+  } catch (err) {
+    console.error("Get chats error:", err);
+    res.status(500).json({ error: "Failed to fetch chats" });
+  }
+});
+
+// --- Create New Chat (DM or Group) ---
+app.post("/api/chats", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { userIds, name, type } = req.body; // userIds: [otherUserId] for DM, [] or [id, id] for Group
+    
+    const currentUserId = req.user.id;
+    
+    if (type === 'dm') {
+      if (!users || users.length === 0) throw new Error("User ID required for DM");
+      const otherUserId = users[0];
+
+      // Check if chat already exists between these two
+      const { rows: existing } = await client.query(`
+        SELECT c.* 
+        FROM chats c
+        JOIN participants p1 ON c.id = p1.chat_id
+        JOIN participants p2 ON c.id = p2.chat_id
+        WHERE p1.user_id = $1 AND p2.user_id = $2 AND c.type = 'dm'
+      `, [currentUserId, otherUserId]);
+
+      if (existing.length > 0) {
+        await client.query('ROLLBACK');
+        return res.json({ chat: existing[0] });
+      }
+
+      // Create DM
+      const { rows } = await client.query(`
+        INSERT INTO chats (creator_id, type, name, participants)
+        VALUES ($1, 'dm', NULL, $2)
+        RETURNING *
+      `, [currentUserId, [currentUserId, otherUserId]]);
+      
+      res.status(201).json({ chat: rows[0] });
+
+    } else if (type === 'group') {
+      if (!name) throw new Error("Group name required");
+      const participantIds = Array.isArray(users) ? users : [];
+
+      // Create Group
+      const { rows } = await client.query(`
+        INSERT INTO chats (creator_id, type, name, participants, admin_id)
+        VALUES ($1, 'group', $2, $3, $1)
+        RETURNING *
+      `, [currentUserId, name, [...participantIds, currentUserId]]);
+
+      res.status(201).json({ chat: rows[0] });
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("Create chat error:", err);
+    res.status(500).json({ error: "Failed to create chat" });
+  } finally {
+    client.release();
+  }
+});
+
+// --- Get Messages for a Chat ---
+app.get("/api/chats/:id/messages", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const { limit = 50, before } = req.query; // Pagination support
+
+    let query = `
+      SELECT cm.*, u.username as sender_name, u.profile_url as sender_avatar
+      FROM chat_messages cm
+      JOIN users u ON cm.sender_id = u.id
+      WHERE cm.chat_id = $1 AND cm.is_deleted = false
+    `;
+    const params = [id];
+
+    if (before) {
+      query += ` AND cm.id < $2 ORDER BY cm.id DESC LIMIT $3`;
+      params.push(before, limit);
+    } else {
+      query += ` ORDER BY cm.created_at DESC LIMIT $1`;
+      params.push(limit);
+    }
+
+    const { rows } = await pool.query(query, params);
+
+    // Update `last_message_id` on chat table if this is the latest fetch
+    if (rows.length > 0) {
+      await pool.query("UPDATE chats SET last_message_id = $1 WHERE id = $2", [rows[0].id, id]);
+    }
+
+    res.json(rows);
+  } catch (err) {
+    console.error("Get messages error:", err);
+    res.status(500).json({ error: "Failed to fetch messages" });
+  }
+});
+
+// --- Send Message ---
+app.post("/api/chats/:id/messages", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const { type, content } = req.body;
+
+    let contentToSave = content;
+    let mediaUrl = null;
+
+    // Handle Image/Video Uploads if needed (Base64 to S3 logic here if not already handled)
+    if (type === 'image' || type === 'video') {
+        // If content is a Base64 string, upload to S3
+        if (content.startsWith('data:')) {
+           // Implementation: Upload Base64 string to S3 using `putObjectCommand`
+           // For brevity, assuming content is a URL or handled elsewhere
+        }
+        mediaUrl = content; 
+    }
+
+    const { rows } = await pool.query(`
+      INSERT INTO chat_messages (chat_id, sender_id, type, content, media_url, created_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
+      RETURNING *
+    `, [id, userId, type, contentToSave, mediaUrl]);
+
+    const message = rows[0];
+    
+    // Emit via Socket.IO for real-time update
+    io.to(`chat-${id}`).emit("new-message", message);
+
+    res.status(201).json(message);
+  } catch (err) {
+    console.error("Send message error:", err);
+    res.status(500).json({ error: "Failed to send message" });
+  }
+});
+
+// --- Chat Settings (Pin/Mute/Privacy) ---
+app.patch("/api/chats/:id/pin", authMiddleware, async (req, return res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    
+    // Toggle pinned status
+    const { rows: current } = await pool.query("SELECT * FROM chats WHERE id = $1", [id]);
+    if (current.length === 0) return res.status(404).json({ error: "Chat not found" });
+
+    const isPinned = current[0].pinned_by?.includes(userId);
+    
+    if (isPinned) {
+      await pool.query("UPDATE chats SET pinned_by = array_remove(pinned_by, $1) WHERE id = $2", [userId, id]);
+    } else {
+      await pool.query("UPDATE chats SET pinned_by = array_append(pinned_by, $1) WHERE id = $2", [userId, id]);
+    }
+
+    res.json({ pinned: !isPinned });
+  } catch (err) {
+    console.error("Pin chat error:", err);
+    res.status(500).json({ error: "Failed to pin chat" });
+  }
+});
+
+app.post("/api/chats/:id/mute", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { duration } = req.body; // '1h', '8h', '24h', 'forever'
+    const userId = req.user.id;
+
+    let mutedUntil = null;
+    if (duration !== 'forever') {
+      const hours = parseInt(duration);
+      mutedUntil = new Date(Date.now() + hours * 60 * 60 * 1000);
+    }
+
+    await pool.query(
+      "UPDATE chats SET muted_by = jsonb_set(muted_by, $1, $2) WHERE id = $3",
+      [userId, JSON.stringify(mutedUntil), id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Mute chat error:", err);
+    res.status(500).json({ error: "Failed to mute chat" });
+  }
+});
+
+// --- Delete Chat ---
+app.delete("/api/chats/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    // Logic to soft delete or hard delete
+    await pool.query("DELETE FROM chats WHERE id = $1 AND creator_id = $2", [id, userId]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete chat error:", err);
+    typingStatus(500).json({ error: "Failed to delete chat" });
+  }
+});
+
+// --- Call Token Endpoint (for CallModal) ---
+app.post("/api/calls/token", authMiddleware, async (req, res) => {
+  try {
+    const { channel, uid } = req.body;
+    
+    // Use your existing generateAgoraToken function or the logic from your server.js
+    const token = generateAgoraToken(channel, uid || req.user.id);
+    
+    res.json({ 
+      token, 
+      appId: process.env.AGORA_APP_ID, 
+      channel, 
+      uid: uid || req.user.id 
+    });
+  } catch (err) {
+    console.error("Get call token error:", err);
+    res.status(500).json({ error: "Failed to get token" });
+  }
+});
+
+// --- Save Call History ---
+app.post("/api/calls/history", authMiddleware, async (req, res) => {
+  try {
+    const { channelName, duration, type, recordingUrl } = req.body;
+    const userId = req.user.id;
+
+    await pool.query(`
+      INSERT INTO call_records (channel_name, caller_id, receiver_id, type, started_at, ended_at, duration, recording_url)
+      VALUES ($1, $2, NULL, $3, NOW(), NULL, $4, $5)
+    `, [channelName, userId, type, duration, recordingUrl]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Save call history error:", err);
+    res.status(500).json({ Error: "Failed to save call history" });
+  }
+});
+
 // --- Socket.IO Setup ---
 
 const server = http.createServer(app);
@@ -7411,6 +7780,50 @@ io.on("connection", (socket) => {
       }
     })
     .catch(err => console.error("Error checking if user is streamer:", err));
+
+  // Inside io.on("connection", (socket) => { ... }) block:
+
+// --- Chat Events ---
+
+socket.on("join-chat", async (chatId) => {
+  socket.join(`chat-${chatId}`);
+  // Send unread count or online status logic here if needed
+});
+
+socket.on("leave-chat", (chatId) => {
+  socket.leave(`chat-${chatId}`);
+});
+
+socket.on("typing-start", (data) => {
+  // data: { chatId }
+  socket.to(`chat-${data.chatId}`).emit("user-typing", { userId: socket.userId });
+});
+
+socket.on("typing-stop", (data) => {
+  socket.to(`chat-${data.chatId}`).emit("user-stop-typing", { userId: socket.userId });
+});
+
+// --- Call Events ---
+
+socket.on("join-call", (data) => {
+  const { channel } = data;
+  socket.join(`call-${channel}`);
+});
+
+socket.on("leave-call", (data) => {
+  const { channel } = data;
+  socket.leave(`call-${channel}`);
+});
+
+socket.on("call-status", (data) => {
+  // data: { channel, status: 'ringing' | 'live' | 'ended' | 'busy' }
+  socket.to(`call-${data.channel}`).emit("call-status", data);
+});
+
+socket.on("reaction", (data) => {
+  // data: { channel, emoji }
+  socket.to(`call-${data.channel}`).emit("new-reaction", { emoji: data.emoji, userId: socket.userId });
+});
   
   // Handle joining a livestream
   socket.on("join-stream", async (data) => {
