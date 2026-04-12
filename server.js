@@ -92,12 +92,14 @@ app.use(
 );
 
 // PostgreSQL pool
-const pool = new pg.Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASS,
-  port: process.env.DB_PORT,
+import pg from "pg";
+const { Pool } = pg;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
@@ -106,11 +108,6 @@ const pool = new pg.Pool({
 const { RtcRole, RtcTokenBuilder } = pkg;
 
 const {
-  DB_USER,
-  DB_HOST,
-  DB_NAME,
-  DB_PASS,
-  DB_PORT,
 
   JWT_SECRET = "supersecretkey",
   SESSION_SECRET = "sessionsecret",
