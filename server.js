@@ -7640,7 +7640,7 @@ app.post("/api/chats/:id/messages", authMiddleware, async (req, res) => {
 });
 
 // --- Chat Settings (Pin/Mute/Privacy) ---
-app.patch("/api/chats/:id/pin", authMiddleware, async (req, return res) => {
+app.patch("/api/chats/:id/pin", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
