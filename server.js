@@ -211,6 +211,60 @@ async function initializeTables() {
       )
     `);
 
+    // --- Products Table (Supports both Physical & Digital) ---
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS products (
+    id SERIAL PRIMARY KEY,
+    creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    price DECIMAL(10, 2) NOT NULL,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('physical', 'digital')),
+    images JSONB DEFAULT '[]',
+    tags JSONB DEFAULT '[]',
+    category VARCHAR(100),
+    
+    -- Physical specific
+    stock INTEGER DEFAULT 0,
+    sizes JSONB DEFAULT '[]',
+    colors JSONB DEFAULT '[]',
+    
+    -- Digital specific (Musicians)
+    crypto_address VARCHAR(255),
+    crypto_type VARCHAR(20) DEFAULT 'ETH',
+    
+    views INTEGER DEFAULT 0,
+    likes INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW()
+  )
+`);
+
+// --- Orders Table ---
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS orders (
+    id SERIAL PRIMARY KEY,
+    buyer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    seller_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    total_amount DECIMAL(10, 2) NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'shipped', 'completed', 'cancelled')),
+    payment_intent_id VARCHAR(255), -- Stripe ID or Crypto Tx Hash
+    shipping_address JSONB,
+    created_at TIMESTAMP DEFAULT NOW()
+  )
+`);
+
+// --- Order Items Table ---
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS order_items (
+    id SERIAL PRIMARY KEY,
+    order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+    product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+    quantity INTEGER DEFAULT 1,
+    price_at_purchase DECIMAL(10, 2) NOT NULL,
+    product_snapshot JSONB -- Stores title/image at time of purchase
+  )
+`);
+
     // Enhanced content tables for YouTube/TikTok functionality
     await pool.query(`
       CREATE TABLE IF NOT EXISTS videos (
@@ -6821,6 +6875,293 @@ app.get("/api/downloads/:token", async (req, res) => {
     res.status(500).json({ error: "Failed to get download URL" });
   }
 });
+
+  // --- products create/sale ---
+
+  // POST /api/products
+app.post("/api/products", authMiddleware, upload.array('images', 5), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const userId = req.user.id;
+    
+    // Parse JSON fields from FormData strings
+    const tags = req.body.tags ? JSON.parse(req.body.tags) : [];
+    const sizes = req.body.sizes ? JSON.parse(req.body.sizes) : [];
+    const colors = req.body.colors ? JSON.parse(req.body.colors) : [];
+    const { title, description, price, type, category, cryptoAddress, stock } = req.body;
+
+    // 1. Upload Images to S3
+    const imageUrls = [];
+    if (req.files && req.files.length > 0) {
+      for (const file of req.files) {
+        const key = `products/${userId}/${Date.now()}-${file.originalname}`;
+        const url = await contentProcessor.uploadToS3(file.path, key); // Assuming you have this helper
+        imageUrls.push(url);
+        // Clean up temp file
+        fs.unlinkSync(file.path); 
+      }
+    } else if (req.body.existingImages) {
+       // Handle if frontend passed existing URLs (if editing)
+       imageUrls.push(...JSON.parse(req.body.existingImages));
+    }
+
+    // 2. Insert Product
+    const query = `
+      INSERT INTO products (
+        creator_id, title, description, price, type, images, tags, category, 
+        stock, sizes, colors, crypto_address
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      RETURNING *
+    `;
+    
+    const values = [
+      userId, title, description, price, type, 
+      JSON.stringify(imageUrls), JSON.stringify(tags), category,
+      type === 'physical' ? stock : 0,
+      type === 'physical' ? JSON.stringify(sizes) : '[]',
+      type === 'physical' ? JSON.stringify(colors) : '[]',
+      type === 'digital' ? cryptoAddress : null
+    ];
+
+    const result = await client.query(query, values);
+    await client.query('COMMIT');
+
+    res.status(201).json({ product: result.rows[0] });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("Create Product Error:", err);
+    res.status(500).json({ error: "Failed to create product", details: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+  // GET /api/products
+app.get("/api/products", async (req, res) => {
+  try {
+    const { type, search } = req.query;
+    
+    let query = `
+      SELECT p.*, u.username as creator 
+      FROM products p
+      JOIN users u ON p.creator_id = u.id
+      WHERE 1=1
+    `;
+    const params = [];
+
+    // Filter by Type (Tabs: All, Physical, Digital)
+    if (type && type !== 'All') {
+      params.push(type);
+      query += ` AND p.type = $${params.length}`;
+    }
+
+    // Search logic
+    if (search) {
+      params.push(`%${search}%`);
+      query += ` AND (p.title ILIKE $${params.length} OR u.username ILIKE $${params.length})`;
+    }
+
+    query += ` ORDER BY p.created_at DESC`;
+
+    const { rows } = await pool.query(query, params);
+    
+    // Map results to match frontend expectations (e.g., images array)
+    const products = rows.map(p => ({
+      ...p,
+      images: p.images || [], // Ensure it's an array
+      creator: p.username // Map username to creator field
+    }));
+
+    res.json(products);
+
+  } catch (err) {
+    console.error("Get Products Error:", err);
+    res.status(500).json({ error: "Failed to fetch products" });
+  }
+});
+
+  // POST /api/orders
+app.post("/api/orders", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const buyerId = req.user.id;
+    const { items, shippingAddress } = req.body; // items: [{ productId, quantity }]
+    
+    let totalAmount = 0;
+    const orderItemsData = [];
+
+    // 1. Validate products and calculate total
+    for (const item of items) {
+      const { rows } = await client.query(
+        "SELECT * FROM products WHERE id = $1", [item.productId]
+      );
+      
+      if (rows.length === 0) throw new Error(`Product ${item.productId} not found`);
+      const product = rows[0];
+
+      if (product.type === 'physical' && product.stock < item.quantity) {
+        throw new Error(`Insufficient stock for ${product.title}`);
+      }
+
+      const itemTotal = product.price * item.quantity;
+      totalAmount += itemTotal;
+
+      orderItemsData.push({
+        product,
+        quantity: item.quantity,
+        priceAtPurchase: product.price
+      });
+    }
+
+    // 2. Create Order
+    // Assume first item's creator is the main seller for simplicity (or split by seller)
+    const sellerId = orderItemsData[0].product.creator_id;
+    
+    const orderResult = await client.query(`
+      INSERT INTO orders (buyer_id, seller_id, total_amount, shipping_address, status)
+      VALUES ($1, $2, $3, $4, 'paid')
+      RETURNING *
+    `, [buyerId, sellerId, totalAmount, JSON.stringify(shippingAddress)]);
+    
+    const orderId = orderResult.rows[0].id;
+
+    // 3. Create Order Items & Update Stock
+    for (const item of orderItemsData) {
+      await client.query(`
+        INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, product_snapshot)
+        VALUES ($1, $2, $3, $4, $5)
+      `, [orderId, item.product.id, item.quantity, item.priceAtPurchase, JSON.stringify({
+        title: item.product.title,
+        images: item.product.images
+      })]);
+
+      if (item.product.type === 'physical') {
+        await client.query(
+          "UPDATE products SET stock = stock - $1 WHERE id = $2",
+          [item.quantity, item.product.id]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json({ order: orderResult.rows[0] });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("Create Order Error:", err);
+    res.status(500).json({ error: err.message || "Failed to create order" });
+  } finally {
+    client.release();
+  }
+});
+
+  // GET /api/orders
+app.get("/api/orders", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { status } = req.query;
+
+    let query = `
+      SELECT o.*, 
+             json_agg(
+               json_build_object(
+                 'id', oi.id, 
+                 'title', oi.product_snapshot->>'title', 
+                 'image', oi.product_snapshot->'images'->0,
+                 'quantity', oi.quantity,
+                 'price', oi.price_at_purchase
+               )
+             ) as items
+      FROM orders o
+      JOIN order_items oi ON o.id = oi.order_id
+      WHERE o.buyer_id = $1
+    `;
+    const params = [userId];
+
+    if (status && status !== 'all') {
+      params.push(status);
+      query += ` AND o.status = $${params.length}`;
+    }
+
+    query += ` GROUP BY o.id ORDER BY o.created_at DESC`;
+
+    const { rows } = await pool.query(query, params);
+    
+    // Format to match frontend expectations
+    const orders = rows.map(order => ({
+      id: order.id,
+      total: order.total_amount,
+      status: order.status,
+      created_at: order.created_at,
+      items: order.items
+    }));
+
+    res.json(orders);
+
+  } catch (err) {
+    console.error("Get Orders Error:", err);
+    res.status(500).json({ error: "Failed to fetch orders" });
+  }
+});
+
+  // POST /api/orders/:id/cancel
+app.post("/api/orders/:id/cancel", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const { reason } = req.body; // from frontend prompt
+
+    await client.query('BEGIN');
+
+    // Verify ownership
+    const { rows } = await client.query(
+      "SELECT * FROM orders WHERE id = $1 AND buyer_id = $2", [id, userId]
+    );
+
+    if (rows.length === 0) return res.status(404).json({ error: "Order not found" });
+
+    const order = rows[0];
+    if (order.status === 'cancelled' || order.status === 'completed') {
+      return res.status(400).json({ error: "Cannot cancel this order" });
+    }
+
+    // Update Status
+    await client.query("UPDATE orders SET status = 'cancelled' WHERE id = $1", [id]);
+
+    // Refund Stock
+    const items = await client.query("SELECT * FROM order_items WHERE order_id = $1", [id]);
+    for (const item of items.rows) {
+      // Check if product still exists and is physical
+      const productCheck = await client.query(
+        "SELECT type FROM products WHERE id = $1", [item.product_id]
+      );
+      if (productCheck.rows.length > 0 && productCheck.rows[0].type === 'physical') {
+        await client.query(
+          "UPDATE products SET stock = stock + $1 WHERE id = $2",
+          [item.quantity, item.product_id]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: "Order cancelled" });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("Cancel Order Error:", err);
+    res.status(500).json({ error: "Failed to cancel order" });
+  } finally {
+    client.release();
+  }
+});
+
+  
 
 // --- Content Moderation Endpoints ---
 
