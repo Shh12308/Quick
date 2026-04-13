@@ -2331,23 +2331,80 @@ app.get(
   }
 );
 
-// User registration
-app.post("/signup", async (req, res) => {
+app.post("/signup", upload.none(), async (req, res) => {
   try {
-    const { username, email, password, phone, device_id } = req.body;
-    if (!username || !email || !password) return res.status(400).json({ error: "Missing fields" });
+    const {
+      username,
+      email,
+      password,
+      phone,
+      device_id,
+      captchaToken,
+    } = req.body;
 
-    const existingUser = await pool.query("SELECT id FROM users WHERE email = $1 OR username = $2", [email, username]);
-    if (existingUser.rows.length > 0) return res.status(400).json({ error: "Email or username already registered" });
+    // -------------------------
+    // 1. Validate required fields
+    // -------------------------
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
 
-    // Using argon2 for password hashing
+    if (!captchaToken) {
+      return res.status(400).json({ error: "Missing captcha token" });
+    }
+
+    // -------------------------
+    // 2. VERIFY TURNSTILE
+    // -------------------------
+    const verifyRes = await fetch(
+      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          secret: process.env.TURNSTILE_SECRET,
+          response: captchaToken,
+        }),
+      }
+    );
+
+    const verifyData = await verifyRes.json();
+
+    if (!verifyData.success) {
+      console.error("Turnstile failed:", verifyData["error-codes"]);
+      return res.status(403).json({
+        error: "Captcha verification failed",
+        details: verifyData["error-codes"],
+      });
+    }
+
+    // -------------------------
+    // 3. Check duplicate user
+    // -------------------------
+    const existingUser = await pool.query(
+      "SELECT id FROM users WHERE email = $1 OR username = $2",
+      [email, username]
+    );
+
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({
+        error: "Email or username already registered",
+      });
+    }
+
+    // -------------------------
+    // 4. Hash password
+    // -------------------------
     const hashed = await argon2.hash(password, {
       type: argon2.argon2id,
       memoryCost: 2 ** 16,
       timeCost: 3,
       parallelism: 1,
     });
-    
+
+    // -------------------------
+    // 5. Insert user
+    // -------------------------
     const { rows } = await pool.query(
       `INSERT INTO users 
        (username, email, password_hash, phone, device_id, role, subscription_plan, is_musician, is_creator, is_admin, status, created_at)
@@ -2357,16 +2414,38 @@ app.post("/signup", async (req, res) => {
     );
 
     const user = rows[0];
+
+    // -------------------------
+    // 6. Post-create setup
+    // -------------------------
     await ensureCreatorStats(user.id);
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
-    
-    // Initialize user preferences
+
     await pool.query(
       `INSERT INTO user_preferences (user_id, created_at) VALUES ($1, NOW())`,
       [user.id]
     );
-    
-    res.json({ message: "Signed up successfully", user, token });
+
+    // -------------------------
+    // 7. JWT token
+    // -------------------------
+    const token = jwt.sign(
+      {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+      },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    // -------------------------
+    // 8. Response
+    // -------------------------
+    res.json({
+      message: "Signed up successfully",
+      user,
+      token,
+    });
   } catch (err) {
     console.error("Signup error:", err);
     res.status(500).json({ error: "Signup failed" });
