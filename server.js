@@ -2455,50 +2455,106 @@ app.post("/signup", upload.none(), async (req, res) => {
 // User login
 app.post("/login", async (req, res) => {
   try {
-    const { email, password, device_id } = req.body;
-    if (!email || !password) return res.status(400).json({ error: "Missing fields" });
+    const { identifier, password, device_id } = req.body;
 
-    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+    if (!identifier || !password)
+      return res.status(400).json({ error: "Missing fields" });
+
+    const isEmail = identifier.includes("@");
+
+    const query = isEmail
+      ? `SELECT * FROM users WHERE LOWER(email) = LOWER($1)`
+      : `SELECT * FROM users WHERE username = $1`;
+
+    const { rows } = await pool.query(query, [identifier]);
     const userRow = rows[0];
-    if (!userRow) return res.status(400).json({ error: "Invalid credentials" });
 
-    // Check if user is suspended or banned
+    if (!userRow)
+      return res.status(400).json({ error: "Invalid credentials" });
+
+    /* =======================
+       ACCOUNT STATUS CHECKS
+    ======================= */
+
     if (userRow.status === "banned") {
-      return res.status(403).json({ error: "Account banned", reason: userRow.suspension_reason });
-    }
-    
-    if (userRow.status === "suspended" && userRow.suspend_until && new Date() < new Date(userRow.suspend_until)) {
-      return res.status(403).json({ 
-        error: "Account suspended", 
-        until: userRow.suspend_until, 
-        reason: userRow.suspension_reason 
+      return res.status(403).json({
+        error: "Account banned",
+        reason: userRow.suspension_reason,
       });
     }
 
-    if (!userRow.password_hash) return res.status(400).json({ error: "Set a password or use OAuth" });
-    
-    // Using argon2 for password verification
-    const valid = await argon2.verify(userRow.password_hash, password);
-    if (!valid) return res.status(400).json({ error: "Invalid credentials" });
+    if (
+      userRow.status === "suspended" &&
+      userRow.suspend_until &&
+      new Date() < new Date(userRow.suspend_until)
+    ) {
+      return res.status(403).json({
+        error: "Account suspended",
+        until: userRow.suspend_until,
+        reason: userRow.suspension_reason,
+      });
+    }
 
-    // Update device_id if provided
+    if (!userRow.password_hash)
+      return res
+        .status(400)
+        .json({ error: "Set a password or use OAuth" });
+
+    const valid = await argon2.verify(
+      userRow.password_hash,
+      password
+    );
+
+    if (!valid)
+      return res.status(400).json({ error: "Invalid credentials" });
+
+    /* =======================
+       DEVICE TRACKING
+    ======================= */
+
     if (device_id && device_id !== userRow.device_id) {
-      await pool.query("UPDATE users SET device_id=$1 WHERE id=$2", [device_id, userRow.id]);
+      await pool.query(
+        "UPDATE users SET device_id=$1 WHERE id=$2",
+        [device_id, userRow.id]
+      );
       userRow.device_id = device_id;
     }
 
-    // Reset suspension if it has expired
-    if (userRow.status === "suspended" && userRow.suspend_until && new Date() >= new Date(userRow.suspend_until)) {
+    /* =======================
+       AUTO UNSUSPEND
+    ======================= */
+
+    if (
+      userRow.status === "suspended" &&
+      userRow.suspend_until &&
+      new Date() >= new Date(userRow.suspend_until)
+    ) {
       await pool.query(
-        "UPDATE users SET status='active', suspend_until=NULL, suspension_reason=NULL WHERE id=$1",
+        `UPDATE users 
+         SET status='active', suspend_until=NULL, suspension_reason=NULL 
+         WHERE id=$1`,
         [userRow.id]
       );
+
       userRow.status = "active";
       userRow.suspend_until = null;
       userRow.suspension_reason = null;
     }
 
-    const token = jwt.sign({ id: userRow.id, email: userRow.email, role: userRow.role }, JWT_SECRET, { expiresIn: "7d" });
+    /* =======================
+       TOKEN
+    ======================= */
+
+    const token = jwt.sign(
+      {
+        id: userRow.id,
+        email: userRow.email,
+        role: userRow.role,
+      },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
     res.json({ message: "Logged in", user: userRow, token });
   } catch (err) {
     console.error(err);
