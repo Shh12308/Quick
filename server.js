@@ -3,6 +3,7 @@ import pg from "pg";
 import { Worker } from "bullmq";
 import { Worker as ThreadWorker } from "worker_threads";
 import argon2 from "argon2";
+import geoip from "geoip-lite";
 import jwt from "jsonwebtoken";
 import passport from "passport";
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
@@ -2559,6 +2560,83 @@ app.post("/login", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Login failed" });
+  }
+});
+
+  // --- Stripe Payout Endpoint ---
+app.post("/api/creator/withdraw", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const userId = req.user.id;
+
+    // 1. Get User's Stripe Account ID
+    const { rows: userRows } = await client.query(
+      "SELECT stripe_account_id FROM users WHERE id = $1",
+      [userId]
+    );
+
+    if (!userRows.length || !userRows[0].stripe_account_id) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: "Stripe account not connected. Please complete onboarding." });
+    }
+
+    const stripeAccountId = userRows[0].stripe_account_id;
+
+    // 2. Calculate Available Earnings
+    const { rows: earningsRows } = await client.query(
+      `SELECT id, amount FROM earnings 
+       WHERE user_id = $1 AND status = 'available'`,
+      [userId]
+    );
+
+    if (earningsRows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: "No available earnings to withdraw." });
+    }
+
+    const totalAmount = earningsRows.reduce((sum, row) => sum + parseFloat(row.amount), 0);
+    const earningIds = earningsRows.map((row) => row.id);
+
+    // 3. Mark Earnings as 'Processing' (Prevent double spending)
+    await client.query(
+      `UPDATE earnings SET status = 'processing' WHERE id = ANY($1)`,
+      [earningIds]
+    );
+
+    // 4. Create Stripe Transfer
+    // Amount must be in cents (integer)
+    const transfer = await stripe.transfers.create({
+      amount: Math.round(totalAmount * 100),
+      currency: "usd",
+      destination: stripeAccountId,
+      metadata: { userId: userId.toString(), source: "creator_payout" },
+    });
+
+    // 5. Mark Earnings as 'Paid'
+    await client.query(
+      `UPDATE earnings 
+       SET status = 'paid', stripe_transfer_id = $1 
+       WHERE id = ANY($2)`,
+      [transfer.id, earningIds]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      success: true,
+      amount: totalAmount,
+      transferId: transfer.id,
+      message: "Withdrawal successful"
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("Withdrawal Error:", err);
+    res.status(500).json({ error: err.message || "Withdrawal failed" });
+  } finally {
+    client.release();
   }
 });
 
@@ -6397,116 +6475,118 @@ app.post("/api/analytics/events", async (req, res) => {
   }
 });
 
+  // --- Real-time View Tracking (Geo-IP + Socket Emitter) ---
+app.post("/api/track-view", async (req, res) => {
+  try {
+    const { creatorId, contentId, contentType, ipAddress } = req.body;
+
+    if (!creatorId || !contentId || !ipAddress) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    // 1. Geo-IP Lookup
+    const geo = geoip.lookup(ipAddress);
+    const countryCode = geo ? geo.country : null;
+
+    // 2. Log to Database (Async, don't await for performance)
+    pool.query(
+      `INSERT INTO views_log (user_id, content_id, content_type, viewer_ip, country_code) 
+       VALUES ($1, $2, $3, $4, $5)`,
+      [creatorId, contentId, contentType || 'video', ipAddress, countryCode]
+    ).catch(err => console.error("View logging error:", err));
+
+    // 3. Increment Content View Count (Async)
+    const table = contentType === 'music' ? 'music' : (contentType === 'livestream' ? 'livestreams' : 'videos');
+    pool.query(`UPDATE ${table} SET views = views + 1 WHERE id = $1`, [contentId])
+      .catch(err => console.error("View count error:", err));
+
+    // 4. Emit Real-time Event via Socket.io
+    // io is defined globally in your file
+    io.to(`user_${creatorId}`).emit("new_view", {
+      views: 1,
+      countryCode,
+      timestamp: new Date(),
+      contentId
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Track View Error:", err);
+    res.status(500).json({ error: "Tracking failed" });
+  }
+});
+
 // Get creator analytics
 app.get("/api/analytics/creator", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
     const { period = '30d' } = req.query;
     
-    // Calculate date range based on period
-    let startDate;
-    switch (period) {
-      case '7d':
-        startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-        break;
-      case '30d':
-        startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-        break;
-      case '90d':
-        startDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
-        break;
-      default:
-        startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    }
-    
-    // Get video analytics
-    const { rows: videoAnalytics } = await pool.query(
-      `SELECT 
-         COUNT(*) as video_count,
-         SUM(views) as total_views,
-         SUM(likes) as total_likes,
-         SUM(comments_count) as total_comments,
-         SUM(shares) as total_shares
-       FROM videos 
-       WHERE user_id = $1 AND created_at >= $2`,
-      [userId, startDate]
-    );
-    
-    // Get music analytics
-    const { rows: musicAnalytics } = await pool.query(
-      `SELECT 
-         COUNT(*) as music_count,
-         SUM(listens) as total_listens,
-         SUM(likes) as total_likes,
-         SUM(shares) as total_shares
-       FROM music 
-       WHERE user_id = $1 AND created_at >= $2`,
-      [userId, startDate]
-    );
-    
-    // Get livestream analytics
-    const { rows: streamAnalytics } = await pool.query(
-      `SELECT 
-         COUNT(*) as stream_count,
-         SUM(duration) as total_duration,
-         SUM(viewers) as total_viewers,
-         SUM(peak_viewers) as total_peak_viewers
-       FROM livestreams 
-       WHERE user_id = $1 AND created_at >= $2`,
-      [userId, startDate]
-    );
-    
-    // Get follower growth
-    const { rows: followerGrowth } = await pool.query(
-      `SELECT COUNT(*) as new_followers
-       FROM follows 
-       WHERE following_id = $1 AND created_at >= $2`,
-      [userId, startDate]
-    );
-    
-    // Get earnings
-    const { rows: earningsData } = await pool.query(
-      `SELECT 
-         SUM(CASE WHEN type = 'tip' THEN amount ELSE 0 END) as tip_earnings,
-         SUM(CASE WHEN type = 'subscription' THEN amount ELSE 0 END) as subscription_earnings,
-         SUM(CASE WHEN type = 'ad' THEN amount ELSE 0 END) as ad_earnings,
-         SUM(amount) as total_earnings
-       FROM earnings 
-       WHERE user_id = $1 AND created_at >= $2`,
-      [userId, startDate]
-    );
-    
-    // Get daily analytics for charts
-    const { rows: dailyAnalytics } = await pool.query(
-      `SELECT 
-         DATE(created_at) as date,
-         SUM(views) as views,
-         SUM(likes) as likes,
-         SUM(CASE WHEN content_type = 'video' THEN 1 ELSE 0 END) as videos,
-         SUM(CASE WHEN content_type = 'music' THEN 1 ELSE 0 END) as music
-       FROM (
-         SELECT created_at, views, likes, 'video' as content_type FROM videos WHERE user_id = $1
-         UNION ALL
-         SELECT created_at, listens as views, likes, 'music' as content_type FROM music WHERE user_id = $1
-       ) as content
-       WHERE created_at >= $2
-       GROUP BY DATE(created_at)
-       ORDER BY date ASC`,
-      [userId, startDate]
-    );
-    
+    // Calculate date range
+    const intervals = { '7d': 7, '30d': 30, '90d': 90 };
+    const days = intervals[period] || 30;
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+
+    // Run queries in parallel
+    const [
+      contentStats,
+      countryStats,
+      retentionStats,
+      earningsData
+    ] = await Promise.all([
+      // 1. Total Stats
+      pool.query(
+        `SELECT 
+           COUNT(*) as total_content,
+           SUM(views) as total_views, 
+           SUM(likes) as total_likes
+         FROM videos 
+         WHERE user_id = $1 AND created_at >= $2`,
+        [userId, startDate]
+      ),
+      // 2. Country Breakdown (Geo-IP)
+      pool.query(
+        `SELECT country_code, COUNT(*) as count 
+         FROM views_log 
+         WHERE user_id = $1 AND created_at >= $2
+         GROUP BY country_code 
+         ORDER BY count DESC 
+         LIMIT 10`,
+        [userId, startDate]
+      ),
+      // 3. Follower Retention (Gained vs Lost)
+      pool.query(
+        `SELECT 
+           DATE_TRUNC('week', created_at) as week,
+           SUM(CASE WHEN action = 'follow' THEN 1 ELSE 0 END) as gained,
+           SUM(CASE WHEN action = 'unfollow' THEN 1 ELSE 0 END) as lost
+         FROM follower_history 
+         WHERE following_id = $1 AND created_at >= $2
+         GROUP BY week
+         ORDER BY week ASC`,
+        [userId, startDate]
+      ),
+      // 4. Available Earnings
+      pool.query(
+        `SELECT COALESCE(SUM(amount), 0) as available_earnings
+         FROM earnings 
+         WHERE user_id = $1 AND status = 'available'`,
+        [userId]
+      )
+    ]);
+
     res.json({
       period,
-      videos: videoAnalytics[0] || { video_count: 0, total_views: 0, total_likes: 0, total_comments: 0, total_shares: 0 },
-      music: musicAnalytics[0] || { music_count: 0, total_listens: 0, total_likes: 0, total_shares: 0 },
-      livestreams: streamAnalytics[0] || { stream_count: 0, total_duration: 0, total_viewers: 0, total_peak_viewers: 0 },
-      followers: { new_followers: followerGrowth[0]?.new_followers || 0 },
-      earnings: earningsData[0] || { tip_earnings: 0, subscription_earnings: 0, ad_earnings: 0, total_earnings: 0 },
-      daily: dailyAnalytics
+      overview: contentStats.rows[0] || {},
+      countries: countryStats.rows,
+      retention: retentionStats.rows,
+      earnings: parseFloat(earningsData.rows[0].available_earnings || 0)
     });
+
   } catch (err) {
-    console.error("Get creator analytics error:", err);
-    res.status(500).json({ error: "Failed to get creator analytics" });
+    console.error("Analytics Error:", err);
+    res.status(500).json({ error: "Failed to fetch analytics" });
   }
 });
 
