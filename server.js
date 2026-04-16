@@ -129,7 +129,7 @@ const {
 
   FRONTEND_URL,
   ADMIN_KEY,
-  PORT = 5000,
+  PORT = 3000,
 
   AGORA_APP_ID,
   AGORA_APP_CERTIFICATE,
@@ -9076,6 +9076,9 @@ await pool.query(`
 });
 
 // --- Start Server ---
+  app.get("/", (req, res) => {
+  res.send("Backend is live 🚀");
+});
 
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
