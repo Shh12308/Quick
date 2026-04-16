@@ -9076,16 +9076,26 @@ await pool.query(`
 });
 
 // --- Start Server ---
-  app.get("/", (req, res) => {
-  res.send("Backend is live 🚀");
-});
+  const app = express();
+const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  
-  // Update trending scores on startup
-  setTimeout(() => {
-    recommendationEngine.updateTrendingScores();
-  }, 5000);
-});
+async function startServer() {
+  try {
+    await initDatabase();
+
+    console.log("Database tables initialized successfully");
+
+    app.get("/", (req, res) => {
+      res.send("Backend is live 🚀");
+    });
+
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+
+  } catch (err) {
+    console.error("Startup error:", err);
+  }
 }
+
+startServer();
