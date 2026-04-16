@@ -9073,7 +9073,6 @@ await pool.query(`
   socket.on("disconnect", () => {
     console.log(`Socket disconnected: ${socket.id} (User: ${socket.userId})`);
   });
-});
 
 const app = express();
 const PORT = process.env.PORT || 3000;
