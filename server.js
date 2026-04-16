@@ -9075,8 +9075,7 @@ await pool.query(`
   });
 });
 
-// --- Start Server ---
-  const app = express();
+const app = express();
 const PORT = process.env.PORT || 3000;
 
 async function startServer() {
@@ -9099,4 +9098,3 @@ async function startServer() {
 }
 
 startServer();
-});
