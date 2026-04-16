@@ -44,6 +44,9 @@ import { dirname } from "path";
 import session from "express-session";
 import RedisStore from "connect-redis";
 import dotenv from "dotenv";
+// Update this import
+import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 dotenv.config();
 
@@ -73,7 +76,11 @@ await subClient.connect();
 // Redis adapter for Socket.IO
 io.adapter(createAdapter(pubClient, subClient));
 
+// Add this after your imports and process.env variables
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
 // Redis caching and session
+
 const redis = new Redis(process.env.REDIS_URL);
 const cache = new NodeCache({ stdTTL: 600 });
 
@@ -6144,6 +6151,112 @@ app.post("/api/stories/:id/react", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Failed to react to story" });
   }
 });
+
+app.get("/api/videos", async (req, res) => {
+  try {
+    const { filter, category } = req.query;
+
+    // Base query joining videos with user info
+    let query = `
+      SELECT v.*, 
+             u.username, 
+             u.profile_url, 
+             u.verified
+      FROM videos v 
+      JOIN users u ON v.user_id = u.id 
+      WHERE v.is_public = true 
+        AND v.processing_status = 'completed'
+    `;
+    const params = [];
+
+    // Filter by Category if provided
+    if (category && category !== 'All') {
+      params.push(category);
+      query += ` AND v.category = $${params.length}`;
+    }
+
+    // Sorting logic based on filter
+    if (filter === 'Recommended') {
+      // Use recommendation score if available, else trending score
+      query += ` ORDER BY COALESCE(v.recommendation_score, v.trending_score, 0) DESC, v.created_at DESC`;
+    } else if (filter === 'Trending') {
+      query += ` ORDER BY v.trending_score DESC NULLS LAST, v.views DESC`;
+    } else {
+      // Default to newest
+      query += ` ORDER BY v.created_at DESC`;
+    }
+
+    // Limit results (e.g., 20 for home feed)
+    query += ` LIMIT $${params.length + 1}`;
+    params.push(20);
+
+    const { rows } = await pool.query(query, params);
+
+    // Return in format expected by frontend { data: [...] }
+    res.json({ data: rows });
+
+  } catch (err) {
+    console.error("Get videos feed error:", err);
+    res.status(500).json({ error: "Failed to fetch videos" });
+  }
+});
+
+app.post("/api/videos/:id/hide", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+
+    // Check if video exists
+    const { rows } = await pool.query("SELECT * FROM videos WHERE id = $1", [id]);
+    if (rows.length === 0) return res.status(404).json({ error: "Video not found" });
+
+    // Insert into 'content_filters' table (which you created in initializeTables)
+    // This prevents the video from showing up in recommendations
+    await pool.query(
+      `INSERT INTO content_filters (user_id, filter_type, filter_value, is_active, created_at)
+       VALUES ($1, 'video_id', $2, true, NOW())
+       ON CONFLICT (user_id, filter_type, filter_value) DO NOTHING`,
+      [userId, id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Hide video error:", err);
+    res.status(500).json({ error: "Failed to hide video" });
+  }
+});
+
+app.post("/api/users/:userId/block", authMiddleware, async (req, res) => {
+  try {
+    const currentUserId = req.user.id;
+    const targetUserId = parseInt(req.params.userId);
+
+    if (currentUserId === targetUserId) {
+      return res.status(400).json({ error: "Cannot block yourself" });
+    }
+
+    // 1. Add to content_filters (prevents seeing their content)
+    await pool.query(
+      `INSERT INTO content_filters (user_id, filter_type, filter_value, is_active, created_at)
+       VALUES ($1, 'user_id', $2, true, NOW())
+       ON CONFLICT (user_id, filter_type, filter_value) DO UPDATE SET is_active = true`,
+      [currentUserId, targetUserId]
+    );
+
+    // 2. (Optional) Remove follow if exists
+    await pool.query(
+      "DELETE FROM follows WHERE follower_id = $1 AND following_id = $2",
+      [currentUserId, targetUserId]
+    );
+
+    res.json({ success: true, message: "User blocked" });
+  } catch (err) {
+    console.error("Block user error:", err);
+    res.status(500).json({ error: "Failed to block user" });
+  }
+});
+
+
 
 // --- Highlight Endpoints ---
 
