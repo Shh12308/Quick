@@ -1027,7 +1027,8 @@ export function processVideo(input, outputDir) {
 
       .run();
 
-  });
+  }); // <--- ADD THIS CLOSING BRACE
+}     // <--- AND THIS CLOSING BRACE
 
 // Example: Taking a 10% platform fee
 const platformFeePercent = 0.10;
@@ -9074,26 +9075,4 @@ await pool.query(`
     console.log(`Socket disconnected: ${socket.id} (User: ${socket.userId})`);
   });
 
-const app = express();
-const PORT = process.env.PORT || 3000;
 
-async function startServer() {
-  try {
-    await initDatabase();
-
-    console.log("Database tables initialized successfully");
-
-    app.get("/", (req, res) => {
-      res.send("Backend is live 🚀");
-    });
-
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Server running on port ${PORT}`);
-    });
-
-  } catch (err) {
-    console.error("Startup error:", err);
-  }
-}
-
-startServer();
