@@ -56,12 +56,6 @@ const app = express(); // ✅ initialize app first
 
 const server = http.createServer(app);
 
-const io = new Server(server, {
-  cors: {
-    origin: "*"
-  }
-});
-
 app.use(helmet());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
