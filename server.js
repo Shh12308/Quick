@@ -20,7 +20,6 @@ import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
 import { v4 as uuidv4 } from "uuid";
 import { ExpressPeerServer } from "peer";
-import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import os from "os";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
