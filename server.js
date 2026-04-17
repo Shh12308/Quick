@@ -8066,8 +8066,6 @@ app.post("/api/calls/history", authMiddleware, async (req, res) => {
 });
 
 // --- Socket.IO Setup ---
-
-const server = http.createServer(app);
 const io = new SocketServer(server, { 
   cors: { 
     origin: process.env.FRONTEND_URL || "http://localhost:3000",
