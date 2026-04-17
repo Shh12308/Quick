@@ -2719,7 +2719,6 @@ app.post("/api/profile/update", authMiddleware, async (req, res) => {
 // --- Video Endpoints ---
 
 const { body, param, query, validationResult } = require('express-validator');
-const rateLimit = require('express-rate-limit');
 
 // Rate limiting configuration
 const uploadLimiter = rateLimit({
