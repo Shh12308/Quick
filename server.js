@@ -9176,5 +9176,3 @@ await pool.query(`
   // Handle disconnect
   socket.on("disconnect", () => {
     console.log(`Socket disconnected: ${socket.id} (User: ${socket.userId})`);
-  });
-}
