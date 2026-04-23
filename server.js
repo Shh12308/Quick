@@ -66,9 +66,6 @@ const subClient = pubClient.duplicate();
 await pubClient.connect();
 await subClient.connect();
 
-// Redis adapter for Socket.IO
-io.adapter(createAdapter(pubClient, subClient));
-
 // Add this after your imports and process.env variables
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
