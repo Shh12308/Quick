@@ -6695,13 +6695,14 @@ app.get("/api/analytics/creator", authMiddleware, async (req, res) => {
 
 // --- Subscription Endpoints ---
 
-// Get subscription tiers
+// =========================
+// SUBSCRIPTION TIERS
+// =========================
 app.get("/api/subscriptions/tiers", async (req, res) => {
   try {
     const { rows } = await pool.query(
       "SELECT * FROM subscription_tiers ORDER BY price ASC"
     );
-    
     res.json({ tiers: rows });
   } catch (err) {
     console.error("Get subscription tiers error:", err);
@@ -6709,37 +6710,42 @@ app.get("/api/subscriptions/tiers", async (req, res) => {
   }
 });
 
-// Create subscription checkout session
+
+// =========================
+// CREATE CHECKOUT SESSION
+// =========================
 app.post("/api/subscriptions/checkout", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
     const { tierId } = req.body;
-    
-    if (!tierId) return res.status(400).json({ error: "Tier ID is required" });
-    
-    // Get tier details
+
+    if (!tierId) {
+      return res.status(400).json({ error: "Tier ID is required" });
+    }
+
     const { rows: tierRows } = await pool.query(
       "SELECT * FROM subscription_tiers WHERE id = $1",
       [tierId]
     );
-    
-    if (tierRows.length === 0) return res.status(404).json({ error: "Subscription tier not found" });
-    
-    const tier = tierRows[0];
-    
-    // Create Stripe checkout session
+
+    const tier = tierRows?.[0];
+    if (!tier) {
+      return res.status(404).json({ error: "Subscription tier not found" });
+    }
+
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
+      payment_method_types: ["card"],
       customer_email: req.user.email,
+
       line_items: [
         {
           price_data: {
-            currency: 'usd',
+            currency: "usd",
             product_data: {
               name: tier.name,
               description: `Subscription to ${tier.name}`,
             },
-            unit_amount: tier.price * 100, // Convert to cents
+            unit_amount: Math.round(tier.price * 100),
             recurring: {
               interval: tier.billing_cycle,
             },
@@ -6747,21 +6753,223 @@ app.post("/api/subscriptions/checkout", authMiddleware, async (req, res) => {
           quantity: 1,
         },
       ],
-      mode: 'subscription',
+
+      mode: "subscription",
+
       success_url: `${FRONTEND_URL}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${FRONTEND_URL}/subscription/cancel`,
+
       metadata: {
-        userId: userId.toString(),
-        tierId: tierId.toString(),
+        userId: String(userId),
+        tierId: String(tierId),
       },
     });
-    
+
     res.json({ sessionId: session.id });
   } catch (err) {
     console.error("Create subscription checkout error:", err);
     res.status(500).json({ error: "Failed to create subscription checkout" });
   }
 });
+
+
+// =========================
+// STRIPE WEBHOOK
+// =========================
+app.post(
+  "/api/webhooks/stripe",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("Webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // =========================
+    // IDEMPOTENCY CHECK
+    // =========================
+    try {
+      const exists = await pool.query(
+        "SELECT 1 FROM stripe_events WHERE event_id = $1",
+        [event.id]
+      );
+
+      if (exists.rowCount > 0) {
+        return res.send(); // already processed
+      }
+
+      await pool.query(
+        "INSERT INTO stripe_events (event_id) VALUES ($1)",
+        [event.id]
+      );
+    } catch (err) {
+      console.error("Idempotency check failed:", err);
+      return res.send(); // fail-safe (don’t crash webhook)
+    }
+
+    // =========================
+    // HANDLE EVENTS
+    // =========================
+    try {
+      switch (event.type) {
+        // =====================
+        // CHECKOUT COMPLETE
+        // =====================
+        case "checkout.session.completed": {
+          const session = event.data.object;
+
+          if (!session.subscription) {
+            console.log("No subscription in session");
+            break;
+          }
+
+          const userId = parseInt(session.metadata.userId);
+          const tierId = parseInt(session.metadata.tierId);
+
+          const subscription = await stripe.subscriptions.retrieve(
+            session.subscription
+          );
+
+          await pool.query(
+            `INSERT INTO user_subscriptions
+             (user_id, tier_id, stripe_subscription_id, status, current_period_start, current_period_end, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,NOW())
+             ON CONFLICT (user_id)
+             DO UPDATE SET
+               tier_id = EXCLUDED.tier_id,
+               stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+               status = EXCLUDED.status,
+               current_period_start = EXCLUDED.current_period_start,
+               current_period_end = EXCLUDED.current_period_end,
+               updated_at = NOW()`,
+            [
+              userId,
+              tierId,
+              subscription.id,
+              subscription.status,
+              new Date(subscription.current_period_start * 1000),
+              new Date(subscription.current_period_end * 1000),
+            ]
+          );
+
+          const { rows: tierRows } = await pool.query(
+            "SELECT * FROM subscription_tiers WHERE id = $1",
+            [tierId]
+          );
+
+          const tier = tierRows?.[0];
+
+          if (tier) {
+            await pool.query(
+              `UPDATE users
+               SET role = $1,
+                   subscription_plan = $2,
+                   subscription_expires = $3
+               WHERE id = $4`,
+              [
+                tier.role || "premium",
+                tier.name.toLowerCase(),
+                new Date(subscription.current_period_end * 1000),
+                userId,
+              ]
+            );
+          }
+
+          console.log(`User ${userId} subscribed to tier ${tierId}`);
+          break;
+        }
+
+        // =====================
+        // PAYMENT SUCCESS
+        // =====================
+        case "invoice.payment_succeeded": {
+          const invoice = event.data.object;
+
+          if (!invoice.subscription) break;
+
+          const subscription = await stripe.subscriptions.retrieve(
+            invoice.subscription
+          );
+
+          await pool.query(
+            `UPDATE user_subscriptions
+             SET status = $1,
+                 current_period_start = $2,
+                 current_period_end = $3,
+                 updated_at = NOW()
+             WHERE stripe_subscription_id = $4`,
+            [
+              subscription.status,
+              new Date(subscription.current_period_start * 1000),
+              new Date(subscription.current_period_end * 1000),
+              subscription.id,
+            ]
+          );
+
+          await pool.query(
+            `UPDATE users
+             SET subscription_expires = $1
+             WHERE id = (
+               SELECT user_id FROM user_subscriptions
+               WHERE stripe_subscription_id = $2
+             )`,
+            [
+              new Date(subscription.current_period_end * 1000),
+              subscription.id,
+            ]
+          );
+
+          break;
+        }
+
+        // =====================
+        // SUBSCRIPTION CANCELED
+        // =====================
+        case "customer.subscription.deleted": {
+          const sub = event.data.object;
+
+          await pool.query(
+            `UPDATE user_subscriptions
+             SET status = 'canceled', updated_at = NOW()
+             WHERE stripe_subscription_id = $1`,
+            [sub.id]
+          );
+
+          await pool.query(
+            `UPDATE users
+             SET role = 'free',
+                 subscription_plan = 'free'
+             WHERE id = (
+               SELECT user_id FROM user_subscriptions
+               WHERE stripe_subscription_id = $1
+             )`,
+            [sub.id]
+          );
+
+          console.log(`Subscription ${sub.id} canceled`);
+          break;
+        }
+
+        default:
+          console.log(`Unhandled event type: ${event.type}`);
+      }
+    } catch (err) {
+      console.error("Webhook handler error:", err);
+      // do NOT throw → Stripe will retry automatically
+    }
+
+    res.send();
+  }
+);
 
 // Handle Stripe webhook
 app.post("/api/webhooks/stripe", express.raw({ type: 'application/json' }), async (req, res) => {
