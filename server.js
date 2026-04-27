@@ -1692,23 +1692,23 @@ class ContentProcessor {
     this.initWorkers();
   }
 
-    initWorkers() {
+      initWorkers() {
     for (let i = 0; i < this.maxWorkers; i++) {
-      // FIX: Pass the queue name ('content-queue') and the connection object
-      const worker = new Worker(
-        'content-queue', // 1. Add a queue name
-        path.join(__dirname, 'contentWorker.js'),
-        { connection: redis } // 2. Pass the global 'redis' connection (ioredis)
-      );
-      
+      // FIX 1: Use ThreadWorker (native threads) instead of BullMQ Worker
+      // because the class logic uses .postMessage()
+      const worker = new ThreadWorker(path.join(__dirname, 'contentWorker.js'));
+
       worker.on('message', (result) => {
         this.handleWorkerResult(result);
       });
-      
       worker.on('error', (error) => {
         console.error(`Worker ${i} error:`, error);
       });
-      
+      worker.on('exit', (code) => {
+        console.error(`Worker ${i} stopped with exit code ${code}`);
+        this.workerPool[i].busy = false; // Reset busy state if worker crashes
+      });
+
       this.workerPool.push({
         worker,
         busy: false,
@@ -1986,6 +1986,12 @@ class ContentProcessor {
             .on('error', reject)
             .run();
         });
+
+        // Write the worker code to a file so ThreadWorker can read it
+const workerPath = path.join(__dirname, 'contentWorker.js');
+if (!fs.existsSync(workerPath)) {
+  fs.writeFileSync(workerPath, contentWorkerCode);
+}
         
         // Transcribe audio
         const transcript = await this.transcribeAudio(audioPath);
