@@ -1024,13 +1024,9 @@ export function processVideo(input, outputDir) {
 
       .run();
 
-  }); // <--- ADD THIS CLOSING BRACE
-}     // <--- AND THIS CLOSING BRACE
+  }); 
+}
 
-// Example: Taking a 10% platform fee
-const platformFeePercent = 0.10;
-const platformFeeAmount = Math.floor(amount * platformFeePercent);
-const creatorPayoutAmount = amount - platformFeeAmount;
 
 app.use(passport.initialize());
 app.use(passport.session());
