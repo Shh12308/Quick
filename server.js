@@ -29,6 +29,7 @@ import axios from "axios";
 import { createClient } from "redis";
 import { createAdapter } from "@socket.io/redis-adapter";
 import OpenAI from "openai";
+import { body, param, query, validationResult } from 'express-validator';
 import FormData from "form-data";
 import Redis from "ioredis";
 import { Server } from "socket.io";
@@ -2717,9 +2718,7 @@ app.post("/api/profile/update", authMiddleware, async (req, res) => {
   }
 });
 
-// --- Video Endpoints ---
 
-const { body, param, query, validationResult } = require('express-validator');
 
 // Rate limiting configuration
 const uploadLimiter = rateLimit({
