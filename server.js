@@ -29,7 +29,6 @@ import axios from "axios";
 import { createClient } from "redis";
 import { createAdapter } from "@socket.io/redis-adapter";
 import OpenAI from "openai";
-import { body, param, query, validationResult } from 'express-validator';
 import FormData from "form-data";
 import Redis from "ioredis";
 import { Server } from "socket.io";
@@ -935,6 +934,25 @@ app.use(rateLimit({
   max: 500
 }));
 
+app.post("/api/payment", async (req, res) => {
+  const { amount } = req.body;
+
+  if (!amount || typeof amount !== "number") {
+    return res.status(400).json({ error: "Invalid amount" });
+  }
+
+  const platformFeePercent = 0.10;
+
+  const platformFeeAmount = Math.round(amount * platformFeePercent);
+  const creatorPayoutAmount = amount - platformFeeAmount;
+
+  res.json({
+    amount,
+    platformFeeAmount,
+    creatorPayoutAmount
+  });
+});
+
 // Place this BEFORE express.json() middleware
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -1025,9 +1043,13 @@ export function processVideo(input, outputDir) {
 
       .run();
 
-  }); 
-}
+  }); // <--- ADD THIS CLOSING BRACE
+}     // <--- AND THIS CLOSING BRACE
 
+// Example: Taking a 10% platform fee
+const platformFeePercent = 0.10;
+const platformFeeAmount = Math.floor(amount * platformFeePercent);
+const creatorPayoutAmount = amount - platformFeeAmount;
 
 app.use(passport.initialize());
 app.use(passport.session());
@@ -1249,32 +1271,6 @@ function calculateEarningsFromDeltas({
 
 // Configure ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
-
-// Rate limiting configuration
-const uploadLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // Limit each IP to 5 uploads per window
-  message: 'Too many upload attempts, please try again later',
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-// --- ADD THIS DEFINITION ---
-const uploadQuotaLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 10, // Limit each IP to 10 music uploads per hour
-  message: 'Too many music upload attempts, please try again later',
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-const interactionLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 30, // Limit each IP to 30 interactions per minute
-  message: 'Too many interactions, please try again later',
-  standardHeaders: true,
-  legacyHeaders: false,
-});
 
 // --- Recommendation Algorithm ---
 
@@ -1719,23 +1715,15 @@ class ContentProcessor {
     this.initWorkers();
   }
 
-      initWorkers() {
+  initWorkers() {
     for (let i = 0; i < this.maxWorkers; i++) {
-      // FIX 1: Use ThreadWorker (native threads) instead of BullMQ Worker
-      // because the class logic uses .postMessage()
-      const worker = new ThreadWorker(path.join(__dirname, 'contentWorker.js'));
-
+      const worker = new Worker(path.join(__dirname, 'contentWorker.js'));
       worker.on('message', (result) => {
         this.handleWorkerResult(result);
       });
       worker.on('error', (error) => {
         console.error(`Worker ${i} error:`, error);
       });
-      worker.on('exit', (code) => {
-        console.error(`Worker ${i} stopped with exit code ${code}`);
-        this.workerPool[i].busy = false; // Reset busy state if worker crashes
-      });
-
       this.workerPool.push({
         worker,
         busy: false,
@@ -2013,12 +2001,6 @@ class ContentProcessor {
             .on('error', reject)
             .run();
         });
-
-        // Write the worker code to a file so ThreadWorker can read it
-const workerPath = path.join(__dirname, 'contentWorker.js');
-if (!fs.existsSync(workerPath)) {
-  fs.writeFileSync(workerPath, contentWorkerCode);
-}
         
         // Transcribe audio
         const transcript = await this.transcribeAudio(audioPath);
@@ -2744,7 +2726,9 @@ app.post("/api/profile/update", authMiddleware, async (req, res) => {
   }
 });
 
+// --- Video Endpoints ---
 
+const { body, param, query, validationResult } = require('express-validator');
 
 // Rate limiting configuration
 const uploadLimiter = rateLimit({
@@ -2958,15 +2942,62 @@ app.post("/api/videos/upload",
   }
 );
 
+app.get("/api/videos/:id/reaction-status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    let userId = null;
+
+    // ✅ FIX: Soft auth check - try to get user, but don't fail if missing
+    const token = req.headers.authorization?.split(" ")[1];
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.id;
+      } catch (err) {
+        // Token is invalid or missing, proceed as anonymous
+      }
+    }
+
+    // If no user, they haven't liked or disliked anything
+    if (!userId) {
+      return res.json({ liked: false, disliked: false });
+    }
+
+    // Check if user liked this video
+    const { rows: likeRows } = await pool.query(
+      "SELECT * FROM likes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+      [userId, id]
+    );
+    
+    // Check if user disliked this video
+    const { rows: dislikeRows } = await pool.query(
+      "SELECT * FROM dislikes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+      [userId, id]
+    );
+    
+    res.json({
+      liked: likeRows.length > 0,
+      disliked: dislikeRows.length > 0
+    });
+  } catch (err) {
+    console.error("Get reaction status error:", err);
+    res.status(500).json({ error: "Failed to get reaction status" });
+  }
+});
+
 // Get video by ID with enhanced features
 app.get("/api/videos/:id", 
   [
     param('id').isInt().withMessage('Invalid video ID'),
     query('includeRecommendations').optional().isBoolean().withMessage('includeRecommendations must be boolean')
   ],
-  handleValidationErrors,
-  async (req, res) => {
+  async (req, res) => { // Removed handleValidationErrors to manually handle errors so the video still loads
     try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ error: "Invalid video ID" });
+      }
+
       const { id } = req.params;
       const { includeRecommendations = false } = req.query;
       
@@ -2996,38 +3027,42 @@ app.get("/api/videos/:id",
       let userAge = null;
       let userId = null;
       
+      // ✅ FIX: Soft auth check - try to get user, but don't fail if token is missing/invalid
       if (req.headers.authorization) {
         try {
           const token = req.headers.authorization.split(" ")[1];
           const decoded = jwt.verify(token, JWT_SECRET);
           userAge = decoded.age;
           userId = decoded.id;
-          
-          // Record view history for authenticated users
-          await pool.query(
-            `INSERT INTO watch_history (user_id, content_type, content_id, created_at)
-             VALUES ($1, 'video', $2, NOW())
-             ON CONFLICT (user_id, content_type, content_id) 
-             DO UPDATE SET created_at = NOW(), watch_count = watch_history.watch_count + 1`,
-            [userId, id]
-          );
-          
-          // Check if user has liked/disliked this video
-          const { rows: reactions } = await pool.query(
-            `SELECT reaction_type FROM content_reactions 
-             WHERE user_id = $1 AND content_id = $2 AND content_type = 'video'`,
-            [userId, id]
-          );
-          
-          video.userReaction = reactions.length > 0 ? reactions[0].reaction_type : null;
-          
         } catch (err) {
           // Invalid token, continue as anonymous
         }
       }
+
+      // Record view history for authenticated users
+      if (userId) {
+        // ✅ FIX: Removed ON CONFLICT because the unique constraint doesn't exist in your schema
+        pool.query(
+          `INSERT INTO watch_history (user_id, content_type, content_id, created_at)
+           VALUES ($1, 'video', $2, NOW())`,
+          [userId, id]
+        ).catch(err => console.error("Watch history error:", err)); // Fire and forget
+
+        // ✅ FIX: Query the actual likes/dislikes tables instead of non-existent content_reactions
+        const { rows: likeRows } = await pool.query(
+          "SELECT 1 FROM likes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+          [userId, id]
+        );
+        const { rows: dislikeRows } = await pool.query(
+          "SELECT 1 FROM dislikes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+          [userId, id]
+        );
+        
+        video.userReaction = likeRows.length > 0 ? 'like' : (dislikeRows.length > 0 ? 'dislike' : null);
+      }
       
       // Age restriction check
-      if (video.age_restriction !== "none") {
+      if (video.age_restriction && video.age_restriction !== "none") {
         if (!userAge) {
           return res.status(403).json({ 
             error: "Age-restricted content",
@@ -3045,18 +3080,18 @@ app.get("/api/videos/:id",
         }
       }
       
-      // Increment view count atomically
-      await pool.query(
+      // Increment view count atomically (Fire and forget)
+      pool.query(
         `UPDATE videos 
          SET views = views + 1, 
              last_viewed_at = NOW(),
              trending_score = trending_score + 1
          WHERE id = $1`,
         [id]
-      );
+      ).catch(err => console.error("View count error:", err));
       
       // Parse tags
-      if (video.tags) {
+      if (video.tags && typeof video.tags === 'string') {
         try {
           video.tags = JSON.parse(video.tags);
         } catch (err) {
@@ -3066,23 +3101,43 @@ app.get("/api/videos/:id",
       
       // Get recommendations if requested
       let recommendations = [];
+      let relatedVideos = [];
+
       if (includeRecommendations) {
-        const { rows: recRows } = await pool.query(
-          `SELECT id, title, thumbnail_url, duration, views, 
-                  likes, username, profile_url
-           FROM get_video_recommendations($1, $2, 10)`,
-          [id, userId || null]
-        );
-        recommendations = recRows;
+        // ✅ FIX: Replaced missing get_video_recommendations() function with standard SQL
+        try {
+          const { rows: recRows } = await pool.query(
+            `SELECT v2.id, v2.title, v2.thumbnail_url, v2.duration, v2.views, 
+                    v2.likes, u.username, u.profile_url
+             FROM videos v2
+             JOIN users u ON v2.user_id = u.id
+             WHERE v2.category = $1 AND v2.id != $2 AND v2.is_public = true AND v2.processing_status = 'completed'
+             ORDER BY v2.views DESC
+             LIMIT 10`,
+            [video.category, id]
+          );
+          recommendations = recRows;
+        } catch (err) {
+          console.error("Recommendations query failed:", err);
+        }
       }
-      
-      // Get related videos based on category and tags
-      const { rows: relatedVideos } = await pool.query(
-        `SELECT id, title, thumbnail_url, duration, views, 
-                likes, username, profile_url
-         FROM get_related_videos($1, $2, 5)`,
-        [id, video.category || null]
-      );
+
+      // ✅ FIX: Replaced missing get_related_videos() function with standard SQL
+      try {
+        const { rows: relatedRows } = await pool.query(
+          `SELECT v2.id, v2.title, v2.thumbnail_url, v2.duration, v2.views, 
+                  v2.likes, u.username, u.profile_url
+           FROM videos v2
+           JOIN users u ON v2.user_id = u.id
+           WHERE v2.category = $1 AND v2.id != $2 AND v2.is_public = true AND v2.processing_status = 'completed'
+           ORDER BY v2.created_at DESC
+           LIMIT 5`,
+          [video.category, id]
+        );
+        relatedVideos = relatedRows;
+      } catch (err) {
+        console.error("Related videos query failed:", err);
+      }
       
       res.json({ 
         video: {
@@ -3288,6 +3343,66 @@ app.get("/api/videos/trending",
     }
   }
 );
+
+// Dedicated Like Endpoint
+app.post("/api/videos/:id/like", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { action } = req.body; // "like" or "unlike"
+
+    const { rows: videoRows } = await pool.query("SELECT * FROM videos WHERE id = $1", [id]);
+    if (videoRows.length === 0) return res.status(404).json({ error: "Video not found" });
+
+    const { rows: likeRows } = await pool.query(
+      "SELECT * FROM likes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+      [userId, id]
+    );
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      if (action === "like" && likeRows.length === 0) {
+        // Remove existing dislike if any
+        const { rows: disLikeRows } = await client.query(
+          "SELECT * FROM dislikes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+          [userId, id]
+        );
+        if (disLikeRows.length > 0) {
+          await client.query("DELETE FROM dislikes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2", [userId, id]);
+          await client.query("UPDATE videos SET dislikes = GREATEST(dislikes - 1, 0) WHERE id = $1", [id]);
+        }
+
+        await client.query(
+          "INSERT INTO likes (user_id, content_type, content_id, created_at) VALUES ($1, 'video', $2, NOW())",
+          [userId, id]
+        );
+        await client.query("UPDATE videos SET likes = likes + 1 WHERE id = $1", [id]);
+      } else if (action === "unlike" && likeRows.length > 0) {
+        await client.query(
+          "DELETE FROM likes WHERE user_id = $1 AND content_type = 'video' AND content_id = $2",
+          [userId, id]
+        );
+        await client.query("UPDATE videos SET likes = GREATEST(likes - 1, 0) WHERE id = $1", [id]);
+      }
+
+      await client.query('COMMIT');
+      
+      const { rows: updated } = await pool.query("SELECT likes, dislikes FROM videos WHERE id = $1", [id]);
+      res.json({ success: true, likes: updated[0].likes, dislikes: updated[0].dislikes });
+
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error("Like video error:", err);
+    res.status(500).json({ error: "Failed to like video" });
+  }
+});
 
 // Like/unlike video with improved error handling and notifications
 app.post("/api/videos/:id/react", 
