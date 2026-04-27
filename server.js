@@ -1692,15 +1692,23 @@ class ContentProcessor {
     this.initWorkers();
   }
 
-  initWorkers() {
+    initWorkers() {
     for (let i = 0; i < this.maxWorkers; i++) {
-      const worker = new Worker(path.join(__dirname, 'contentWorker.js'));
+      // FIX: Pass the queue name ('content-queue') and the connection object
+      const worker = new Worker(
+        'content-queue', // 1. Add a queue name
+        path.join(__dirname, 'contentWorker.js'),
+        { connection: redis } // 2. Pass the global 'redis' connection (ioredis)
+      );
+      
       worker.on('message', (result) => {
         this.handleWorkerResult(result);
       });
+      
       worker.on('error', (error) => {
         console.error(`Worker ${i} error:`, error);
       });
+      
       this.workerPool.push({
         worker,
         busy: false,
