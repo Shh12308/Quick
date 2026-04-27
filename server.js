@@ -45,7 +45,7 @@ import RedisStore from "connect-redis";
 import dotenv from "dotenv";
 import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { body, param, query, validationResult } from 'express-validator'; // ✅ FIXED: Moved import to top
+import { body, param, query, validationResult } from 'express-validator';
 
 dotenv.config();
 
@@ -89,10 +89,13 @@ app.use(
 const { Pool } = pg;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  // ✅ FIX 2: Dynamic SSL configuration - only use SSL for remote/cloud databases
+  ssl: process.env.DATABASE_URL?.includes('localhost') || process.env.DATABASE_URL?.includes('127.0.0.1') 
+    ? false 
+    : { rejectUnauthorized: false },
   max: 20,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  connectionTimeoutMillis: 30000, // ✅ FIX 1: Increased from 2000 (2s) to 30000 (30s)
 });
 
 const { RtcRole, RtcTokenBuilder } = pkg;
@@ -154,7 +157,10 @@ async function initializeTables() {
     await pool.query(`CREATE TABLE IF NOT EXISTS user_subscriptions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE UNIQUE, tier_id INTEGER REFERENCES subscription_tiers(id) ON DELETE CASCADE, stripe_subscription_id VARCHAR(255), status VARCHAR(20), current_period_start TIMESTAMP, current_period_end TIMESTAMP, cancel_at_period_end BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_dislikes_user_content ON dislikes(user_id, content_type, content_id)`);
     console.log("Database tables initialized successfully");
-  } catch (error) { console.error("Error initializing database tables:", error); }
+  } catch (error) { 
+    console.error("Error initializing database tables:", error); 
+    throw error; // ✅ FIX 3: Throw error so the retry mechanism catches it
+  }
 }
 
 function generateAgoraToken(channelName, userId) {
@@ -165,7 +171,7 @@ function generateAgoraToken(channelName, userId) {
   return RtcTokenBuilder.buildTokenWithUid(process.env.AGORA_APP_ID, process.env.AGORA_APP_CERT, channelName, userId, role, privilegeExpiredTs);
 }
 
-initializeTables();
+// ✅ FIX 3: REMOVED `initializeTables();` from here. Added robust startup function below.
 
 const transporter = nodemailer.createTransport({ host: process.env.EMAIL_HOST, port: Number(process.env.EMAIL_PORT), secure: Number(process.env.EMAIL_PORT) === 465, auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS } });
 
@@ -208,7 +214,6 @@ export function processVideo(input, outputDir) {
     ffmpeg(input).output(`${outputDir}/720p.m3u8`).videoCodec("libx264").size("1280x720").outputOptions(["-profile:v baseline", "-level 3.0", "-start_number 0", "-hls_time 10", "-hls_list_size 0", "-f hls"]).on("end", () => resolve()).on("error", reject).run();
   }); 
 }
-// ✅ FIX: Removed stray global variable crash (platformFeeAmount)
 
 app.use(passport.initialize());
 app.use(passport.session());
@@ -312,4 +317,35 @@ io.on("connection", (socket) => {
 // Auto delete expired messages
 setInterval(async () => { try { await pool.query(`DELETE FROM private_messages WHERE expires_at IS NOT NULL AND expires_at < NOW()`); } catch (err) {} }, 10000);
 
-server.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
+// ✅ FIX 3: Robust Startup Retry Logic
+async function startServer() {
+  const MAX_RETRIES = 10;
+  const RETRY_DELAY = 3000; // 3 seconds
+
+  for (let i = 1; i <= MAX_RETRIES; i++) {
+    try {
+      console.log(`Attempting to connect to database (Try ${i}/${MAX_RETRIES})...`);
+      await initializeTables();
+      console.log("Database connected and tables initialized!");
+      return; // Success, exit the loop
+    } catch (err) {
+      console.error(`Database connection failed: ${err.message}`);
+      if (i === MAX_RETRIES) {
+        console.error("Max retries reached. Shutting down.");
+        process.exit(1); // Exit if it completely fails
+      }
+      // Wait before trying again
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+    }
+  }
+}
+
+// Start the server only after database connects
+startServer().then(() => {
+  server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}).catch(err => {
+  console.error("Fatal error starting server:", err);
+  process.exit(1);
+});
