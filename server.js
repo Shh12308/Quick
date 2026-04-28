@@ -352,16 +352,29 @@ async function verifyTurnstile(token) {
   } catch (err) { console.error('Turnstile failed:', err); return false; }
 }
 
+// --- CHECK USERNAME ROUTE ---
 app.get("/check-username", async (req, res) => {
   try {
     const { username } = req.query;
-    if (!username || username.length < 3) return res.json({ available: false });
-    if (username.length > 20 || !/^[a-zA-Z0-9_]+$/.test(username)) return res.json({ available: false });
-    const reserved = ['admin', 'moderator', 'staff', 'system', 'support', 'help', 'mintza', 'official'];
-    if (reserved.includes(username.toLowerCase())) return res.json({ available: false });
-    const { rows } = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [username]);
+    
+    // Basic client-side validation
+    if (!username || username.length < 3) {
+      return res.json({ available: false });
+    }
+
+    // Check PostgreSQL for duplicates
+    const { rows } = await pool.query(
+      `SELECT id FROM "public"."users" WHERE LOWER(username) = LOWER($1) LIMIT 1`,
+      [username]
+    );
+
+    // If rows exist, username is taken. Otherwise, available.
     res.json({ available: rows.length === 0 });
-  } catch (err) { res.status(500).json({ available: false }); }
+  } catch (err) {
+    console.error("Check Username Error:", err);
+    // If the query fails, assume not available or return error
+    res.status(500).json({ error: "Server error checking username" });
+  }
 });
 
 app.post("/signup", upload.fields([{ name: 'profilePic', maxCount: 1 }, { name: 'coverPhoto', maxCount: 1 }]), async (req, res) => {
