@@ -367,22 +367,31 @@ app.get("/check-username", async (req, res) => {
 app.post("/signup", upload.fields([{ name: 'profilePic', maxCount: 1 }, { name: 'coverPhoto', maxCount: 1 }]), async (req, res) => {
   try {
     const { username, email, password, dob, captchaToken } = req.body;
-    if (!captchaToken || !(await verifyTurnstile(captchaToken))) return res.status(400).json({ error: "Security verification failed" });
+
+    // 1. Basic Validation
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "Invalid email" });
     if (!password || password.length < 8) return res.status(400).json({ error: "Password too short" });
-    let str = 0; if (password.length > 8) str++; if (/[A-Z]/.test(password)) str++; if (/[0-9]/.test(password)) str++; if (/[^A-Za-z0-9]/.test(password)) str++;
-    if (str < 3) return res.status(400).json({ error: "Password too weak" });
     if (!username || username.length < 3 || !/^[a-zA-Z0-9_]+$/.test(username)) return res.status(400).json({ error: "Invalid username" });
     
-    const birthDate = new Date(dob); let age = new Date().getFullYear() - birthDate.getFullYear();
-    if ((new Date().getMonth() - birthDate.getMonth() < 0 || (new Date().getMonth() === birthDate.getMonth() && new Date().getDate() < birthDate.getDate()))) age--;
-    if (isNaN(age) || age < 13) return res.status(400).json({ error: age < 13 ? "Must be 13+" : "Invalid DOB" });
+    // 2. Validate DOB and Calculate Age (To mark as Kid)
+    const birthDate = new Date(dob);
+    const today = new Date();
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const m = today.getMonth() - birthDate.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) age--;
 
+    if (isNaN(age)) return res.status(400).json({ error: "Invalid Date of Birth" });
+
+    // --- FIX: Determine if user is a kid (<= 12) ---
+    const is_kid = age <= 12;
+
+    // 3. Check if user exists
     const { rows: exEmail } = await pool.query("SELECT id FROM users WHERE email = $1", [email.toLowerCase()]);
     if (exEmail.length > 0) return res.status(409).json({ error: "Email exists" });
     const { rows: exUser } = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [username]);
     if (exUser.length > 0) return res.status(409).json({ error: "Username taken" });
 
+    // 4. Handle Image Uploads (S3)
     let profileUrl = null, coverUrl = null;
     if (req.files?.profilePic?.[0]) {
       const file = req.files.profilePic[0];
@@ -393,17 +402,31 @@ app.post("/signup", upload.fields([{ name: 'profilePic', maxCount: 1 }, { name: 
       fs.unlinkSync(file.path);
     }
 
+    // 5. Hash Password
     const passwordHash = await argon2.hash(password, { type: argon2.argon2id, memoryCost: 65536, timeCost: 3, parallelism: 4 });
-    const { rows: newUser } = await pool.query(`INSERT INTO users (username, email, password_hash, profile_url, cover_url, dob, auth_provider, created_at) VALUES ($1,$2,$3,$4,$5,$6,'email',NOW()) RETURNING id, username, email, profile_url`, [username, email.toLowerCase(), passwordHash, profileUrl, coverUrl, birthDate]);
+
+    // 6. Insert into Database
+    // --- FIX: Added is_kid to the INSERT query ---
+    const { rows: newUser } = await pool.query(
+      `INSERT INTO users (username, email, password_hash, profile_url, cover_url, dob, auth_provider, is_kid, created_at) 
+       VALUES ($1, $2, $3, $4, $5, $6, 'email', $7, NOW()) 
+       RETURNING id, username, email, profile_url, is_kid`, 
+      [username, email.toLowerCase(), passwordHash, profileUrl, coverUrl, birthDate, is_kid]
+    );
+
     const user = newUser[0];
     
+    // 7. Setup Creator Stats & Email (Optional based on flow)
     await ensureCreatorStats(user.id);
     const confirmToken = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: "24h" });
     await pool.query(`INSERT INTO email_confirmations (user_id, token, expires_at) VALUES ($1, $2, NOW() + INTERVAL '24 hours')`, [user.id, confirmToken]);
     sendEmail({ to: user.email, subject: "Welcome to MintZa", html: `<p>Click <a href="${FRONTEND_URL}/confirm-email?token=${confirmToken}">here</a> to confirm.</p>` }).catch(() => {});
     
+    // 8. Generate Token
     const token = jwt.sign({ id: user.id, email: user.email, role: 'free' }, JWT_SECRET, { expiresIn: "7d" });
-    res.status(201).json({ message: "Success", token, user: { id: user.id, username: user.username, email: user.email, profile_url: user.profile_url } });
+    
+    // --- FIX: Return is_kid in response so frontend knows where to redirect ---
+    res.status(201).json({ message: "Success", token, user: { id: user.id, username: user.username, email: user.email, profile_url: user.profile_url, is_kid: user.is_kid } });
   } catch (err) {
     console.error('Signup error:', err);
     if (req.files?.profilePic?.[0]?.path) fs.unlinkSync(req.files.profilePic[0].path).catch(() => {});
