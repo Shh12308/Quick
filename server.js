@@ -352,28 +352,40 @@ async function verifyTurnstile(token) {
   } catch (err) { console.error('Turnstile failed:', err); return false; }
 }
 
-// --- CHECK USERNAME ROUTE ---
+// --- CHECK USERNAME ROUTE ---// --- UPDATED CHECK USERNAME/EMAIL ROUTE ---
 app.get("/check-username", async (req, res) => {
   try {
-    const { username } = req.query;
+    const { username, email } = req.query;
     
-    // Basic client-side validation
-    if (!username || username.length < 3) {
-      return res.json({ available: false });
+    // 1. Validate Username
+    let usernameAvailable = true;
+    if (username && username.length >= 3) {
+      const userResult = await pool.query(
+        `SELECT id FROM "public"."users" WHERE LOWER(username) = LOWER($1) LIMIT 1`,
+        [username]
+      );
+      usernameAvailable = userResult.rowCount === 0;
     }
 
-    // Check PostgreSQL for duplicates
-    const { rows } = await pool.query(
-      `SELECT id FROM "public"."users" WHERE LOWER(username) = LOWER($1) LIMIT 1`,
-      [username]
-    );
+    // 2. Validate Email (if provided)
+    let emailAvailable = true;
+    if (email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      const emailResult = await pool.query(
+        `SELECT id FROM "public"."users" WHERE email = $1 LIMIT 1`,
+        [email.toLowerCase()]
+      );
+      emailAvailable = emailResult.rowCount === 0;
+    }
 
-    // If rows exist, username is taken. Otherwise, available.
-    res.json({ available: rows.length === 0 });
+    // Return detailed status
+    res.json({ 
+      available: usernameAvailable && emailAvailable,
+      usernameAvailable,
+      emailAvailable
+    });
   } catch (err) {
-    console.error("Check Username Error:", err);
-    // If the query fails, assume not available or return error
-    res.status(500).json({ error: "Server error checking username" });
+    console.error("Check Availability Error:", err);
+    res.status(500).json({ error: "Server error checking availability" });
   }
 });
 
