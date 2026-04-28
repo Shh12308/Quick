@@ -126,6 +126,41 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 // Create tables if they don't exist
 async function initializeTables() {
   try {
+    // Add these inside initializeTables() before the console.log:
+
+// User devices for tracking logins
+await pool.query(`CREATE TABLE IF NOT EXISTS user_devices (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  device_id VARCHAR(255) NOT NULL,
+  ip_address VARCHAR(45),
+  user_agent TEXT,
+  last_seen TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(user_id, device_id)
+)`);
+
+// Security logs for monitoring
+await pool.query(`CREATE TABLE IF NOT EXISTS security_logs (
+  id SERIAL PRIMARY KEY,
+  event_type VARCHAR(50) NOT NULL,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  ip_address VARCHAR(45),
+  device_id VARCHAR(255),
+  details JSONB,
+  created_at TIMESTAMP DEFAULT NOW()
+)`);
+
+// Stripe events idempotency (if not exists)
+await pool.query(`CREATE TABLE IF NOT EXISTS stripe_events (
+  id SERIAL PRIMARY KEY,
+  event_id VARCHAR(255) UNIQUE NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+)`);
+
+// Failed login count column
+await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_count INTEGER DEFAULT 0`);
+await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP`);
     await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(255) UNIQUE NOT NULL, email VARCHAR(255) UNIQUE NOT NULL, password_hash VARCHAR(255), phone VARCHAR(20), device_id VARCHAR(255), profile_url VARCHAR(500), cover_url VARCHAR(500), bio TEXT, social_links JSON, role VARCHAR(20) DEFAULT 'free', subscription_plan VARCHAR(20) DEFAULT 'free', subscription_expires TIMESTAMP, is_musician BOOLEAN DEFAULT false, is_creator BOOLEAN DEFAULT false, is_admin BOOLEAN DEFAULT false, is_verified BOOLEAN DEFAULT false, status VARCHAR(20) DEFAULT 'active', suspend_until TIMESTAMP, suspension_reason TEXT, auth_provider VARCHAR(50), earnings DECIMAL(10, 2) DEFAULT 0, balance DECIMAL(10, 2) DEFAULT 0, dob DATE, preferences JSON, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS chats (id SERIAL PRIMARY KEY, creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(10), name VARCHAR(255), avatar TEXT, participants INTEGER[] DEFAULT '{}', admin_id INTEGER REFERENCES users(id), pinned_by INTEGER[] DEFAULT '{}', muted_by JSONB DEFAULT '{}', last_message_id INTEGER, last_message_at TIMESTAMP, is_archived BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, chat_id INTEGER REFERENCES chats(id) ON DELETE CASCADE, sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(20), content TEXT, media_url TEXT, is_deleted BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())`);
@@ -247,8 +282,703 @@ app.get("/auth/discord/callback", passport.authenticate("discord", { failureRedi
 app.get("/auth/github", passport.authenticate("github", { scope: ["user:email"] }));
 app.get("/auth/github/callback", passport.authenticate("github", { failureRedirect: "/", session: false }), (req, res) => { const token = jwt.sign({ id: req.user.id, email: req.user.email, role: req.user.role }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/welcome.html?token=${token}`); });
 
-app.post("/signup", upload.none(), async (req, res) => { /* signup logic */ });
-app.post("/login", async (req, res) => { /* login logic */ });
+// ============================================
+// SIGNUP ENDPOINTS - Add these to your server.js
+// ============================================
+
+// Turnstile Verification Helper
+async function verifyTurnstile(token) {
+  try {
+    const response = await axios.post(
+      'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+      new URLSearchParams({
+        secret: process.env.TURNSTILE_SECRET_KEY,
+        response: token
+      })
+    );
+    return response.data.success === true;
+  } catch (err) {
+    console.error('Turnstile verification failed:', err);
+    return false;
+  }
+}
+
+// Check Username Availability
+app.get("/check-username", async (req, res) => {
+  try {
+    const { username } = req.query;
+    
+    if (!username || username.length < 3) {
+      return res.json({ available: false, reason: "Username must be at least 3 characters" });
+    }
+    
+    if (username.length > 20) {
+      return res.json({ available: false, reason: "Username must be 20 characters or less" });
+    }
+    
+    // Only allow alphanumeric and underscores
+    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+      return res.json({ available: false, reason: "Only letters, numbers, and underscores allowed" });
+    }
+    
+    // Check for reserved names
+    const reserved = ['admin', 'moderator', 'staff', 'system', 'support', 'help', 'mintza', 'official'];
+    if (reserved.includes(username.toLowerCase())) {
+      return res.json({ available: false, reason: "This username is reserved" });
+    }
+    
+    const { rows } = await pool.query(
+      "SELECT id FROM users WHERE LOWER(username) = LOWER($1)",
+      [username]
+    );
+    
+    res.json({ available: rows.length === 0 });
+  } catch (err) {
+    console.error('Username check error:', err);
+    res.status(500).json({ available: false, reason: "Server error" });
+  }
+});
+
+// Complete Signup Endpoint
+app.post("/signup", upload.fields([
+  { name: 'profilePic', maxCount: 1 },
+  { name: 'coverPhoto', maxCount: 1 }
+]), async (req, res) => {
+  try {
+    const { username, email, password, dob, captchaToken } = req.body;
+    
+    // --- Validation ---
+    
+    // 1. Verify Turnstile
+    if (!captchaToken || !(await verifyTurnstile(captchaToken))) {
+      return res.status(400).json({ error: "Security verification failed" });
+    }
+    
+    // 2. Validate email
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "Invalid email address" });
+    }
+    
+    // 3. Validate password strength
+    if (!password || password.length < 8) {
+      return res.status(400).json({ error: "Password must be at least 8 characters" });
+    }
+    
+    let strength = 0;
+    if (password.length > 8) strength++;
+    if (/[A-Z]/.test(password)) strength++;
+    if (/[0-9]/.test(password)) strength++;
+    if (/[^A-Za-z0-9]/.test(password)) strength++;
+    
+    if (strength < 3) {
+      return res.status(400).json({ error: "Password is too weak. Include uppercase, numbers, and special characters." });
+    }
+    
+    // 4. Validate username
+    if (!username || username.length < 3 || username.length > 20) {
+      return res.status(400).json({ error: "Username must be 3-20 characters" });
+    }
+    
+    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+      return res.status(400).json({ error: "Username can only contain letters, numbers, and underscores" });
+    }
+    
+    // 5. Validate date of birth
+    if (!dob) {
+      return res.status(400).json({ error: "Date of birth is required" });
+    }
+    
+    const birthDate = new Date(dob);
+    const today = new Date();
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const monthDiff = today.getMonth() - birthDate.getMonth();
+    if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+      age--;
+    }
+    
+    if (isNaN(age) || age < 1 || age > 120) {
+      return res.status(400).json({ error: "Invalid date of birth" });
+    }
+    
+    if (age < 13) {
+      return res.status(400).json({ error: "You must be at least 13 years old to sign up" });
+    }
+    
+    // --- Check for existing user ---
+    const { rows: existingEmail } = await pool.query(
+      "SELECT id FROM users WHERE email = $1",
+      [email.toLowerCase()]
+    );
+    
+    if (existingEmail.length > 0) {
+      return res.status(409).json({ error: "An account with this email already exists" });
+    }
+    
+    const { rows: existingUsername } = await pool.query(
+      "SELECT id FROM users WHERE LOWER(username) = LOWER($1)",
+      [username]
+    );
+    
+    if (existingUsername.length > 0) {
+      return res.status(409).json({ error: "This username is already taken" });
+    }
+    
+    // --- Upload profile picture to S3 ---
+    let profileUrl = null;
+    let coverUrl = null;
+    
+    if (req.files?.profilePic?.[0]) {
+      const file = req.files.profilePic[0];
+      const key = `profiles/${Date.now()}-${username}${path.extname(file.originalname)}`;
+      
+      // Resize and optimize with sharp
+      const buffer = await sharp(file.path)
+        .resize(400, 400, { fit: 'cover' })
+        .jpeg({ quality: 80 })
+        .toBuffer();
+      
+      await s3.send(new PutObjectCommand({
+        Bucket: S3_BUCKET_NAME,
+        Key: key,
+        Body: buffer,
+        ContentType: 'image/jpeg'
+      }));
+      
+      profileUrl = `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+      fs.unlinkSync(file.path); // Clean up temp file
+    }
+    
+    if (req.files?.coverPhoto?.[0]) {
+      const file = req.files.coverPhoto[0];
+      const key = `covers/${Date.now()}-${username}${path.extname(file.originalname)}`;
+      
+      const buffer = await sharp(file.path)
+        .resize(1500, 500, { fit: 'cover' })
+        .jpeg({ quality: 80 })
+        .toBuffer();
+      
+      await s3.send(new PutObjectCommand({
+        Bucket: S3_BUCKET_NAME,
+        Key: key,
+        Body: buffer,
+        ContentType: 'image/jpeg'
+      }));
+      
+      coverUrl = `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+      fs.unlinkSync(file.path);
+    }
+    
+    // --- Create user ---
+    const passwordHash = await argon2.hash(password, {
+      type: argon2.argon2id,
+      memoryCost: 65536,
+      timeCost: 3,
+      parallelism: 4
+    });
+    
+    const { rows: newUser } = await pool.query(
+      `INSERT INTO users (
+        username, email, password_hash, profile_url, cover_url, 
+        dob, auth_provider, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, 'email', NOW()) 
+      RETURNING id, username, email, profile_url, created_at`,
+      [username, email.toLowerCase(), passwordHash, profileUrl, coverUrl, birthDate]
+    );
+    
+    const user = newUser[0];
+    
+    // Initialize creator stats
+    await ensureCreatorStats(user.id);
+    
+    // Create email confirmation token
+    const confirmToken = jwt.sign(
+      { id: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: "24h" }
+    );
+    
+    await pool.query(
+      `INSERT INTO email_confirmations (user_id, token, expires_at) 
+       VALUES ($1, $2, NOW() + INTERVAL '24 hours')`,
+      [user.id, confirmToken]
+    );
+    
+    // Send confirmation email (async, don't block response)
+    const confirmUrl = `${FRONTEND_URL}/confirm-email?token=${confirmToken}`;
+    sendEmail({
+      to: user.email,
+      subject: "Welcome to MintZa - Confirm your email",
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <div style="background: #facc15; padding: 20px; text-align: center;">
+            <h1 style="color: #000; margin: 0;">Welcome to MintZa! 🚀</h1>
+          </div>
+          <div style="padding: 30px; background: #1a1a1a; color: white;">
+            <p>Hi <strong>${user.username}</strong>,</p>
+            <p>Thanks for joining MintZa! Please confirm your email address to get started:</p>
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${confirmUrl}" 
+                 style="background: #facc15; color: #000; padding: 12px 30px; 
+                        text-decoration: none; border-radius: 8px; font-weight: bold;">
+                Confirm Email
+              </a>
+            </div>
+            <p style="color: #888; font-size: 12px;">
+              This link expires in 24 hours. If you didn't create this account, ignore this email.
+            </p>
+          </div>
+        </div>
+      `
+    }).catch(err => console.error('Welcome email failed:', err));
+    
+    // Generate JWT
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: 'free' },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+    
+    // Return success
+    res.status(201).json({
+      message: "Account created successfully",
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        profile_url: user.profile_url,
+        is_verified: false
+      }
+    });
+    
+  } catch (err) {
+    console.error('Signup error:', err);
+    
+    // Clean up uploaded files if error occurred
+    if (req.files?.profilePic?.[0]?.path) {
+      fs.unlinkSync(req.files.profilePic[0].path).catch(() => {});
+    }
+    if (req.files?.coverPhoto?.[0]?.path) {
+      fs.unlinkSync(req.files.coverPhoto[0].path).catch(() => {});
+    }
+    
+    res.status(500).json({ error: "Failed to create account. Please try again." });
+  }
+});
+
+// Login Endpoint (Complete)
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password are required" });
+    }
+    
+    const { rows } = await pool.query(
+      "SELECT * FROM users WHERE email = $1",
+      [email.toLowerCase()]
+    );
+    
+    if (rows.length === 0) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+    
+    const user = rows[0];
+    
+    // Check if suspended
+    if (user.status === 'suspended') {
+      if (user.suspend_until && new Date(user.suspend_until) > new Date()) {
+        return res.status(403).json({ 
+          error: `Account suspended until ${new Date(user.suspend_until).toLocaleDateString()}. Reason: ${user.suspension_reason || 'Violation of terms'}` 
+        });
+      } else if (!user.suspend_until) {
+        return res.status(403).json({ error: "Account permanently suspended" });
+      } else {
+        // Suspension expired, reactivate
+        await pool.query(
+          "UPDATE users SET status = 'active', suspend_until = NULL, suspension_reason = NULL WHERE id = $1",
+          [user.id]
+        );
+      }
+    }
+    
+    // Verify password
+    const validPassword = await argon2.verify(user.password_hash, password);
+    
+    if (!validPassword) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+    
+    // Check if email-only login (no password set from OAuth)
+    if (!user.password_hash && user.auth_provider !== 'email') {
+      return res.status(400).json({ 
+        error: "This account was created with " + user.auth_provider + ". Please use that method to log in." 
+      });
+    }
+    
+    // Generate token
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+    
+    // Update last login
+    await pool.query(
+      "UPDATE users SET updated_at = NOW() WHERE id = $1",
+      [user.id]
+    );
+    
+    delete user.password_hash;
+    
+    res.json({
+      token,
+      user
+    });
+    
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: "Login failed. Please try again." });
+  }
+});
+// ============================================
+// VPN CHECK ENDPOINT
+// ============================================
+app.post("/auth/check-vpn", async (req, res) => {
+  try {
+    // Get IP from headers (works behind proxies like Railway)
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
+               req.socket?.remoteAddress || 
+               req.ip;
+    
+    if (!ip || ip === '::1' || ip === '127.0.0.1') {
+      return res.json({ vpn: false, ip: ip });
+    }
+    
+    let isVpn = false;
+    
+    try {
+      // Using ipqualityscore or ipinfo (free tier available)
+      // Option 1: ip-api.com (free, no key needed)
+      const response = await axios.get(`http://ip-api.com/json/${ip}?fields=proxy,hosting,query`, {
+        timeout: 3000
+      });
+      
+      isVpn = response.data?.proxy === true || response.data?.hosting === true;
+      
+      // Log for security monitoring
+      await pool.query(
+        `INSERT INTO security_logs (event_type, ip_address, details, created_at) 
+         VALUES ($1, $2, $3, NOW())`,
+        ['vpn_check', ip, JSON.stringify({ vpn: isVpn, data: response.data })]
+      ).catch(() => {});
+      
+    } catch (apiErr) {
+      console.log('VPN check API failed:', apiErr.message);
+      // Don't block login if VPN check fails
+    }
+    
+    res.json({ vpn: isVpn, ip: ip });
+    
+  } catch (err) {
+    console.error('VPN check error:', err);
+    res.json({ vpn: false });
+  }
+});
+
+// ============================================
+// SECURITY LOGS TABLE (add to initializeTables)
+// ============================================
+// Add this line inside initializeTables():
+await pool.query(`CREATE TABLE IF NOT EXISTS security_logs (
+  id SERIAL PRIMARY KEY, 
+  event_type VARCHAR(50), 
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, 
+  ip_address VARCHAR(45), 
+  device_id VARCHAR(255), 
+  details JSONB, 
+  created_at TIMESTAMP DEFAULT NOW()
+)`);
+
+// ============================================
+// LOGIN RATE LIMITER (stricter than global)
+// ============================================
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // 10 attempts per window
+  message: { error: "Too many login attempts. Please try again in 15 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    // Rate limit by IP + identifier to prevent brute force
+    const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.ip;
+    const identifier = req.body?.identifier || 'unknown';
+    return `${ip}:${identifier}`;
+  }
+});
+
+// ============================================
+// TURNSTILE VERIFICATION HELPER
+// ============================================
+async function verifyTurnstile(token) {
+  try {
+    const response = await axios.post(
+      'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+      new URLSearchParams({
+        secret: process.env.TURNSTILE_SECRET_KEY,
+        response: token
+      })
+    );
+    return response.data.success === true;
+  } catch (err) {
+    console.error('Turnstile verification failed:', err);
+    return false;
+  }
+}
+
+// ============================================
+// COMPLETE LOGIN ENDPOINT
+// ============================================
+app.post("/login", loginLimiter, async (req, res) => {
+  try {
+    const { identifier, password, device_id, vpn, captcha } = req.body;
+    
+    // --- Validation ---
+    
+    if (!identifier || !password) {
+      return res.status(400).json({ error: "Email/username and password are required" });
+    }
+    
+    if (!captcha) {
+      return res.status(400).json({ error: "Please complete the security check" });
+    }
+    
+    // Verify Turnstile
+    const isHuman = await verifyTurnstile(captcha);
+    if (!isHuman) {
+      return res.status(400).json({ error: "Security verification failed. Please try again." });
+    }
+    
+    // Get client IP
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
+               req.socket?.remoteAddress || 
+               'unknown';
+    
+    // --- Find User (by email or username) ---
+    
+    const { rows } = await pool.query(
+      `SELECT u.*, 
+              EXISTS(SELECT 1 FROM user_devices WHERE user_id = u.id AND device_id = $2) as is_known_device
+       FROM users u 
+       WHERE (LOWER(u.email) = LOWER($1) OR LOWER(u.username) = LOWER($1))
+       LIMIT 1`,
+      [identifier, device_id || null]
+    );
+    
+    if (rows.length === 0) {
+      // Log failed attempt
+      await pool.query(
+        `INSERT INTO security_logs (event_type, ip_address, device_id, details, created_at) 
+         VALUES ($1, $2, $3, $4, NOW())`,
+        ['login_failed_unknown', ip, device_id, JSON.stringify({ identifier, vpn })]
+      ).catch(() => {});
+      
+      return res.status(401).json({ error: "Invalid email/username or password" });
+    }
+    
+    const user = rows[0];
+    
+    // --- Check Account Status ---
+    
+    if (user.status === 'banned') {
+      return res.status(403).json({ 
+        error: "Account has been permanently banned",
+        code: "ACCOUNT_BANNED"
+      });
+    }
+    
+    if (user.status === 'suspended') {
+      if (user.suspend_until && new Date(user.suspend_until) > new Date()) {
+        return res.status(403).json({ 
+          error: `Account suspended until ${new Date(user.suspend_until).toLocaleDateString()}. Reason: ${user.suspension_reason || 'Violation of terms'}`,
+          code: "ACCOUNT_SUSPENDED"
+        });
+      } else {
+        // Suspension expired, reactivate
+        await pool.query(
+          `UPDATE users SET status = 'active', suspend_until = NULL, suspension_reason = NULL, updated_at = NOW() WHERE id = $1`,
+          [user.id]
+        );
+      }
+    }
+    
+    // --- Check Password ---
+    
+    if (!user.password_hash) {
+      return res.status(400).json({ 
+        error: `This account was created using ${user.auth_provider || 'social login'}. Please use that method to log in.`,
+        code: "OAUTH_ACCOUNT"
+      });
+    }
+    
+    const validPassword = await argon2.verify(user.password_hash, password);
+    
+    if (!validPassword) {
+      // Log failed attempt
+      await pool.query(
+        `INSERT INTO security_logs (event_type, user_id, ip_address, device_id, details, created_at) 
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+        ['login_failed_password', user.id, ip, device_id, JSON.stringify({ vpn })]
+      ).catch(() => {});
+      
+      // Increment failed login count
+      await pool.query(
+        `UPDATE users SET failed_login_count = COALESCE(failed_login_count, 0) + 1, updated_at = NOW() WHERE id = $1`,
+        [user.id]
+      ).catch(() => {});
+      
+      // Check if account should be temporarily locked
+      const { rows: lockCheck } = await pool.query(
+        "SELECT failed_login_count FROM users WHERE id = $1",
+        [user.id]
+      );
+      
+      if (lockCheck[0]?.failed_login_count >= 5) {
+        await pool.query(
+          `UPDATE users SET status = 'suspended', suspend_until = NOW() + INTERVAL '30 minutes', 
+           suspension_reason = 'Too many failed login attempts', updated_at = NOW() WHERE id = $1`,
+          [user.id]
+        );
+        return res.status(429).json({ 
+          error: "Too many failed attempts. Account locked for 30 minutes.",
+          code: "ACCOUNT_LOCKED"
+        });
+      }
+      
+      return res.status(401).json({ error: "Invalid email/username or password" });
+    }
+    
+    // --- Login Successful ---
+    
+    // Reset failed login count
+    await pool.query(
+      `UPDATE users SET failed_login_count = 0, last_login_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [user.id]
+    );
+    
+    // --- Device Management ---
+    
+    if (device_id) {
+      await pool.query(`
+        INSERT INTO user_devices (user_id, device_id, ip_address, last_seen, created_at)
+        VALUES ($1, $2, $3, NOW(), NOW())
+        ON CONFLICT (user_id, device_id) 
+        DO UPDATE SET ip_address = $3, last_seen = NOW()
+      `, [user.id, device_id, ip]).catch(() => {});
+    }
+    
+    // --- Log Successful Login ---
+    
+    await pool.query(
+      `INSERT INTO security_logs (event_type, user_id, ip_address, device_id, details, created_at) 
+       VALUES ($1, $2, $3, $4, $5, NOW())`,
+      ['login_success', user.id, ip, device_id, JSON.stringify({ vpn, is_known_device: user.is_known_device })]
+    ).catch(() => {});
+    
+    // --- New Device Notification ---
+    
+    if (!user.is_known_device && device_id) {
+      sendEmail({
+        to: user.email,
+        subject: "New login to your MintZa account",
+        html: `
+          <div style="font-family: Arial; max-width: 600px; margin: 0 auto; background: #1a1a1a; color: white; padding: 30px; border-radius: 12px;">
+            <div style="background: #facc15; padding: 15px; border-radius: 8px 8px 0 0; text-align: center;">
+              <h2 style="margin: 0; color: #000;">🔒 New Device Login</h2>
+            </div>
+            <div style="padding: 20px;">
+              <p>We noticed a new login to your account:</p>
+              <ul style="color: #9ca3af;">
+                <li><strong>IP Address:</strong> ${ip}</li>
+                <li><strong>Device ID:</strong> ${device_id.substring(0, 15)}...</li>
+                <li><strong>Time:</strong> ${new Date().toLocaleString()}</li>
+                ${vpn ? '<li style="color: #ef4444;"><strong>⚠️ VPN/Proxy detected</strong></li>' : ''}
+              </ul>
+              <p style="color: #9ca3af; font-size: 12px; margin-top: 20px;">
+                If this wasn't you, please change your password immediately and contact support.
+              </p>
+            </div>
+          </div>
+        `
+      }).catch(() => {});
+    }
+    
+    // --- Generate JWT ---
+    
+    const token = jwt.sign(
+      { 
+        id: user.id, 
+        email: user.email, 
+        username: user.username,
+        role: user.role 
+      },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+    
+    // --- Check if user is a kid (under 13) ---
+    
+    let is_kid = false;
+    if (user.dob) {
+      const age = Math.floor((new Date() - new Date(user.dob)) / (365.25 * 24 * 60 * 60 * 1000));
+      is_kid = age < 13;
+    }
+    
+    // --- Return Response ---
+    
+    const responseUser = {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      profile: user.profile_url,
+      cover: user.cover_url,
+      bio: user.bio,
+      role: user.role,
+      is_verified: user.is_verified,
+      is_kid,
+      is_musician: user.is_musician,
+      is_creator: user.is_creator,
+      subscription_plan: user.subscription_plan,
+      created_at: user.created_at
+    };
+    
+    res.json({
+      token,
+      user: responseUser
+    });
+    
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: "Login failed. Please try again." });
+  }
+});
+
+// ============================================
+// USER DEVICES TABLE (add to initializeTables)
+// ============================================
+await pool.query(`CREATE TABLE IF NOT EXISTS user_devices (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  device_id VARCHAR(255) NOT NULL,
+  ip_address VARCHAR(45),
+  last_seen TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(user_id, device_id)
+)`);
+
+// Add failed_login_count column if not exists
+await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_count INTEGER DEFAULT 0`);
 app.get("/api/me", authMiddleware, async (req, res) => { const { rows } = await pool.query("SELECT * FROM users WHERE id = $1", [req.user.id]); if (!rows.length) return res.status(404).json({ error: "Not found" }); const user = rows[0]; delete user.password_hash; res.json({ user }); });
 
 // Payment
