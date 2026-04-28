@@ -251,6 +251,99 @@ app.get("/auth/discord/callback", passport.authenticate("discord", { failureRedi
 app.get("/auth/github", passport.authenticate("github", { scope: ["user:email"] }));
 app.get("/auth/github/callback", passport.authenticate("github", { failureRedirect: "/", session: false }), (req, res) => { const token = jwt.sign({ id: req.user.id, email: req.user.email, role: req.user.role }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/welcome.html?token=${token}`); });
 
+// --- FORGOT PASSWORD LOGIC ---
+
+// 1. Generate and Send Code
+app.post("/api/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "Email is required" });
+
+    // Check if user exists (don't reveal if they don't for security, but check DB)
+    const { rows } = await pool.query("SELECT id, username FROM users WHERE email = $1", [email.toLowerCase()]);
+    
+    if (rows.length === 0) {
+      // Return success anyway to prevent email enumeration
+      return res.json({ message: "If an account exists, a code was sent." });
+    }
+
+    const user = rows[0];
+    
+    // Generate 6-digit code
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    
+    // Store in Redis with 15 minute expiry (Key: reset_code:<email>)
+    await redis.set(`reset_code:${email.toLowerCase()}`, code, 'EX', 900);
+
+    // Send Email
+    await sendEmail({
+      to: email,
+      subject: "MintZa Password Reset Code",
+      html: `<p>Your verification code is: <strong>${code}</strong></p><p>It expires in 15 minutes.</p>`
+    });
+
+    res.json({ message: "Code sent successfully." });
+  } catch (err) {
+    console.error("Forgot password error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// 2. Verify Code
+app.post("/api/verify-code", async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: "Email and code required" });
+
+    const storedCode = await redis.get(`reset_code:${email.toLowerCase()}`);
+
+    if (!storedCode) {
+      return res.status(400).json({ error: "Code expired or invalid." });
+    }
+
+    if (storedCode !== code) {
+      return res.status(400).json({ error: "Incorrect code." });
+    }
+
+    res.json({ message: "Code verified." });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// 3. Reset Password
+app.post("/api/reset-password", async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body;
+    
+    if (!email || !code || !newPassword) return res.status(400).json({ error: "Missing fields" });
+    if (newPassword.length < 8) return res.status(400).json({ error: "Password must be 8+ chars" });
+
+    // Verify code one last time
+    const storedCode = await redis.get(`reset_code:${email.toLowerCase()}`);
+    if (storedCode !== code) return res.status(400).json({ error: "Invalid or expired code" });
+
+    // Hash new password
+    const passwordHash = await argon2.hash(newPassword, { 
+      type: argon2.argon2id, 
+      memoryCost: 65536, 
+      timeCost: 3, 
+      parallelism: 4 
+    });
+
+    // Update DB
+    await pool.query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE email = $2", [passwordHash, email.toLowerCase()]);
+
+    // Delete code from Redis so it can't be used again
+    await redis.del(`reset_code:${email.toLowerCase()}`);
+
+    res.json({ message: "Password reset successfully. Please login." });
+  } catch (err) {
+    console.error("Reset error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // FIXED: Single Turnstile Verification Helper
 async function verifyTurnstile(token) {
   try {
