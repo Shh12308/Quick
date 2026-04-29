@@ -69,13 +69,43 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // --- Redis & Session Setup ---
-const pubClient = createClient({ url: process.env.REDIS_URL });
+// Helper to create a robust Redis client with TLS support
+function createRedisClient() {
+  return createClient({
+    url: process.env.REDIS_URL,
+    socket: {
+      // Enable TLS if the URL is 'rediss://'
+      tls: process.env.REDIS_URL?.startsWith('rediss://'),
+      // Necessary for many cloud providers (Render, Heroku, AWS) to prevent self-cert errors
+      rejectUnauthorized: false,
+      // Keep connection alive
+      keepAlive: 30000, 
+    },
+  });
+}
+
+const pubClient = createRedisClient();
 const subClient = pubClient.duplicate();
-await pubClient.connect();
-await subClient.connect();
+
+// CRITICAL: Add error handlers to prevent the app from crashing on Redis disconnects
+pubClient.on('error', (err) => console.error('Redis Pub Client Error:', err));
+subClient.on('error', (err) => console.error('Redis Sub Client Error:', err));
+
+try {
+  await pubClient.connect();
+  await subClient.connect();
+  console.log("Redis Pub/Sub connected successfully");
+} catch (err) {
+  console.error("Failed to connect to Redis Pub/Sub:", err);
+  // We continue execution, assuming connection might recover or features might be degraded
+}
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-const redis = new Redis(process.env.REDIS_URL);
+
+const redis = new Redis(process.env.REDIS_URL, {
+  tls: process.env.REDIS_URL?.startsWith('rediss://') ? { rejectUnauthorized: false } : {},
+  maxRetriesPerRequest: null, // Required for connect-redis
+});
 const cache = new NodeCache({ stdTTL: 600 });
 
 app.use(
@@ -87,7 +117,7 @@ app.use(
     cookie: {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
-      sameSite: "none",
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax", // 'none' requires secure: true
       maxAge: 1000 * 60 * 60 * 24 * 7
     }
   })
@@ -123,6 +153,7 @@ const {
   OPENAI_API_KEY,
   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
   ASSEMBLYAI_KEY, SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET, DEEP_AI_KEY,
+  TURNSTILE_SECRET_KEY
 } = process.env;
 
 // --- AWS S3 Setup ---
@@ -174,7 +205,11 @@ async function initializeTables() {
     await pool.query(`CREATE TABLE IF NOT EXISTS livestreams (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(255) NOT NULL, description TEXT, category VARCHAR(100), thumbnail_url VARCHAR(500), stream_key VARCHAR(255) UNIQUE NOT NULL, is_live BOOLEAN DEFAULT false, is_scheduled BOOLEAN DEFAULT false, scheduled_start TIMESTAMP, viewers INTEGER DEFAULT 0, peak_viewers INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, shares INTEGER DEFAULT 0, duration INTEGER, recording_url VARCHAR(500), chat_enabled BOOLEAN DEFAULT true, delay_seconds INTEGER DEFAULT 0, tags JSON, earnings DECIMAL(10, 2) DEFAULT 0, started_at TIMESTAMP, ended_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS products (id SERIAL PRIMARY KEY, creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(255) NOT NULL, description TEXT, price DECIMAL(10, 2) NOT NULL, type VARCHAR(20) NOT NULL, images JSONB DEFAULT '[]', tags JSONB DEFAULT '[]', category VARCHAR(100), stock INTEGER DEFAULT 0, sizes JSONB DEFAULT '[]', colors JSONB DEFAULT '[]', crypto_address VARCHAR(255), crypto_type VARCHAR(20) DEFAULT 'ETH', views INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS email_confirmations (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, token VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMP NOT NULL, created_at TIMESTAMP DEFAULT NOW())`);
-    
+    await pool.query(`CREATE TABLE IF NOT EXISTS stripe_events (id SERIAL PRIMARY KEY, event_id TEXT UNIQUE NOT NULL, processed_at TIMESTAMP DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_subscriptions (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, tier_id INTEGER, stripe_subscription_id TEXT, status TEXT, current_period_start TIMESTAMP, current_period_end TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS subscription_tiers (id SERIAL PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2), benefits JSON, role VARCHAR(50))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), amount DECIMAL(10,2), status TEXT, type TEXT, created_at TIMESTAMP DEFAULT NOW())`);
+
     console.log("Database tables initialized successfully");
   } catch (error) { 
     console.error("Error initializing database tables:", error); 
@@ -223,14 +258,19 @@ export const upload = multer({
 // --- S3 Upload Helper ---
 async function uploadToS3(file, key, mimeType) {
   const fileContent = fs.readFileSync(file.path);
-  const buffer = await sharp(fileContent)
-    .rotate()
-    .toBuffer();
+  let buffer = fileContent;
+  
+  // Use sharp if it's an image to orient it correctly
+  if (mimeType.startsWith('image/')) {
+    buffer = await sharp(fileContent)
+      .rotate()
+      .toBuffer();
+  }
     
   await s3.send(new PutObjectCommand({
     Bucket: S3_BUCKET_NAME,
     Key: key,
-    Body: fileContent, // Or 'buffer' if using sharp resizing
+    Body: buffer, 
     ContentType: mimeType
   }));
   
@@ -296,7 +336,6 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 });
 
 // --- Passport & Auth Strategies ---
-// (Using existing logic)
 app.use(passport.initialize());
 app.use(passport.session());
 passport.serializeUser((user, done) => done(null, user.id));
@@ -305,21 +344,19 @@ passport.deserializeUser(async (id, done) => { try { const res = await pool.quer
 // Helper for creating stats
 async function ensureCreatorStats(userId) { try { await pool.query(`INSERT INTO creator_stats (user_id, total_likes, total_follows, total_views, total_tips, total_merch_sales, earnings, updated_at) VALUES ($1,0,0,0,0,0,0,NOW()) ON CONFLICT (user_id) DO NOTHING`, [userId]); } catch (err) { console.error("ensureCreatorStats error:", err); } }
 
-// (Strategies: Google, Discord, GitHub) - Omitted for brevity, assuming same as previous code
-
 // --- Helper: Verify Turnstile ---
 async function verifyTurnstile(token) {
   try {
-    const response = await axios.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', new URLSearchParams({ secret: process.env.TURNSTILE_SECRET_KEY, response: token }));
+    const response = await axios.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', new URLSearchParams({ secret: TURNSTILE_SECRET_KEY, response: token }));
     return response.data.success === true;
   } catch (err) { console.error('Turnstile failed:', err); return false; }
 }
 
 // ==========================================
-// NEW & UPDATED API ROUTES
+// API ROUTES
 // ==========================================
 
-// 1. Video & Shorts Upload (Matches SQL & S3)
+// 1. Video & Shorts Upload
 app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
   try {
     const { title, description, category, is_short } = req.body;
@@ -391,10 +428,10 @@ app.post("/api/music", authMiddleware, upload.fields([{ name: 'audio', maxCount:
   }
 });
 
-// 3. Generic Reaction Handler (Video, Music, Comment)
+// 3. Generic Reaction Handler
 app.post("/api/react", authMiddleware, async (req, res) => {
   try {
-    const { content_id, content_type, reaction_type } = req.body; // reaction_type: 'like', 'dislike'
+    const { content_id, content_type, reaction_type } = req.body;
     const user_id = req.user.id;
 
     if (!content_id || !content_type) return res.status(400).json({ error: "Missing content info" });
@@ -408,15 +445,13 @@ app.post("/api/react", authMiddleware, async (req, res) => {
     `;
     await pool.query(query, [user_id, content_id, content_type, reaction_type]);
 
-    // Update counts on the source table (Video/Music/Comment)
-    // Note: In a high-scale app, do this asynchronously or use a trigger
+    // Update counts on the source table
     let updateTable = "";
     if (content_type === 'video') updateTable = "videos";
     else if (content_type === 'music') updateTable = "music";
     else if (content_type === 'comment') updateTable = "comments";
 
     if (updateTable) {
-      // Recalculate counts (Simplistic approach)
       if (reaction_type === 'like') {
          await pool.query(`UPDATE ${updateTable} SET likes = (SELECT COUNT(*) FROM content_reactions WHERE content_id = $1 AND content_type = $2 AND reaction_type = 'like') WHERE id = $1`, [content_id, content_type]);
       } else if (reaction_type === 'dislike') {
@@ -435,15 +470,14 @@ app.post("/api/react", authMiddleware, async (req, res) => {
 app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), async (req, res) => {
   try {
     const { chatId } = req.params;
-    const { content } = req.body; // Text content
+    const { content } = req.body;
     const userId = req.user.id;
     
     let mediaUrl = null;
     let type = 'text';
 
-    // Handle Voice Message (Audio Blob)
     if (req.file) {
-      const voiceKey = `voice-msgs/${chatId}/${Date.now()}.webm`; // or wav
+      const voiceKey = `voice-msgs/${chatId}/${Date.now()}.webm`;
       mediaUrl = await uploadToS3(req.file, voiceKey, req.file.mimetype);
       type = 'audio';
     } else if (content) {
@@ -458,7 +492,6 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), 
       [chatId, userId, content || null, mediaUrl, type]
     );
 
-    // Emit via Socket
     io.to(`chat-${chatId}`).emit("new-message", rows[0]);
 
     res.status(201).json({ message: rows[0] });
@@ -468,35 +501,29 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), 
   }
 });
 
-// 5. Ad Tag Endpoint (The Logic)
+// 5. Ad Tag Endpoint
 app.get("/api/videos/:id/ad-tag", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     
-    // Fetch Video details
     const { rows } = await pool.query("SELECT duration, is_short, monetization_enabled FROM videos WHERE id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "Video not found" });
     
     const video = rows[0];
 
-    // Rules: No ads on shorts, must be monetized, duration > 60s
     if (video.is_short || !video.monetization_enabled || (video.duration && video.duration < 60)) {
       return res.json({ vastUrl: null });
     }
 
-    // Provider Selection Strategy
     let vastUrl = "";
     const providers = ["google", "freewheel", "roku"];
-    const provider = providers[Math.floor(Math.random() * providers.length)]; // Round robin for demo
+    const provider = providers[Math.floor(Math.random() * providers.length)];
 
     if (provider === "google") {
-      // Google Ad Manager URL
       vastUrl = `https://pubads.g.doubleclick.net/gampad/ads?iu=/21775744923/external/pre-roll&sz=640x480&ciu_szs=300x250%2C728x90&gdfp_req=1&output=vast&unviewed_position_start=1&env=vp&impl=s&correlator=${Date.now()}&cust_params=vid%3D${id}`;
     } else if (provider === "roku") {
-      // Mock Roku Ad Manager URL
       vastUrl = `https://ads.roku.com/ads/vast.xml?video_id=${id}&provider=roku`;
     } else {
-      // FreeWheel
       vastUrl = `https://vast.freewheel.com/mrex.xml?cid=123&pid=456&video=${id}`;
     }
 
@@ -507,9 +534,7 @@ app.get("/api/videos/:id/ad-tag", authMiddleware, async (req, res) => {
   }
 });
 
-// --- Existing Routes (Signup, Login, Fetch Videos) ---
-// (Keeping your existing logic below, just ensuring they match the new schema slightly)
-
+// --- Existing Routes ---
 app.get("/api/videos", async (req, res) => { 
   try { 
     const { filter, category } = req.query; 
@@ -536,6 +561,10 @@ app.get("/api/videos/:id", async (req, res) => {
 const io = new SocketServer(server, { 
   cors: { origin: process.env.FRONTEND_URL || "*", methods: ["GET", "POST"] } 
 });
+
+// Attach Redis Adapter for scaling
+io.adapter(createAdapter(pubClient, subClient));
+
 io.use(async (socket, next) => { 
   try { 
     const token = socket.handshake.auth.token; 
