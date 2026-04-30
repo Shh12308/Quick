@@ -59,6 +59,31 @@ import {
 
 dotenv.config();
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const app = express(); 
+const server = http.createServer(app);
+
+// ==========================================
+// ENVIRONMENT VARIABLES
+// ==========================================
+const {
+  DATABASE_URL, JWT_SECRET, SESSION_SECRET,
+  EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS,
+  GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_CALLBACK_URL,
+  DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_CALLBACK_URL,
+  GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_CALLBACK_URL,
+  FRONTEND_URL, ADMIN_KEY, PORT = 3000,
+  AGORA_APP_ID, AGORA_APP_CERTIFICATE,
+  AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME,
+  OPENAI_API_KEY,
+  STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
+  ASSEMBLYAI_KEY, SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET, DEEP_AI_KEY,
+  TURNSTILE_SECRET_KEY,
+  IPINFO_TOKEN // Added for VPN detection
+} = process.env;
+
 // Environment variable validation
 const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET', 'SESSION_SECRET'];
 const missingEnv = REQUIRED_ENV.filter(key => !process.env[key]);
@@ -66,12 +91,6 @@ if (missingEnv.length) {
   console.error(`❌ Missing required environment variables: ${missingEnv.join(', ')}`);
   process.exit(1);
 }
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const app = express(); 
-const server = http.createServer(app);
 
 // CORS middleware
 app.use(cors({
@@ -81,13 +100,15 @@ app.use(cors({
 
 app.use(helmet());
 
-// Stripe webhook MUST come before express.json() to preserve raw body
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+// ==========================================
+// STRIPE WEBHOOK (Raw Body)
+// ==========================================
+const stripe = new Stripe(STRIPE_SECRET_KEY);
 
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
-  try { event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET); } catch (err) { return res.status(400).send(`Webhook Error: ${err.message}`); }
+  try { event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET); } catch (err) { return res.status(400).send(`Webhook Error: ${err.message}`); }
   try {
     const exists = await pool.query("SELECT 1 FROM stripe_events WHERE event_id = $1", [event.id]);
     if (exists.rowCount > 0) return res.send();
@@ -124,7 +145,9 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// --- Redis & Session Setup ---
+// ==========================================
+// REDIS & SESSION (Non-Blocking)
+// ==========================================
 function createRedisClient() {
   return createClient({
     url: process.env.REDIS_URL,
@@ -142,13 +165,17 @@ const subClient = pubClient.duplicate();
 pubClient.on('error', (err) => console.error('Redis Pub Client Error:', err));
 subClient.on('error', (err) => console.error('Redis Sub Client Error:', err));
 
-try {
-  await pubClient.connect();
-  await subClient.connect();
-  console.log("Redis Pub/Sub connected successfully");
-} catch (err) {
-  console.error("Failed to connect to Redis Pub/Sub:", err);
-}
+// Connect Redis in background to prevent 502 on startup
+(async () => {
+  try {
+    await pubClient.connect();
+    await subClient.connect();
+    console.log("Redis Pub/Sub connected successfully");
+  } catch (err) {
+    console.error("Failed to connect to Redis Pub/Sub (Chat/Cache might be unavailable):", err);
+    // Do NOT exit here
+  }
+})();
 
 const redis = new Redis(process.env.REDIS_URL, {
   tls: process.env.REDIS_URL?.startsWith('rediss://') ? { rejectUnauthorized: false } : {},
@@ -159,7 +186,7 @@ const cache = new NodeCache({ stdTTL: 600 });
 app.use(
   session({
     store: new RedisStore({ client: redis }),
-    secret: process.env.SESSION_SECRET,
+    secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
     cookie: {
@@ -171,11 +198,13 @@ app.use(
   })
 );
 
-// --- PostgreSQL Pool ---
+// ==========================================
+// POSTGRESQL POOL
+// ==========================================
 const { Pool } = pg;
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes('localhost') || process.env.DATABASE_URL?.includes('127.0.0.1') 
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL?.includes('localhost') || DATABASE_URL?.includes('127.0.0.1') 
     ? false 
     : { rejectUnauthorized: false },
   max: 20,
@@ -183,39 +212,18 @@ const pool = new Pool({
   connectionTimeoutMillis: 30000,
 });
 
-// --- Agora Setup ---
+// ==========================================
+// MISC SETUP
+// ==========================================
 const { RtcRole, RtcTokenBuilder } = pkg;
-
-// --- Environment Variables ---
-const {
-  JWT_SECRET = "supersecretkey",
-  SESSION_SECRET = "sessionsecret",
-  EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS,
-  GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_CALLBACK_URL,
-  DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_CALLBACK_URL,
-  GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_CALLBACK_URL,
-  FRONTEND_URL, ADMIN_KEY, PORT = 3000,
-  AGORA_APP_ID, AGORA_APP_CERTIFICATE,
-  AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME, AWS_S3_BUCKET,
-  MEDIACONVERT_ROLE_ARN, MEDIACONVERT_ENDPOINT,
-  OPENAI_API_KEY,
-  STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
-  ASSEMBLYAI_KEY, SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET, DEEP_AI_KEY,
-  TURNSTILE_SECRET_KEY
-} = process.env;
-
-// --- AWS S3 Setup ---
 const s3 = new S3Client({ 
   region: AWS_REGION,
   credentials: { accessKeyId: AWS_ACCESS_KEY_ID, secretAccessKey: AWS_SECRET_ACCESS_KEY }
 });
-
-// --- OpenAI ---
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- Socket.IO Setup ---
 const io = new SocketServer(server, { 
-  cors: { origin: process.env.FRONTEND_URL || "*", methods: ["GET", "POST"] } 
+  cors: { origin: FRONTEND_URL || "*", methods: ["GET", "POST"] } 
 });
 
 io.adapter(createAdapter(pubClient, subClient));
@@ -244,7 +252,6 @@ io.on("connection", (socket) => {
 // ==========================================
 async function initializeTables() {
   try {
-    // FIX: profile_url changed to TEXT to accommodate base64 strings or long S3 URLs
     await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(255) UNIQUE NOT NULL, email VARCHAR(255) UNIQUE NOT NULL, password_hash VARCHAR(255), phone VARCHAR(20), device_id VARCHAR(255), profile_url TEXT, cover_url VARCHAR(500), bio TEXT, social_links JSON, role VARCHAR(20) DEFAULT 'free', subscription_plan VARCHAR(20) DEFAULT 'free', subscription_expires TIMESTAMP, is_musician BOOLEAN DEFAULT false, is_creator BOOLEAN DEFAULT false, is_admin BOOLEAN DEFAULT false, is_verified BOOLEAN DEFAULT false, status VARCHAR(20) DEFAULT 'active', suspend_until TIMESTAMP, suspension_reason TEXT, auth_provider VARCHAR(50), earnings DECIMAL(10, 2) DEFAULT 0, balance DECIMAL(10, 2) DEFAULT 0, dob DATE, preferences JSON, failed_login_count INTEGER DEFAULT 0, last_login_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS user_devices (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, device_id VARCHAR(255) NOT NULL, ip_address VARCHAR(45), user_agent TEXT, last_seen TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, device_id))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS security_logs (id SERIAL PRIMARY KEY, event_type VARCHAR(50) NOT NULL, user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, ip_address VARCHAR(45), device_id VARCHAR(255), details JSONB, created_at TIMESTAMP DEFAULT NOW())`);
@@ -281,14 +288,14 @@ function generateAgoraToken(channelName, userId) {
   const expirationTimeInSeconds = 3600;
   const currentTimestamp = Math.floor(Date.now() / 1000);
   const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
-  return RtcTokenBuilder.buildTokenWithUid(process.env.AGORA_APP_ID, process.env.AGORA_APP_CERT, channelName, userId, role, privilegeExpiredTs);
+  return RtcTokenBuilder.buildTokenWithUid(AGORA_APP_ID, AGORA_APP_CERTIFICATE, channelName, userId, role, privilegeExpiredTs);
 }
 
 const transporter = nodemailer.createTransport({ 
-  host: process.env.EMAIL_HOST, 
-  port: Number(process.env.EMAIL_PORT), 
-  secure: Number(process.env.EMAIL_PORT) === 465, 
-  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS } 
+  host: EMAIL_HOST, 
+  port: Number(EMAIL_PORT), 
+  secure: Number(EMAIL_PORT) === 465, 
+  auth: { user: EMAIL_USER, pass: EMAIL_PASS } 
 });
 
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
@@ -474,6 +481,37 @@ app.get("/api/check-username", async (req, res) => {
   } catch (err) {
     console.error("Check username error:", err);
     res.json({ usernameAvailable: true, emailAvailable: true });
+  }
+});
+
+// --- VPN CHECK ROUTE (IPINFO) ---
+app.post("/auth/check-vpn", async (req, res) => {
+  try {
+    const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+    if (!IPINFO_TOKEN) {
+      return res.status(500).json({ error: "IPInfo Token not configured" });
+    }
+
+    // Use ipinfo.io API
+    const response = await axios.get(`https://ipinfo.io/${ip}/json?token=${IPINFO_TOKEN}`);
+    const data = response.data;
+
+    // IPInfo provides a 'privacy' object with detailed VPN/Proxy data if you have the paid tier
+    // If free tier, we rely on basic data
+    const isVpn = data.privacy?.vpn || data.privacy?.proxy || data.privacy?.tor || false;
+    
+    res.json({
+      ip,
+      country: data.country,
+      region: data.region,
+      city: data.city,
+      timezone: data.timezone,
+      isVpn: isVpn, // Returns true if VPN/Proxy/Tor detected (requires IPInfo Privacy tier)
+      details: data.privacy || null
+    });
+  } catch (err) {
+    console.error("VPN Check Error:", err.message);
+    res.status(500).json({ error: "Failed to check VPN status" });
   }
 });
 
@@ -906,6 +944,21 @@ app.get("/api/users/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed" }); }
 });
 
+// --- CURRENT USER PROFILE (GET /me) ---
+app.get("/api/users/me", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, username, email, profile_url, cover_url, bio, is_musician, is_creator, is_verified, role, created_at FROM users WHERE id = $1`, 
+      [req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json({ user: rows[0] });
+  } catch (err) { 
+    console.error("Get user error:", err);
+    res.status(500).json({ error: "Failed to fetch user" }); 
+  }
+});
+
 app.put("/api/users/me", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -960,25 +1013,33 @@ app.get("/api/search", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Search failed" }); }
 });
 
-// --- Server Startup ---
+// ==========================================
+// SERVER STARTUP
+// ==========================================
 ffmpeg.setFfmpegPath(ffmpegPath);
 
-async function startServer() {
+// FIX: Listen immediately to prevent 502s
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  // Initialize DB in background
+  initializeDatabase();
+});
+
+async function initializeDatabase() {
   const MAX_RETRIES = 10;
   for (let i = 1; i <= MAX_RETRIES; i++) {
     try {
       console.log(`DB Connection Try ${i}/${MAX_RETRIES}...`);
       await initializeTables();
-      console.log("Database connected!");
+      console.log("✅ Database connected!");
       return; 
     } catch (err) {
       console.error(`DB Failed: ${err.message}`);
-      if (i === MAX_RETRIES) { console.error("Max retries reached."); process.exit(1); }
+      if (i === MAX_RETRIES) { 
+        console.error("❌ Max DB retries reached. Server is running but database features are disabled."); 
+        // Do NOT exit, allowing the server to stay up for health checks
+      }
       await new Promise(resolve => setTimeout(resolve, 3000));
     }
   }
 }
-
-startServer().then(() => {
-  server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-}).catch(err => { console.error("Fatal:", err); process.exit(1); });
