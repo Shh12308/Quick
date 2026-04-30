@@ -26,7 +26,7 @@ import ffmpegPath from "ffmpeg-static";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import axios from "axios";
-import cors from "cors"; // FIX 1: Added CORS import
+import cors from "cors";
 import { createClient } from "redis";
 import { createAdapter } from "@socket.io/redis-adapter";
 import OpenAI from "openai";
@@ -59,7 +59,7 @@ import {
 
 dotenv.config();
 
-// FIX 2: Environment variable validation
+// Environment variable validation
 const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET', 'SESSION_SECRET'];
 const missingEnv = REQUIRED_ENV.filter(key => !process.env[key]);
 if (missingEnv.length) {
@@ -73,7 +73,7 @@ const __dirname = dirname(__filename);
 const app = express(); 
 const server = http.createServer(app);
 
-// FIX 3: Added CORS middleware
+// CORS middleware
 app.use(cors({
   origin: process.env.FRONTEND_URL || "*",
   credentials: true,
@@ -81,7 +81,7 @@ app.use(cors({
 
 app.use(helmet());
 
-// FIX 4: Stripe webhook MUST come before express.json() to preserve raw body
+// Stripe webhook MUST come before express.json() to preserve raw body
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -213,7 +213,7 @@ const s3 = new S3Client({
 // --- OpenAI ---
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- Socket.IO Setup (Moved before routes so `io` is available) ---
+// --- Socket.IO Setup ---
 const io = new SocketServer(server, { 
   cors: { origin: process.env.FRONTEND_URL || "*", methods: ["GET", "POST"] } 
 });
@@ -244,7 +244,8 @@ io.on("connection", (socket) => {
 // ==========================================
 async function initializeTables() {
   try {
-    await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(255) UNIQUE NOT NULL, email VARCHAR(255) UNIQUE NOT NULL, password_hash VARCHAR(255), phone VARCHAR(20), device_id VARCHAR(255), profile_url VARCHAR(500), cover_url VARCHAR(500), bio TEXT, social_links JSON, role VARCHAR(20) DEFAULT 'free', subscription_plan VARCHAR(20) DEFAULT 'free', subscription_expires TIMESTAMP, is_musician BOOLEAN DEFAULT false, is_creator BOOLEAN DEFAULT false, is_admin BOOLEAN DEFAULT false, is_verified BOOLEAN DEFAULT false, status VARCHAR(20) DEFAULT 'active', suspend_until TIMESTAMP, suspension_reason TEXT, auth_provider VARCHAR(50), earnings DECIMAL(10, 2) DEFAULT 0, balance DECIMAL(10, 2) DEFAULT 0, dob DATE, preferences JSON, failed_login_count INTEGER DEFAULT 0, last_login_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
+    // FIX: profile_url changed to TEXT to accommodate base64 strings or long S3 URLs
+    await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(255) UNIQUE NOT NULL, email VARCHAR(255) UNIQUE NOT NULL, password_hash VARCHAR(255), phone VARCHAR(20), device_id VARCHAR(255), profile_url TEXT, cover_url VARCHAR(500), bio TEXT, social_links JSON, role VARCHAR(20) DEFAULT 'free', subscription_plan VARCHAR(20) DEFAULT 'free', subscription_expires TIMESTAMP, is_musician BOOLEAN DEFAULT false, is_creator BOOLEAN DEFAULT false, is_admin BOOLEAN DEFAULT false, is_verified BOOLEAN DEFAULT false, status VARCHAR(20) DEFAULT 'active', suspend_until TIMESTAMP, suspension_reason TEXT, auth_provider VARCHAR(50), earnings DECIMAL(10, 2) DEFAULT 0, balance DECIMAL(10, 2) DEFAULT 0, dob DATE, preferences JSON, failed_login_count INTEGER DEFAULT 0, last_login_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS user_devices (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, device_id VARCHAR(255) NOT NULL, ip_address VARCHAR(45), user_agent TEXT, last_seen TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, device_id))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS security_logs (id SERIAL PRIMARY KEY, event_type VARCHAR(50) NOT NULL, user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, ip_address VARCHAR(45), device_id VARCHAR(255), details JSONB, created_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS creator_stats (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, total_likes INTEGER DEFAULT 0, total_follows INTEGER DEFAULT 0, total_views INTEGER DEFAULT 0, total_tips DECIMAL(10,2) DEFAULT 0, total_merch_sales INTEGER DEFAULT 0, earnings DECIMAL(10,2) DEFAULT 0, updated_at TIMESTAMP DEFAULT NOW())`);
@@ -374,7 +375,6 @@ passport.deserializeUser(async (id, done) => {
   } 
 });
 
-// FIX 5: Actually configure OAuth strategies
 if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
   passport.use(new GoogleStrategy({
     clientID: GOOGLE_CLIENT_ID,
@@ -430,7 +430,6 @@ if (GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET) {
     scope: ["user:email"],
   }, async (accessToken, refreshToken, profile, done) => {
     try {
-      // Github might not return email in profile directly, might need API call for primary email
       const email = profile.emails?.[0]?.value || `${profile.username}@github-placeholder.com`;
       let { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
       if (!rows.length) {
@@ -451,31 +450,180 @@ if (GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET) {
 // API ROUTES
 // ==========================================
 
-// --- FIX 6: Auth Routes (Missing Previously) ---
-app.post("/api/auth/register", async (req, res) => {
+// --- CHECK USERNAME & EMAIL AVAILABILITY ---
+app.get("/api/check-username", async (req, res) => {
   try {
-    const { username, email, password } = req.body;
-    if (!username || !email || !password) return res.status(400).json({ error: "All fields required" });
+    const { username, email } = req.query;
+    if (!username || !email) {
+      return res.status(400).json({ error: "Username and email required" });
+    }
 
-    const existing = await pool.query("SELECT id FROM users WHERE email = $1 OR username = $2", [email, username]);
-    if (existing.rows.length) return res.status(409).json({ error: "User already exists" });
-
-    const password_hash = await argon2.hash(password);
-    const { rows } = await pool.query(
-      `INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, role`,
-      [username, email, password_hash]
+    const usernameRes = await pool.query(
+      "SELECT id FROM users WHERE LOWER(username) = LOWER($1)",
+      [username]
+    );
+    const emailRes = await pool.query(
+      "SELECT id FROM users WHERE LOWER(email) = LOWER($1)",
+      [email]
     );
 
-    await ensureCreatorStats(rows[0].id);
-
-    const token = jwt.sign({ id: rows[0].id }, JWT_SECRET, { expiresIn: "7d" });
-    res.status(201).json({ user: rows[0], token });
+    res.json({
+      usernameAvailable: usernameRes.rows.length === 0,
+      emailAvailable: emailRes.rows.length === 0,
+    });
   } catch (err) {
-    console.error("Register error:", err);
-    res.status(500).json({ error: "Registration failed" });
+    console.error("Check username error:", err);
+    res.json({ usernameAvailable: true, emailAvailable: true });
   }
 });
 
+// --- REGISTER (Rewritten to match frontend) ---
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { username, email, password, dob, captchaToken, profile_url } = req.body;
+
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: "All fields required" });
+    }
+
+    if (!dob) {
+      return res.status(400).json({ error: "Date of birth required" });
+    }
+
+    const birthDate = new Date(dob);
+    if (isNaN(birthDate.getTime())) {
+      return res.status(400).json({ error: "Invalid date of birth" });
+    }
+    const today = new Date();
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const m = today.getMonth() - birthDate.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) age--;
+    if (age < 1 || age > 130) {
+      return res.status(400).json({ error: "Invalid age" });
+    }
+
+    if (TURNSTILE_SECRET_KEY && captchaToken) {
+      const isValid = await verifyTurnstile(captchaToken);
+      if (!isValid) {
+        return res.status(403).json({ error: "Security verification failed" });
+      }
+    } else if (TURNSTILE_SECRET_KEY && !captchaToken) {
+      return res.status(403).json({ error: "Security verification required" });
+    }
+
+    const emailCheck = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+    const usernameCheck = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [username]);
+
+    if (emailCheck.rows.length && usernameCheck.rows.length) {
+      return res.status(409).json({ error: "Email and username already taken" });
+    }
+    if (emailCheck.rows.length) {
+      return res.status(409).json({ error: "Email already registered" });
+    }
+    if (usernameCheck.rows.length) {
+      return res.status(409).json({ error: "Username already taken" });
+    }
+
+    let profileUrl = null;
+    if (profile_url && profile_url.startsWith("data:")) {
+      try {
+        const matches = profile_url.match(/^data:(image\/\w+);base64,(.+)$/);
+        if (matches && matches[1] && matches[2]) {
+          const mimeType = matches[1];
+          const extension = mimeType.split("/")[1];
+          const buffer = Buffer.from(matches[2], "base64");
+
+          const processedBuffer = await sharp(buffer)
+            .resize(400, 400, { fit: "cover", withoutEnlargement: true })
+            .rotate()
+            .jpeg({ quality: 85 })
+            .toBuffer();
+
+          const s3Key = `profile-pics/${Date.now()}-${username}.${extension}`;
+          await s3.send(
+            new PutObjectCommand({
+              Bucket: S3_BUCKET_NAME,
+              Key: s3Key,
+              Body: processedBuffer,
+              ContentType: "image/jpeg",
+            })
+          );
+          profileUrl = `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`;
+        }
+      } catch (s3Err) {
+        console.error("Profile pic S3 upload failed, proceeding without:", s3Err.message);
+      }
+    }
+
+    const password_hash = await argon2.hash(password);
+    const isKid = age <= 12;
+
+    const { rows } = await pool.query(
+      `INSERT INTO users (username, email, password_hash, dob, profile_url, role, preferences)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, username, email, role, profile_url, dob, preferences`,
+      [
+        username,
+        email,
+        password_hash,
+        dob,
+        profileUrl,
+        isKid ? "kid" : "free",
+        isKid ? { kids_mode: true, restricted: true } : {},
+      ]
+    );
+
+    const user = rows[0];
+    await ensureCreatorStats(user.id);
+
+    if (EMAIL_HOST && EMAIL_USER) {
+      transporter.sendMail({
+        from: `"MintZa" <${EMAIL_USER}>`,
+        to: email,
+        subject: "Welcome to MintZa! ⚡",
+        html: `
+          <div style="font-family: sans-serif; max-width: 480px; margin: auto; background: #121212; color: #fff; padding: 32px; border-radius: 16px;">
+            <h1 style="color: #facc15; margin-top: 0;">Welcome, ${username}!</h1>
+            <p>Your MintZa account is ready. ${isKid ? "You're in Kids Mode with enhanced protections." : ""}</p>
+            <a href="${FRONTEND_URL}/home" style="display: inline-block; background: #facc15; color: #000; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; margin-top: 16px;">Start Exploring</a>
+          </div>
+        `,
+      }).catch(() => {});
+    }
+
+    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "7d" });
+
+    const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+    pool.query(
+      `INSERT INTO security_logs (event_type, user_id, ip_address, details) VALUES ($1, $2, $3, $4)`,
+      ["register", user.id, ip, { provider: "email", age_group: isKid ? "kid" : "adult" }]
+    ).catch(() => {});
+
+    res.status(201).json({
+      user: {
+        ...user,
+        age_group: isKid ? "kid" : "adult",
+      },
+      token,
+    });
+  } catch (err) {
+    console.error("Register error:", err);
+
+    if (err.code === "23505") {
+      if (err.constraint?.includes("email")) {
+        return res.status(409).json({ error: "Email already registered" });
+      }
+      if (err.constraint?.includes("username")) {
+        return res.status(409).json({ error: "Username already taken" });
+      }
+      return res.status(409).json({ error: "Account already exists" });
+    }
+
+    res.status(500).json({ error: "Registration failed. Please try again." });
+  }
+});
+
+// --- LOGIN ---
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -676,7 +824,7 @@ app.get("/api/videos/:id/ad-tag", authMiddleware, async (req, res) => {
   }
 });
 
-// --- Existing Read Routes ---
+// --- Read Routes ---
 app.get("/api/videos", async (req, res) => { 
   try { 
     const { filter, category } = req.query; 
@@ -699,7 +847,6 @@ app.get("/api/videos/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed" }); } 
 });
 
-// --- FIX 7: Missing Crucial API Endpoints ---
 app.get("/api/music", async (req, res) => {
   try {
     const { filter, genre } = req.query;
@@ -724,7 +871,6 @@ app.post("/api/comments", authMiddleware, async (req, res) => {
       [userId, content_type, content_id, parent_id || null, content]
     );
 
-    // Increment comment count on video
     if (content_type === 'video') {
       await pool.query(`UPDATE videos SET comments_count = comments_count + 1 WHERE id = $1`, [content_id]).catch(()=>{});
     }
