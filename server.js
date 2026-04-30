@@ -26,6 +26,7 @@ import ffmpegPath from "ffmpeg-static";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import axios from "axios";
+import cors from "cors"; // FIX 1: Added CORS import
 import { createClient } from "redis";
 import { createAdapter } from "@socket.io/redis-adapter";
 import OpenAI from "openai";
@@ -58,27 +59,78 @@ import {
 
 dotenv.config();
 
+// FIX 2: Environment variable validation
+const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET', 'SESSION_SECRET'];
+const missingEnv = REQUIRED_ENV.filter(key => !process.env[key]);
+if (missingEnv.length) {
+  console.error(`❌ Missing required environment variables: ${missingEnv.join(', ')}`);
+  process.exit(1);
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express(); 
 const server = http.createServer(app);
 
+// FIX 3: Added CORS middleware
+app.use(cors({
+  origin: process.env.FRONTEND_URL || "*",
+  credentials: true,
+}));
+
 app.use(helmet());
+
+// FIX 4: Stripe webhook MUST come before express.json() to preserve raw body
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try { event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET); } catch (err) { return res.status(400).send(`Webhook Error: ${err.message}`); }
+  try {
+    const exists = await pool.query("SELECT 1 FROM stripe_events WHERE event_id = $1", [event.id]);
+    if (exists.rowCount > 0) return res.send();
+    await pool.query("INSERT INTO stripe_events (event_id) VALUES ($1)", [event.id]);
+  } catch (err) { return res.send(); }
+
+  try {
+    switch (event.type) {
+      case 'payment_intent.succeeded': { 
+        const pi = event.data.object; 
+        const { viewerId, creatorId, paymentType } = pi.metadata; 
+        await pool.query("INSERT INTO transactions (user_id, amount, status, type, created_at) VALUES ($1,$2,'succeeded',$3,NOW())", [viewerId, pi.amount / 100, paymentType]); 
+        io.to(`user-${creatorId}`).emit("payment-received", { from: viewerId, amount: pi.amount, type: paymentType }); 
+        break; 
+      }
+      case 'checkout.session.completed': { 
+        const session = event.data.object; 
+        if (!session.subscription) break; 
+        const userId = parseInt(session.metadata.userId); 
+        const tierId = parseInt(session.metadata.tierId); 
+        const subscription = await stripe.subscriptions.retrieve(session.subscription); 
+        await pool.query(`INSERT INTO user_subscriptions (user_id, tier_id, stripe_subscription_id, status, current_period_start, current_period_end, created_at) VALUES ($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT (user_id) DO UPDATE SET tier_id = EXCLUDED.tier_id, stripe_subscription_id = EXCLUDED.stripe_subscription_id, status = EXCLUDED.status, current_period_start = EXCLUDED.current_period_start, current_period_end = EXCLUDED.current_period_end, updated_at = NOW()`, [userId, tierId, subscription.id, subscription.status, new Date(subscription.current_period_start * 1000), new Date(subscription.current_period_end * 1000)]); 
+        const { rows: tierRows } = await pool.query("SELECT * FROM subscription_tiers WHERE id = $1", [tierId]); 
+        if (tierRows[0]) await pool.query("UPDATE users SET role = $1, subscription_plan = $2, subscription_expires = $3 WHERE id = $4", [tierRows[0].role || 'premium', tierRows[0].name.toLowerCase(), new Date(subscription.current_period_end * 1000), userId]); 
+        break; 
+      }
+      default: console.log(`Unhandled event type ${event.type}`);
+    }
+  } catch (err) { console.error("Webhook handler error:", err); }
+  res.send();
+});
+
+// Body parsing middleware comes AFTER webhook
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // --- Redis & Session Setup ---
-// Helper to create a robust Redis client with TLS support
 function createRedisClient() {
   return createClient({
     url: process.env.REDIS_URL,
     socket: {
-      // Enable TLS if the URL is 'rediss://'
       tls: process.env.REDIS_URL?.startsWith('rediss://'),
-      // Necessary for many cloud providers (Render, Heroku, AWS) to prevent self-cert errors
       rejectUnauthorized: false,
-      // Keep connection alive
       keepAlive: 30000, 
     },
   });
@@ -87,7 +139,6 @@ function createRedisClient() {
 const pubClient = createRedisClient();
 const subClient = pubClient.duplicate();
 
-// CRITICAL: Add error handlers to prevent the app from crashing on Redis disconnects
 pubClient.on('error', (err) => console.error('Redis Pub Client Error:', err));
 subClient.on('error', (err) => console.error('Redis Sub Client Error:', err));
 
@@ -97,14 +148,11 @@ try {
   console.log("Redis Pub/Sub connected successfully");
 } catch (err) {
   console.error("Failed to connect to Redis Pub/Sub:", err);
-  // We continue execution, assuming connection might recover or features might be degraded
 }
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const redis = new Redis(process.env.REDIS_URL, {
   tls: process.env.REDIS_URL?.startsWith('rediss://') ? { rejectUnauthorized: false } : {},
-  maxRetriesPerRequest: null, // Required for connect-redis
+  maxRetriesPerRequest: null,
 });
 const cache = new NodeCache({ stdTTL: 600 });
 
@@ -117,7 +165,7 @@ app.use(
     cookie: {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
-      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax", // 'none' requires secure: true
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
       maxAge: 1000 * 60 * 60 * 24 * 7
     }
   })
@@ -165,43 +213,52 @@ const s3 = new S3Client({
 // --- OpenAI ---
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
+// --- Socket.IO Setup (Moved before routes so `io` is available) ---
+const io = new SocketServer(server, { 
+  cors: { origin: process.env.FRONTEND_URL || "*", methods: ["GET", "POST"] } 
+});
+
+io.adapter(createAdapter(pubClient, subClient));
+
+io.use(async (socket, next) => { 
+  try { 
+    const token = socket.handshake.auth.token; 
+    if (!token) return next(new Error("Auth error")); 
+    socket.userId = jwt.verify(token, JWT_SECRET).id; 
+    next(); 
+  } catch (err) { next(new Error("Auth error")); } 
+});
+
+io.on("connection", (socket) => {
+  console.log(`Socket: ${socket.id} (User: ${socket.userId})`);
+  socket.join(`user-${socket.userId}`);
+  socket.on("join-stream", (data) => socket.join(`stream-${data.streamId}`));
+  socket.on("join-chat", (chatId) => socket.join(`chat-${chatId}`));
+  socket.on("typing-start", (data) => socket.to(`chat-${data.chatId}`).emit("user-typing", { userId: socket.userId }));
+  socket.on("call-user", (data) => io.to(`user-${data.userId}`).emit("incoming-call", { from: socket.userId, channel: data.channel }));
+  socket.on("disconnect", () => console.log("Disconnected:", socket.userId));
+});
+
 // ==========================================
-// DATABASE INITIALIZATION (Matches SQL & Features)
+// DATABASE INITIALIZATION
 // ==========================================
 async function initializeTables() {
   try {
-    // 1. Users & Auth
     await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(255) UNIQUE NOT NULL, email VARCHAR(255) UNIQUE NOT NULL, password_hash VARCHAR(255), phone VARCHAR(20), device_id VARCHAR(255), profile_url VARCHAR(500), cover_url VARCHAR(500), bio TEXT, social_links JSON, role VARCHAR(20) DEFAULT 'free', subscription_plan VARCHAR(20) DEFAULT 'free', subscription_expires TIMESTAMP, is_musician BOOLEAN DEFAULT false, is_creator BOOLEAN DEFAULT false, is_admin BOOLEAN DEFAULT false, is_verified BOOLEAN DEFAULT false, status VARCHAR(20) DEFAULT 'active', suspend_until TIMESTAMP, suspension_reason TEXT, auth_provider VARCHAR(50), earnings DECIMAL(10, 2) DEFAULT 0, balance DECIMAL(10, 2) DEFAULT 0, dob DATE, preferences JSON, failed_login_count INTEGER DEFAULT 0, last_login_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
-    
     await pool.query(`CREATE TABLE IF NOT EXISTS user_devices (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, device_id VARCHAR(255) NOT NULL, ip_address VARCHAR(45), user_agent TEXT, last_seen TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, device_id))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS security_logs (id SERIAL PRIMARY KEY, event_type VARCHAR(50) NOT NULL, user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, ip_address VARCHAR(45), device_id VARCHAR(255), details JSONB, created_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS creator_stats (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, total_likes INTEGER DEFAULT 0, total_follows INTEGER DEFAULT 0, total_views INTEGER DEFAULT 0, total_tips DECIMAL(10,2) DEFAULT 0, total_merch_sales INTEGER DEFAULT 0, earnings DECIMAL(10,2) DEFAULT 0, updated_at TIMESTAMP DEFAULT NOW())`);
-
-    // 2. Chat & Messaging
     await pool.query(`CREATE TABLE IF NOT EXISTS chats (id SERIAL PRIMARY KEY, creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(10), name VARCHAR(255), avatar TEXT, participants INTEGER[] DEFAULT '{}', admin_id INTEGER REFERENCES users(id), pinned_by INTEGER[] DEFAULT '{}', muted_by JSONB DEFAULT '{}', last_message_id INTEGER, last_message_at TIMESTAMP, is_archived BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, chat_id TEXT, sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(20), content TEXT, media_url TEXT, is_deleted BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS message_reactions (id SERIAL PRIMARY KEY, message_id TEXT, user_id INTEGER REFERENCES users(id), reaction TEXT, created_at TIMESTAMP DEFAULT NOW())`);
-
-    // 3. Content (Videos, Music, Shorts)
     await pool.query(`CREATE TABLE IF NOT EXISTS videos (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(255) NOT NULL, description TEXT, video_url VARCHAR(500) NOT NULL, thumbnail_url VARCHAR(500), duration INTEGER, tags JSON, category VARCHAR(100), is_public BOOLEAN DEFAULT true, is_short BOOLEAN DEFAULT false, processing_status VARCHAR(20) DEFAULT 'pending', views INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, dislikes INTEGER DEFAULT 0, comments_count INTEGER DEFAULT 0, shares INTEGER DEFAULT 0, earnings DECIMAL(10, 2) DEFAULT 0, content_rating VARCHAR(10) DEFAULT 'general', language VARCHAR(10) DEFAULT 'en', transcription TEXT, auto_captions JSON, custom_captions JSON, download_allowed BOOLEAN DEFAULT true, monetization_enabled BOOLEAN DEFAULT true, ad_breaks JSON, featured BOOLEAN DEFAULT false, trending_score DECIMAL(10, 2) DEFAULT 0, recommendation_score DECIMAL(10, 2) DEFAULT 0, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
-    
     await pool.query(`CREATE TABLE IF NOT EXISTS music (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(255) NOT NULL, artist VARCHAR(255) NOT NULL, album VARCHAR(255), genre VARCHAR(100), music_url VARCHAR(500) NOT NULL, cover_url VARCHAR(500), duration INTEGER, lyrics TEXT, explicit BOOLEAN DEFAULT false, track_number INTEGER, isrc VARCHAR(12), license_type VARCHAR(50) DEFAULT 'standard', listens INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, shares INTEGER DEFAULT 0, downloads INTEGER DEFAULT 0, earnings DECIMAL(10, 2) DEFAULT 0, featured BOOLEAN DEFAULT false, trending_score DECIMAL(10, 2) DEFAULT 0, recommendation_score DECIMAL(10, 2) DEFAULT 0, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
-    
-    // 4. Reactions & Interactions (Generic System)
     await pool.query(`CREATE TABLE IF NOT EXISTS content_reactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, reaction_type VARCHAR(10), created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_id, content_type))`);
-
-    // 5. Comments
     await pool.query(`CREATE TABLE IF NOT EXISTS comments (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE, content TEXT NOT NULL, likes INTEGER DEFAULT 0, dislikes INTEGER DEFAULT 0, replies_count INTEGER DEFAULT 0, is_pinned BOOLEAN DEFAULT false, is_deleted BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
-
-    // 6. Ads System
     await pool.query(`CREATE TABLE IF NOT EXISTS ads (id SERIAL PRIMARY KEY, advertiser_id INTEGER REFERENCES users(id), title VARCHAR(255) NOT NULL, description TEXT, media_url VARCHAR(500) NOT NULL, media_type VARCHAR(10), target_audience JSON, budget DECIMAL(10, 2) NOT NULL, bid_amount DECIMAL(10, 2) NOT NULL, ad_type VARCHAR(20), start_date TIMESTAMP NOT NULL, end_date TIMESTAMP NOT NULL, is_active BOOLEAN DEFAULT true, views INTEGER DEFAULT 0, clicks INTEGER DEFAULT 0, spend DECIMAL(10, 2) DEFAULT 0, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
-
-    // 7. Notifications & Likes (Legacy support, consider migrating to content_reactions)
     await pool.query(`CREATE TABLE IF NOT EXISTS notifications (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL, type VARCHAR(50) NOT NULL, title VARCHAR(255), message TEXT, data JSON, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS likes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_id))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS dislikes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_id))`);
-
-    // 8. Other (Livestreams, Products, etc.)
     await pool.query(`CREATE TABLE IF NOT EXISTS livestreams (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(255) NOT NULL, description TEXT, category VARCHAR(100), thumbnail_url VARCHAR(500), stream_key VARCHAR(255) UNIQUE NOT NULL, is_live BOOLEAN DEFAULT false, is_scheduled BOOLEAN DEFAULT false, scheduled_start TIMESTAMP, viewers INTEGER DEFAULT 0, peak_viewers INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, shares INTEGER DEFAULT 0, duration INTEGER, recording_url VARCHAR(500), chat_enabled BOOLEAN DEFAULT true, delay_seconds INTEGER DEFAULT 0, tags JSON, earnings DECIMAL(10, 2) DEFAULT 0, started_at TIMESTAMP, ended_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS products (id SERIAL PRIMARY KEY, creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(255) NOT NULL, description TEXT, price DECIMAL(10, 2) NOT NULL, type VARCHAR(20) NOT NULL, images JSONB DEFAULT '[]', tags JSONB DEFAULT '[]', category VARCHAR(100), stock INTEGER DEFAULT 0, sizes JSONB DEFAULT '[]', colors JSONB DEFAULT '[]', crypto_address VARCHAR(255), crypto_type VARCHAR(20) DEFAULT 'ETH', views INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS email_confirmations (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, token VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMP NOT NULL, created_at TIMESTAMP DEFAULT NOW())`);
@@ -209,7 +266,7 @@ async function initializeTables() {
     await pool.query(`CREATE TABLE IF NOT EXISTS user_subscriptions (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, tier_id INTEGER, stripe_subscription_id TEXT, status TEXT, current_period_start TIMESTAMP, current_period_end TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS subscription_tiers (id SERIAL PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2), benefits JSON, role VARCHAR(50))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), amount DECIMAL(10,2), status TEXT, type TEXT, created_at TIMESTAMP DEFAULT NOW())`);
-
+    
     console.log("Database tables initialized successfully");
   } catch (error) { 
     console.error("Error initializing database tables:", error); 
@@ -218,7 +275,6 @@ async function initializeTables() {
 }
 
 // --- Helpers ---
-
 function generateAgoraToken(channelName, userId) {
   const role = RtcRole.PUBLISHER;
   const expirationTimeInSeconds = 3600;
@@ -255,27 +311,35 @@ export const upload = multer({
   } 
 });
 
-// --- S3 Upload Helper ---
 async function uploadToS3(file, key, mimeType) {
   const fileContent = fs.readFileSync(file.path);
   let buffer = fileContent;
-  
-  // Use sharp if it's an image to orient it correctly
   if (mimeType.startsWith('image/')) {
-    buffer = await sharp(fileContent)
-      .rotate()
-      .toBuffer();
+    buffer = await sharp(fileContent).rotate().toBuffer();
   }
-    
   await s3.send(new PutObjectCommand({
     Bucket: S3_BUCKET_NAME,
     Key: key,
     Body: buffer, 
     ContentType: mimeType
   }));
-  
-  fs.unlinkSync(file.path); // Clean up local file
+  fs.unlinkSync(file.path);
   return `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+}
+
+async function ensureCreatorStats(userId) { 
+  try { 
+    await pool.query(`INSERT INTO creator_stats (user_id, total_likes, total_follows, total_views, total_tips, total_merch_sales, earnings, updated_at) VALUES ($1,0,0,0,0,0,0,NOW()) ON CONFLICT (user_id) DO NOTHING`, [userId]); 
+  } catch (err) { 
+    console.error("ensureCreatorStats error:", err); 
+  } 
+}
+
+async function verifyTurnstile(token) {
+  try {
+    const response = await axios.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', new URLSearchParams({ secret: TURNSTILE_SECRET_KEY, response: token }));
+    return response.data.success === true;
+  } catch (err) { console.error('Turnstile failed:', err); return false; }
 }
 
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 500 }));
@@ -297,96 +361,186 @@ function adminMiddleware(req, res, next) {
   next(); 
 }
 
-// --- Stripe Webhook ---
-app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
-  try { event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET); } catch (err) { return res.status(400).send(`Webhook Error: ${err.message}`); }
-  try {
-    const exists = await pool.query("SELECT 1 FROM stripe_events WHERE event_id = $1", [event.id]);
-    if (exists.rowCount > 0) return res.send();
-    await pool.query("INSERT INTO stripe_events (event_id) VALUES ($1)", [event.id]);
-  } catch (err) { return res.send(); }
-
-  try {
-    switch (event.type) {
-      case 'payment_intent.succeeded': { 
-        const pi = event.data.object; 
-        const { viewerId, creatorId, paymentType } = pi.metadata; 
-        await pool.query("INSERT INTO transactions (user_id, amount, status, type, created_at) VALUES ($1,$2,'succeeded',$3,NOW())", [viewerId, pi.amount / 100, paymentType]); 
-        io.to(`user-${creatorId}`).emit("payment-received", { from: viewerId, amount: pi.amount, type: paymentType }); 
-        break; 
-      }
-      case 'checkout.session.completed': { 
-        const session = event.data.object; 
-        if (!session.subscription) break; 
-        const userId = parseInt(session.metadata.userId); 
-        const tierId = parseInt(session.metadata.tierId); 
-        const subscription = await stripe.subscriptions.retrieve(session.subscription); 
-        await pool.query(`INSERT INTO user_subscriptions (user_id, tier_id, stripe_subscription_id, status, current_period_start, current_period_end, created_at) VALUES ($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT (user_id) DO UPDATE SET tier_id = EXCLUDED.tier_id, stripe_subscription_id = EXCLUDED.stripe_subscription_id, status = EXCLUDED.status, current_period_start = EXCLUDED.current_period_start, current_period_end = EXCLUDED.current_period_end, updated_at = NOW()`, [userId, tierId, subscription.id, subscription.status, new Date(subscription.current_period_start * 1000), new Date(subscription.current_period_end * 1000)]); 
-        const { rows: tierRows } = await pool.query("SELECT * FROM subscription_tiers WHERE id = $1", [tierId]); 
-        if (tierRows[0]) await pool.query("UPDATE users SET role = $1, subscription_plan = $2, subscription_expires = $3 WHERE id = $4", [tierRows[0].role || 'premium', tierRows[0].name.toLowerCase(), new Date(subscription.current_period_end * 1000), userId]); 
-        break; 
-      }
-      // ... handle other cases
-      default: console.log(`Unhandled event type ${event.type}`);
-    }
-  } catch (err) { console.error("Webhook handler error:", err); }
-  res.send();
-});
-
 // --- Passport & Auth Strategies ---
 app.use(passport.initialize());
 app.use(passport.session());
 passport.serializeUser((user, done) => done(null, user.id));
-passport.deserializeUser(async (id, done) => { try { const res = await pool.query("SELECT * FROM users WHERE id=$1", [id]); done(null, res.rows[0]); } catch (err) { done(err, null); } });
+passport.deserializeUser(async (id, done) => { 
+  try { 
+    const res = await pool.query("SELECT * FROM users WHERE id=$1", [id]); 
+    done(null, res.rows[0]); 
+  } catch (err) { 
+    done(err, null); 
+  } 
+});
 
-// Helper for creating stats
-async function ensureCreatorStats(userId) { try { await pool.query(`INSERT INTO creator_stats (user_id, total_likes, total_follows, total_views, total_tips, total_merch_sales, earnings, updated_at) VALUES ($1,0,0,0,0,0,0,NOW()) ON CONFLICT (user_id) DO NOTHING`, [userId]); } catch (err) { console.error("ensureCreatorStats error:", err); } }
+// FIX 5: Actually configure OAuth strategies
+if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
+  passport.use(new GoogleStrategy({
+    clientID: GOOGLE_CLIENT_ID,
+    clientSecret: GOOGLE_CLIENT_SECRET,
+    callbackURL: GOOGLE_CALLBACK_URL,
+  }, async (accessToken, refreshToken, profile, done) => {
+    try {
+      const email = profile.emails?.[0]?.value;
+      let { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+      if (!rows.length) {
+        const username = profile.displayName?.replace(/\s/g, '') || email.split('@')[0];
+        const result = await pool.query(
+          `INSERT INTO users (username, email, auth_provider, profile_url) VALUES ($1, $2, 'google', $3) RETURNING *`,
+          [username, email, profile.photos?.[0]?.value]
+        );
+        await ensureCreatorStats(result.rows[0].id);
+        rows = result.rows;
+      }
+      done(null, rows[0]);
+    } catch (err) { done(err, null); }
+  }));
+}
 
-// --- Helper: Verify Turnstile ---
-async function verifyTurnstile(token) {
-  try {
-    const response = await axios.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', new URLSearchParams({ secret: TURNSTILE_SECRET_KEY, response: token }));
-    return response.data.success === true;
-  } catch (err) { console.error('Turnstile failed:', err); return false; }
+if (DISCORD_CLIENT_ID && DISCORD_CLIENT_SECRET) {
+  passport.use(new DiscordStrategy({
+    clientID: DISCORD_CLIENT_ID,
+    clientSecret: DISCORD_CLIENT_SECRET,
+    callbackURL: DISCORD_CALLBACK_URL,
+    scope: ["identify", "email"],
+  }, async (accessToken, refreshToken, profile, done) => {
+    try {
+      const email = profile.email;
+      let { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+      if (!rows.length) {
+        const username = profile.username || email.split('@')[0];
+        const result = await pool.query(
+          `INSERT INTO users (username, email, auth_provider, profile_url) VALUES ($1, $2, 'discord', $3) RETURNING *`,
+          [username, email, `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png`]
+        );
+        await ensureCreatorStats(result.rows[0].id);
+        rows = result.rows;
+      }
+      done(null, rows[0]);
+    } catch (err) { done(err, null); }
+  }));
+}
+
+if (GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET) {
+  passport.use(new GitHubStrategy({
+    clientID: GITHUB_CLIENT_ID,
+    clientSecret: GITHUB_CLIENT_SECRET,
+    callbackURL: GITHUB_CALLBACK_URL,
+    scope: ["user:email"],
+  }, async (accessToken, refreshToken, profile, done) => {
+    try {
+      // Github might not return email in profile directly, might need API call for primary email
+      const email = profile.emails?.[0]?.value || `${profile.username}@github-placeholder.com`;
+      let { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+      if (!rows.length) {
+        const username = profile.username || email.split('@')[0];
+        const result = await pool.query(
+          `INSERT INTO users (username, email, auth_provider, profile_url) VALUES ($1, $2, 'github', $3) RETURNING *`,
+          [username, email, profile.photos?.[0]?.value]
+        );
+        await ensureCreatorStats(result.rows[0].id);
+        rows = result.rows;
+      }
+      done(null, rows[0]);
+    } catch (err) { done(err, null); }
+  }));
 }
 
 // ==========================================
 // API ROUTES
 // ==========================================
 
+// --- FIX 6: Auth Routes (Missing Previously) ---
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+    if (!username || !email || !password) return res.status(400).json({ error: "All fields required" });
+
+    const existing = await pool.query("SELECT id FROM users WHERE email = $1 OR username = $2", [email, username]);
+    if (existing.rows.length) return res.status(409).json({ error: "User already exists" });
+
+    const password_hash = await argon2.hash(password);
+    const { rows } = await pool.query(
+      `INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, role`,
+      [username, email, password_hash]
+    );
+
+    await ensureCreatorStats(rows[0].id);
+
+    const token = jwt.sign({ id: rows[0].id }, JWT_SECRET, { expiresIn: "7d" });
+    res.status(201).json({ user: rows[0], token });
+  } catch (err) {
+    console.error("Register error:", err);
+    res.status(500).json({ error: "Registration failed" });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    if (!rows.length) return res.status(401).json({ error: "Invalid credentials" });
+
+    const user = rows[0];
+    if (!user.password_hash) return res.status(401).json({ error: "Use OAuth to login" });
+
+    const valid = await argon2.verify(user.password_hash, password);
+    if (!valid) return res.status(401).json({ error: "Invalid credentials" });
+
+    await pool.query("UPDATE users SET last_login_at = NOW(), failed_login_count = 0 WHERE id = $1", [user.id]);
+
+    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "7d" });
+    const { password_hash, ...safeUser } = user;
+    res.json({ user: safeUser, token });
+  } catch (err) {
+    console.error("Login error:", err);
+    res.status(500).json({ error: "Login failed" });
+  }
+});
+
+// OAuth Routes
+app.get("/api/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
+app.get("/api/auth/google/callback", passport.authenticate("google", { failureRedirect: "/login" }), (req, res) => {
+  const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" });
+  res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`);
+});
+
+app.get("/api/auth/discord", passport.authenticate("discord"));
+app.get("/api/auth/discord/callback", passport.authenticate("discord", { failureRedirect: "/login" }), (req, res) => {
+  const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" });
+  res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`);
+});
+
+app.get("/api/auth/github", passport.authenticate("github"));
+app.get("/api/auth/github/callback", passport.authenticate("github", { failureRedirect: "/login" }), (req, res) => {
+  const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" });
+  res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`);
+});
+
 // 1. Video & Shorts Upload
 app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
   try {
     const { title, description, category, is_short } = req.body;
     const userId = req.user.id;
-
     if (!req.files?.video) return res.status(400).json({ error: "Video file required" });
 
-    // Upload Video to S3
     const videoFile = req.files.video[0];
     const videoKey = `videos/${userId}/${Date.now()}-${videoFile.originalname}`;
     const videoUrl = await uploadToS3(videoFile, videoKey, videoFile.mimetype);
 
-    // Upload Thumbnail (Optional) or generate later
-    let thumbnailUrl = `https://placehold.co/1280x720?text=${encodeURIComponent(title)}`; // Placeholder
+    let thumbnailUrl = `https://placehold.co/1280x720?text=${encodeURIComponent(title)}`;
     if (req.files?.thumbnail?.[0]) {
       const thumbFile = req.files.thumbnail[0];
       const thumbKey = `thumbnails/${userId}/${Date.now()}-${thumbFile.originalname}`;
       thumbnailUrl = await uploadToS3(thumbFile, thumbKey, thumbFile.mimetype);
     }
 
-    // Insert to DB
     const { rows } = await pool.query(
       `INSERT INTO videos (user_id, title, description, video_url, thumbnail_url, category, is_short, processing_status) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing') RETURNING *`,
       [userId, title, description, videoUrl, thumbnailUrl, category, is_short === 'true']
     );
-
-    // Trigger Background Processing (FFmpeg) - Conceptual
-    // In a real app, push to a BullMQ job here.
-    
     res.status(201).json({ video: rows[0] });
   } catch (err) {
     console.error("Upload error:", err);
@@ -399,15 +553,12 @@ app.post("/api/music", authMiddleware, upload.fields([{ name: 'audio', maxCount:
   try {
     const { title, artist, album, genre } = req.body;
     const userId = req.user.id;
-
     if (!req.files?.audio) return res.status(400).json({ error: "Audio file required" });
 
-    // Upload Audio
     const audioFile = req.files.audio[0];
     const audioKey = `music/${userId}/${Date.now()}-${audioFile.originalname}`;
     const audioUrl = await uploadToS3(audioFile, audioKey, audioFile.mimetype);
 
-    // Upload Cover
     let coverUrl = `https://placehold.co/300x300?text=Music`;
     if (req.files?.cover?.[0]) {
       const coverFile = req.files.cover[0];
@@ -420,7 +571,6 @@ app.post("/api/music", authMiddleware, upload.fields([{ name: 'audio', maxCount:
        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
       [userId, title, artist, album, genre, audioUrl, coverUrl]
     );
-
     res.status(201).json({ music: rows[0] });
   } catch (err) {
     console.error("Music upload error:", err);
@@ -433,10 +583,8 @@ app.post("/api/react", authMiddleware, async (req, res) => {
   try {
     const { content_id, content_type, reaction_type } = req.body;
     const user_id = req.user.id;
-
     if (!content_id || !content_type) return res.status(400).json({ error: "Missing content info" });
 
-    // Upsert into content_reactions table
     const query = `
       INSERT INTO content_reactions (user_id, content_id, content_type, reaction_type)
       VALUES ($1, $2, $3, $4)
@@ -445,7 +593,6 @@ app.post("/api/react", authMiddleware, async (req, res) => {
     `;
     await pool.query(query, [user_id, content_id, content_type, reaction_type]);
 
-    // Update counts on the source table
     let updateTable = "";
     if (content_type === 'video') updateTable = "videos";
     else if (content_type === 'music') updateTable = "music";
@@ -458,7 +605,6 @@ app.post("/api/react", authMiddleware, async (req, res) => {
          await pool.query(`UPDATE ${updateTable} SET dislikes = (SELECT COUNT(*) FROM content_reactions WHERE content_id = $1 AND content_type = $2 AND reaction_type = 'dislike') WHERE id = $1`, [content_id, content_type]);
       }
     }
-
     res.json({ success: true, reaction: reaction_type });
   } catch (err) {
     console.error("Reaction error:", err);
@@ -493,7 +639,6 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), 
     );
 
     io.to(`chat-${chatId}`).emit("new-message", rows[0]);
-
     res.status(201).json({ message: rows[0] });
   } catch (err) {
     console.error("Chat error:", err);
@@ -505,12 +650,10 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), 
 app.get("/api/videos/:id/ad-tag", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    
     const { rows } = await pool.query("SELECT duration, is_short, monetization_enabled FROM videos WHERE id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "Video not found" });
     
     const video = rows[0];
-
     if (video.is_short || !video.monetization_enabled || (video.duration && video.duration < 60)) {
       return res.json({ vastUrl: null });
     }
@@ -526,7 +669,6 @@ app.get("/api/videos/:id/ad-tag", authMiddleware, async (req, res) => {
     } else {
       vastUrl = `https://vast.freewheel.com/mrex.xml?cid=123&pid=456&video=${id}`;
     }
-
     res.json({ vastUrl, provider });
   } catch (err) {
     console.error("Ad tag error:", err);
@@ -534,7 +676,7 @@ app.get("/api/videos/:id/ad-tag", authMiddleware, async (req, res) => {
   }
 });
 
-// --- Existing Routes ---
+// --- Existing Read Routes ---
 app.get("/api/videos", async (req, res) => { 
   try { 
     const { filter, category } = req.query; 
@@ -557,31 +699,119 @@ app.get("/api/videos/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed" }); } 
 });
 
-// --- Socket.IO Setup ---
-const io = new SocketServer(server, { 
-  cors: { origin: process.env.FRONTEND_URL || "*", methods: ["GET", "POST"] } 
+// --- FIX 7: Missing Crucial API Endpoints ---
+app.get("/api/music", async (req, res) => {
+  try {
+    const { filter, genre } = req.query;
+    let query = `SELECT m.*, u.username, u.profile_url FROM music m JOIN users u ON m.user_id = u.id WHERE 1=1`;
+    const params = [];
+    if (genre && genre !== 'All') { params.push(genre); query += ` AND m.genre = $${params.length}`; }
+    query += filter === 'Trending' ? ` ORDER BY m.trending_score DESC` : ` ORDER BY m.created_at DESC`;
+    query += ` LIMIT $${params.length + 1}`; params.push(20);
+    const { rows } = await pool.query(query, params);
+    res.json({ music: rows });
+  } catch (err) { res.status(500).json({ error: "Failed" }); }
 });
 
-// Attach Redis Adapter for scaling
-io.adapter(createAdapter(pubClient, subClient));
+app.post("/api/comments", authMiddleware, async (req, res) => {
+  try {
+    const { content_type, content_id, parent_id, content } = req.body;
+    const userId = req.user.id;
+    if (!content_type || !content_id || !content) return res.status(400).json({ error: "Missing fields" });
 
-io.use(async (socket, next) => { 
-  try { 
-    const token = socket.handshake.auth.token; 
-    if (!token) return next(new Error("Auth error")); 
-    socket.userId = jwt.verify(token, JWT_SECRET).id; 
-    next(); 
-  } catch (err) { next(new Error("Auth error")); } 
+    const { rows } = await pool.query(
+      `INSERT INTO comments (user_id, content_type, content_id, parent_id, content) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [userId, content_type, content_id, parent_id || null, content]
+    );
+
+    // Increment comment count on video
+    if (content_type === 'video') {
+      await pool.query(`UPDATE videos SET comments_count = comments_count + 1 WHERE id = $1`, [content_id]).catch(()=>{});
+    }
+
+    res.status(201).json({ comment: rows[0] });
+  } catch (err) { res.status(500).json({ error: "Failed to comment" }); }
 });
 
-io.on("connection", (socket) => {
-  console.log(`Socket: ${socket.id} (User: ${socket.userId})`);
-  socket.join(`user-${socket.userId}`);
-  socket.on("join-stream", (data) => socket.join(`stream-${data.streamId}`));
-  socket.on("join-chat", (chatId) => socket.join(`chat-${chatId}`));
-  socket.on("typing-start", (data) => socket.to(`chat-${data.chatId}`).emit("user-typing", { userId: socket.userId }));
-  socket.on("call-user", (data) => io.to(`user-${data.userId}`).emit("incoming-call", { from: socket.userId, channel: data.channel }));
-  socket.on("disconnect", () => console.log("Disconnected:", socket.userId));
+app.get("/api/notifications", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { rows } = await pool.query(
+      `SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 30`,
+      [userId]
+    );
+    res.json({ notifications: rows });
+  } catch (err) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.put("/api/notifications/read", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    await pool.query(`UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false`, [userId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.get("/api/users/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT id, username, email, profile_url, cover_url, bio, is_musician, is_creator, is_verified, role, created_at FROM users WHERE id = $1`, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json({ user: rows[0] });
+  } catch (err) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.put("/api/users/me", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { username, bio, profile_url, cover_url, social_links } = req.body;
+    const { rows } = await pool.query(
+      `UPDATE users SET username = COALESCE($1, username), bio = COALESCE($2, bio), profile_url = COALESCE($3, profile_url), cover_url = COALESCE($4, cover_url), social_links = COALESCE($5, social_links), updated_at = NOW() WHERE id = $6 RETURNING id, username, email, profile_url, cover_url, bio`,
+      [username, bio, profile_url, cover_url, social_links, userId]
+    );
+    res.json({ user: rows[0] });
+  } catch (err) { res.status(500).json({ error: "Failed to update profile" }); }
+});
+
+app.post("/api/livestreams", authMiddleware, async (req, res) => {
+  try {
+    const { title, description, category } = req.body;
+    const userId = req.user.id;
+    const streamKey = uuidv4();
+    const agoraToken = generateAgoraToken(streamKey, userId);
+
+    const { rows } = await pool.query(
+      `INSERT INTO livestreams (user_id, title, description, category, stream_key, is_live) VALUES ($1, $2, $3, $4, $5, true) RETURNING *`,
+      [userId, title, description, category, streamKey]
+    );
+
+    io.emit("stream-started", rows[0]);
+    res.status(201).json({ stream: rows[0], agoraToken });
+  } catch (err) { res.status(500).json({ error: "Failed to start stream" }); }
+});
+
+app.get("/api/search", async (req, res) => {
+  try {
+    const { q, type } = req.query;
+    if (!q) return res.status(400).json({ error: "Query required" });
+    
+    const searchQuery = `%${q.toLowerCase()}%`;
+    let results = {};
+
+    if (!type || type === 'videos') {
+      const vidRes = await pool.query(`SELECT * FROM videos WHERE LOWER(title) LIKE $1 LIMIT 10`, [searchQuery]);
+      results.videos = vidRes.rows;
+    }
+    if (!type || type === 'music') {
+      const musRes = await pool.query(`SELECT * FROM music WHERE LOWER(title) LIKE $1 OR LOWER(artist) LIKE $1 LIMIT 10`, [searchQuery]);
+      results.music = musRes.rows;
+    }
+    if (!type || type === 'users') {
+      const usrRes = await pool.query(`SELECT id, username, profile_url, is_verified FROM users WHERE LOWER(username) LIKE $1 LIMIT 10`, [searchQuery]);
+      results.users = usrRes.rows;
+    }
+
+    res.json({ results });
+  } catch (err) { res.status(500).json({ error: "Search failed" }); }
 });
 
 // --- Server Startup ---
