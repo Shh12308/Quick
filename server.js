@@ -15,8 +15,8 @@ import multer from "multer";
 import Stripe from "stripe";
 import path from "path";
 import dayjs from "dayjs";
-// FIX 3: Import fs/promises instead of fs to prevent blocking
-import fs from "fs/promises"; 
+// FIX: Import full 'fs' module so we have access to both existsSync (sync) and promises (async)
+import fs from "fs"; 
 import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
 import { v4 as uuidv4 } from "uuid";
@@ -287,13 +287,13 @@ const transporter = nodemailer.createTransport({
 });
 
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
-// FIX 3: Use fs/promises mkdir for async consistency
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdir(UPLOAD_DIR, { recursive: true });
+// FIX: Use standard fs for sync check at startup
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => { 
     const dir = path.join(UPLOAD_DIR, file.fieldname === 'thumbnail' ? 'thumbnails' : 'uploads'); 
-    if (!fs.existsSync(dir)) fs.mkdir(dir, { recursive: true }); 
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); 
     cb(null, dir); 
   },
   filename: (req, file, cb) => { cb(null, `${Date.now()}-${file.fieldname}${path.extname(file.originalname)}`); },
@@ -308,9 +308,9 @@ export const upload = multer({
   } 
 });
 
-// FIX 3: Updated to async/await to prevent server freezing
+// FIX: Updated to use fs.promises for async/await (prevents freezing)
 async function uploadToS3(file, key, mimeType) {
-  const fileContent = await fs.readFile(file.path);
+  const fileContent = await fs.promises.readFile(file.path);
   let buffer = fileContent;
   if (mimeType.startsWith('image/')) {
     buffer = await sharp(fileContent).rotate().toBuffer();
@@ -321,7 +321,7 @@ async function uploadToS3(file, key, mimeType) {
     Body: buffer, 
     ContentType: mimeType
   }));
-  await fs.unlink(file.path);
+  await fs.promises.unlink(file.path);
   return `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
 }
 
