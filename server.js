@@ -74,7 +74,7 @@ const {
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_CALLBACK_URL,
   DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_CALLBACK_URL,
   GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_CALLBACK_URL,
-  FRONTEND_URL, ADMIN_KEY, PORT = 8000,
+  FRONTEND_URL, ADMIN_KEY,
   AGORA_APP_ID, AGORA_APP_CERTIFICATE,
   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME,
   OPENAI_API_KEY,
@@ -99,6 +99,8 @@ app.use(cors({
 }));
 
 app.use(helmet());
+
+const PORT = process.env.PORT;
 
 // ==========================================
 // STRIPE WEBHOOK (Raw Body)
@@ -1003,11 +1005,8 @@ app.get("/api/search", async (req, res) => {
 // ==========================================
 ffmpeg.setFfmpegPath(ffmpegPath);
 
-// FIX: Listen immediately to prevent 502s
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  // Initialize DB in background
-  initializeDatabase();
+  console.log("Server running on port", PORT);
 });
 
 async function initializeDatabase() {
