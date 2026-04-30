@@ -183,21 +183,6 @@ const redis = new Redis(process.env.REDIS_URL, {
 });
 const cache = new NodeCache({ stdTTL: 600 });
 
-app.use(
-  session({
-    store: new RedisStore({ client: redis }),
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
-      maxAge: 1000 * 60 * 60 * 24 * 7
-    }
-  })
-);
-
 // ==========================================
 // POSTGRESQL POOL
 // ==========================================
@@ -371,7 +356,6 @@ function adminMiddleware(req, res, next) {
 
 // --- Passport & Auth Strategies ---
 app.use(passport.initialize());
-app.use(passport.session());
 passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser(async (id, done) => { 
   try { 
@@ -406,6 +390,7 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
 }
 
 if (DISCORD_CLIENT_ID && DISCORD_CLIENT_SECRET) {
+  passport.authenticate("discord", { session: false })
   passport.use(new DiscordStrategy({
     clientID: DISCORD_CLIENT_ID,
     clientSecret: DISCORD_CLIENT_SECRET,
