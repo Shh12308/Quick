@@ -100,7 +100,7 @@ app.use(cors({
 
 app.use(helmet());
 
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 8000;
 
 // ==========================================
 // STRIPE WEBHOOK (Raw Body)
