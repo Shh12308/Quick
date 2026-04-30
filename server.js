@@ -15,7 +15,8 @@ import multer from "multer";
 import Stripe from "stripe";
 import path from "path";
 import dayjs from "dayjs";
-import fs from "fs";
+// FIX 3: Import fs/promises instead of fs to prevent blocking
+import fs from "fs/promises"; 
 import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
 import { v4 as uuidv4 } from "uuid";
@@ -81,7 +82,7 @@ const {
   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
   ASSEMBLYAI_KEY, SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET, DEEP_AI_KEY,
   TURNSTILE_SECRET_KEY,
-  IPINFO_TOKEN // Added for VPN detection
+  IPINFO_TOKEN 
 } = process.env;
 
 // Environment variable validation
@@ -286,12 +287,13 @@ const transporter = nodemailer.createTransport({
 });
 
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+// FIX 3: Use fs/promises mkdir for async consistency
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdir(UPLOAD_DIR, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => { 
     const dir = path.join(UPLOAD_DIR, file.fieldname === 'thumbnail' ? 'thumbnails' : 'uploads'); 
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); 
+    if (!fs.existsSync(dir)) fs.mkdir(dir, { recursive: true }); 
     cb(null, dir); 
   },
   filename: (req, file, cb) => { cb(null, `${Date.now()}-${file.fieldname}${path.extname(file.originalname)}`); },
@@ -306,8 +308,9 @@ export const upload = multer({
   } 
 });
 
+// FIX 3: Updated to async/await to prevent server freezing
 async function uploadToS3(file, key, mimeType) {
-  const fileContent = fs.readFileSync(file.path);
+  const fileContent = await fs.readFile(file.path);
   let buffer = fileContent;
   if (mimeType.startsWith('image/')) {
     buffer = await sharp(fileContent).rotate().toBuffer();
@@ -318,7 +321,7 @@ async function uploadToS3(file, key, mimeType) {
     Body: buffer, 
     ContentType: mimeType
   }));
-  fs.unlinkSync(file.path);
+  await fs.unlink(file.path);
   return `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
 }
 
@@ -391,8 +394,8 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
   }));
 }
 
+// FIX 1: Removed the crashing `passport.authenticate("discord", { session: false })` line
 if (DISCORD_CLIENT_ID && DISCORD_CLIENT_SECRET) {
-  passport.authenticate("discord", { session: false })
   passport.use(new DiscordStrategy({
     clientID: DISCORD_CLIENT_ID,
     clientSecret: DISCORD_CLIENT_SECRET,
@@ -1005,25 +1008,34 @@ app.get("/api/search", async (req, res) => {
 // ==========================================
 ffmpeg.setFfmpegPath(ffmpegPath);
 
-server.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
-
 async function initializeDatabase() {
   const MAX_RETRIES = 10;
   for (let i = 1; i <= MAX_RETRIES; i++) {
     try {
       console.log(`DB Connection Try ${i}/${MAX_RETRIES}...`);
       await initializeTables();
-      console.log("✅ Database connected!");
+      console.log("✅ Database connected and tables initialized!");
       return; 
     } catch (err) {
       console.error(`DB Failed: ${err.message}`);
       if (i === MAX_RETRIES) { 
-        console.error("❌ Max DB retries reached. Server is running but database features are disabled."); 
-        // Do NOT exit, allowing the server to stay up for health checks
+        console.error("❌ Max DB retries reached. Exiting.");
+        process.exit(1);
       }
       await new Promise(resolve => setTimeout(resolve, 3000));
     }
   }
 }
+
+// FIX 2: Initialize DB BEFORE listening to prevent 502s on startup
+(async () => {
+  try {
+    await initializeDatabase();
+    server.listen(PORT, () => {
+      console.log("Server running on port", PORT);
+    });
+  } catch (err) {
+    console.error("Failed to start server:", err);
+    process.exit(1);
+  }
+})();
