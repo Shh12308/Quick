@@ -152,12 +152,18 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // REDIS & SESSION (Non-Blocking)
 // ==========================================
 function createRedisClient() {
+  const isTLS = process.env.REDIS_URL?.startsWith("rediss://");
+
   return createClient({
     url: process.env.REDIS_URL,
     socket: {
-      tls: process.env.REDIS_URL?.startsWith('rediss://'),
+      tls: isTLS,
       rejectUnauthorized: false,
-      keepAlive: 30000, 
+      reconnectStrategy: (retries) => {
+        console.log(`Redis reconnect attempt #${retries}`);
+        return Math.min(retries * 200, 5000); // backoff
+      },
+      keepAlive: 10000,
     },
   });
 }
