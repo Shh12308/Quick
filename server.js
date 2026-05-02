@@ -1,6 +1,5 @@
 import express from "express";
 import pg from "pg";
-import { Worker, Queue } from "bullmq";
 import argon2 from "argon2";
 import geoip from "geoip-lite";
 import jwt from "jsonwebtoken";
@@ -18,8 +17,6 @@ import fs from "fs";
 import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
 import { v4 as uuidv4 } from "uuid";
-import { ExpressPeerServer } from "peer";
-import os from "os";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 import helmet from "helmet";
@@ -29,17 +26,10 @@ import cors from "cors";
 import { createClient } from "redis";
 import { createAdapter } from "@socket.io/redis-adapter";
 import OpenAI from "openai";
-import FormData from "form-data";
 import NodeCache from "node-cache";
-import cron from "node-cron";
-import { createWorker } from "tesseract.js";
 import sharp from "sharp";
-import { createCanvas, loadImage } from "canvas";
-import { createHmac } from "crypto";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
-import session from "express-session";
-import RedisStore from "connect-redis";
 import dotenv from "dotenv";
 import { 
   S3Client, 
@@ -77,7 +67,7 @@ const {
   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME,
   OPENAI_API_KEY,
   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
-  ASSEMBLYAI_KEY, SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET, DEEP_AI_KEY,
+  DEEP_AI_KEY,
   TURNSTILE_SECRET_KEY,
   IPINFO_TOKEN,
   REDIS_URL
@@ -97,7 +87,9 @@ app.use(cors({
   credentials: true,
 }));
 
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: false // Disabled to allow flexibility with frontend images/scripts
+}));
 
 const PORT = process.env.PORT || 8000;
 
@@ -150,31 +142,6 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // ==========================================
-// REDIS & SESSION (SAFE INITIALIZATION)
-// ==========================================
-let pubClient = null;
-let subClient = null;
-let redis = null;
-let redisConnected = false;
-
-if (REDIS_URL) {
-  try {
-    const isTLS = REDIS_URL.startsWith("rediss://");
-    pubClient = createClient({ url: REDIS_URL, socket: { tls: isTLS ? { rejectUnauthorized: false } : undefined } });
-    subClient = pubClient.duplicate();
-    redis = new Redis(REDIS_URL, { tls: isTLS ? { rejectUnauthorized: false } : undefined, maxRetriesPerRequest: null, lazyConnect: true });
-    pubClient.on('error', (err) => console.error('Redis Pub Client Error:', err.message));
-    subClient.on('error', (err) => console.error('Redis Sub Client Error:', err.message));
-    redis.on('error', (err) => console.error('Redis (ioredis) Error:', err.message));
-  } catch (err) {
-    console.error('Failed to initialize Redis clients:', err.message);
-    pubClient = null; subClient = null; redis = null;
-  }
-}
-
-const cache = new NodeCache({ stdTTL: 600 });
-
-// ==========================================
 // POSTGRESQL POOL
 // ==========================================
 const { Pool } = pg;
@@ -187,6 +154,31 @@ const pool = new Pool({
 });
 
 pool.on('error', (err) => { console.error('PostgreSQL Pool Error:', err.message); });
+
+// ==========================================
+// REDIS & SESSION (SAFE INITIALIZATION)
+// ==========================================
+let pubClient = null;
+let subClient = null;
+let redisConnected = false;
+
+if (REDIS_URL) {
+  try {
+    const isTLS = REDIS_URL.startsWith("rediss://");
+    pubClient = createClient({ url: REDIS_URL, socket: { tls: isTLS ? { rejectUnauthorized: false } : undefined } });
+    subClient = pubClient.duplicate();
+    
+    pubClient.on('error', (err) => console.error('Redis Pub Client Error:', err.message));
+    subClient.on('error', (err) => console.error('Redis Sub Client Error:', err.message));
+    
+    // FIX: Removed usage of undefined 'Redis' class (ioredis) which was crashing the app
+  } catch (err) {
+    console.error('Failed to initialize Redis clients:', err.message);
+    pubClient = null; subClient = null;
+  }
+}
+
+const cache = new NodeCache({ stdTTL: 600 });
 
 // ==========================================
 // MISC SETUP
@@ -246,7 +238,7 @@ async function initializeTables() {
     await pool.query(`CREATE TABLE IF NOT EXISTS stripe_events (id SERIAL PRIMARY KEY, event_id TEXT UNIQUE NOT NULL, processed_at TIMESTAMP DEFAULT NOW())`);
     
     // ===========================================================
-    // FIX: Safe Create (Removed DROP TABLE to prevent locks and data loss)
+    // FIX: Safe Create
     // ===========================================================
     await pool.query(`CREATE TABLE IF NOT EXISTS subscription_tiers (id SERIAL PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2), benefits JSON, role VARCHAR(50))`);
     // ===========================================================
@@ -540,13 +532,13 @@ app.post("/api/auth/login", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Login failed" }); }
 });
 
-// OAuth Routes
-app.get("/api/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
-app.get("/api/auth/google/callback", passport.authenticate("google", { failureRedirect: "/login" }), (req, res) => { const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
-app.get("/api/auth/discord", passport.authenticate("discord"));
-app.get("/api/auth/discord/callback", passport.authenticate("discord", { failureRedirect: "/login" }), (req, res) => { const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
-app.get("/api/auth/github", passport.authenticate("github"));
-app.get("/api/auth/github/callback", passport.authenticate("github", { failureRedirect: "/login" }), (req, res) => { const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
+// OAuth Routes - FIX: Added { session: false } to prevent Passport from looking for a session
+app.get("/api/auth/google", passport.authenticate("google", { scope: ["profile", "email"], session: false }));
+app.get("/api/auth/google/callback", passport.authenticate("google", { failureRedirect: "/login", session: false }), (req, res) => { const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
+app.get("/api/auth/discord", passport.authenticate("discord", { session: false }));
+app.get("/api/auth/discord/callback", passport.authenticate("discord", { failureRedirect: "/login", session: false }), (req, res) => { const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
+app.get("/api/auth/github", passport.authenticate("github", { session: false }));
+app.get("/api/auth/github/callback", passport.authenticate("github", { failureRedirect: "/login", session: false }), (req, res) => { const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
 
 // --- CONTENT ---
 app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
@@ -602,7 +594,6 @@ app.get("/api/videos/:id/ad-tag", authMiddleware, async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "Video not found" });
     const video = rows[0];
 
-    // ELITE LOGIC: Check user role
     if (req.user.role && req.user.role !== 'free') {
       return res.json({ vastUrl: null, isPremium: true });
     }
@@ -671,10 +662,6 @@ app.post("/api/elite/trigger-alert", authMiddleware, async (req, res) => {
     const { alertType, details } = req.body;
     const alertPayload = { id: uuidv4(), type: alertType || 'screenshot', message: details || "Someone took a screenshot of your content.", timestamp: new Date() };
     
-    // Emit to the specific room for the user who is Elite
-    // Logic: The user taking the screenshot calls this. The recipient is the "other" user in the chat.
-    // For this simplified demo, we alert the *caller* themselves to show it works, 
-    // or we need to pass a 'targetUserId' in body.
     const targetUserId = req.body.targetUserId || req.user.id; 
     
     io.to(`user-${targetUserId}`).emit("privacy_alert", alertPayload);
@@ -695,7 +682,6 @@ app.put("/api/users/me", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
     const { username, bio, profile_url, cover_url, social_links, preferences } = req.body;
-    // Logic to gate preferences to Premium users can be added here
     const { rows } = await pool.query(
       `UPDATE users SET username = COALESCE($1, username), bio = COALESCE($2, bio), profile_url = COALESCE($3, profile_url), cover_url = COALESCE($4, cover_url), social_links = COALESCE($5, social_links), preferences = COALESCE($6, preferences), updated_at = NOW() WHERE id = $7 RETURNING id, username, email, profile_url, cover_url, bio, preferences, role`,
       [username, bio, profile_url, cover_url, social_links, preferences, userId]
@@ -754,7 +740,7 @@ async function initializeDatabase() {
       return; 
     } catch (err) {
       console.error(`DB Failed: ${err.message}`);
-      if (i === MAX_RETRIES) { console.error("❌ Max DB retries reached. Server running but DB features disabled."); return; } // Don't exit
+      if (i === MAX_RETRIES) { console.error("❌ Max DB retries reached. Server running but DB features disabled."); return; } 
       await new Promise(resolve => setTimeout(resolve, 3000));
     }
   }
@@ -763,13 +749,13 @@ async function initializeDatabase() {
 async function initializeRedis() {
   if (!pubClient || !subClient) { console.log("⚠️ Redis not configured"); return; }
   try {
-    await pubClient.connect(); await subClient.connect();
+    await pubClient.connect(); 
+    await subClient.connect();
     console.log("✅ Redis Pub/Sub connected");
     io.adapter(createAdapter(pubClient, subClient));
     console.log("✅ Socket.IO Redis adapter configured");
     redisConnected = true;
   } catch (err) { console.error("⚠️ Failed to connect to Redis", err.message); }
-  if (redis) { try { await redis.connect(); console.log("✅ Redis (ioredis) connected"); } catch (err) { console.error("⚠️ Failed Redis (ioredis):", err.message); } }
 }
 
 // ===========================================================
@@ -777,7 +763,7 @@ async function initializeRedis() {
 // ===========================================================
 (async () => {
   // 1. Listen on the port BEFORE connecting to DB
-  server.listen(PORT, () => { 
+  server.listen(PORT, '0.0.0.0', () => { 
     console.log(`🚀 Server running on port ${PORT}`); 
   });
 
