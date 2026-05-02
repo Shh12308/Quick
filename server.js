@@ -246,13 +246,9 @@ async function initializeTables() {
     await pool.query(`CREATE TABLE IF NOT EXISTS stripe_events (id SERIAL PRIMARY KEY, event_id TEXT UNIQUE NOT NULL, processed_at TIMESTAMP DEFAULT NOW())`);
     
     // ===========================================================
-    // FIX STARTS HERE: Drop and recreate subscription_tiers to fix schema
+    // FIX: Safe Create (Removed DROP TABLE to prevent locks and data loss)
     // ===========================================================
-    console.log("🛠️ Resetting subscription_tiers table schema...");
-    await pool.query("DROP TABLE IF EXISTS subscription_tiers CASCADE;"); 
-    await pool.query(`CREATE TABLE subscription_tiers (id SERIAL PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2), benefits JSON, role VARCHAR(50))`);
-    // ===========================================================
-    // FIX ENDS HERE
+    await pool.query(`CREATE TABLE IF NOT EXISTS subscription_tiers (id SERIAL PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2), benefits JSON, role VARCHAR(50))`);
     // ===========================================================
 
     await pool.query(`CREATE TABLE IF NOT EXISTS user_subscriptions (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, tier_id INTEGER REFERENCES subscription_tiers(id) ON DELETE SET NULL, stripe_subscription_id TEXT, status TEXT, current_period_start TIMESTAMP, current_period_end TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
@@ -758,7 +754,7 @@ async function initializeDatabase() {
       return; 
     } catch (err) {
       console.error(`DB Failed: ${err.message}`);
-      if (i === MAX_RETRIES) { console.error("❌ Max DB retries reached. Exiting."); process.exit(1); }
+      if (i === MAX_RETRIES) { console.error("❌ Max DB retries reached. Server running but DB features disabled."); return; } // Don't exit
       await new Promise(resolve => setTimeout(resolve, 3000));
     }
   }
@@ -776,10 +772,25 @@ async function initializeRedis() {
   if (redis) { try { await redis.connect(); console.log("✅ Redis (ioredis) connected"); } catch (err) { console.error("⚠️ Failed Redis (ioredis):", err.message); } }
 }
 
+// ===========================================================
+// FIX: Start Server IMMEDIATELY to prevent 502s
+// ===========================================================
 (async () => {
+  // 1. Listen on the port BEFORE connecting to DB
+  server.listen(PORT, () => { 
+    console.log(`🚀 Server running on port ${PORT}`); 
+  });
+
+  // 2. Initialize services in the background
   try {
     await initializeDatabase();
-    server.listen(PORT, () => { console.log(`🚀 Server running on port ${PORT}`); });
-    initializeRedis().catch(err => { console.error("Redis initialization error:", err.message); });
-  } catch (err) { console.error("❌ Failed to start server:", err); process.exit(1); }
+  } catch (err) { 
+    console.error("❌ Database initialization error:", err.message); 
+  }
+
+  try {
+    await initializeRedis();
+  } catch (err) { 
+    console.error("❌ Redis initialization error:", err.message); 
+  }
 })();
