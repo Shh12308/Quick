@@ -52,6 +52,7 @@ const __dirname = dirname(__filename);
 
 const app = express(); 
 const server = http.createServer(app);
+app.set("trust proxy", 1);
 
 // ==========================================
 // ENVIRONMENT VARIABLES
