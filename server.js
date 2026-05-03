@@ -1,6 +1,5 @@
 import express from "express";
 import pg from "pg";
-import argon2 from "argon2";
 import geoip from "geoip-lite";
 import jwt from "jsonwebtoken";
 import passport from "passport";
@@ -17,8 +16,6 @@ import fs from "fs";
 import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
 import { v4 as uuidv4 } from "uuid";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import axios from "axios";
@@ -27,7 +24,7 @@ import { createClient } from "redis";
 import { createAdapter } from "@socket.io/redis-adapter";
 import OpenAI from "openai";
 import NodeCache from "node-cache";
-import sharp from "sharp";
+
 import { fileURLToPath } from "url";
 import { dirname } from "path";
 import dotenv from "dotenv";
