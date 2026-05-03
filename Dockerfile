@@ -30,4 +30,4 @@ COPY . .
 EXPOSE 8000
 
 # Start server
-CMD ["node", "server.js"]
+CMD ["node", "test.js"]
