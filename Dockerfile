@@ -24,4 +24,4 @@ ENV PORT=8443
 
 EXPOSE 8443
 
-CMD ["node", "test.js"]
+CMD ["node", "server.js"]
