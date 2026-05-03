@@ -91,7 +91,7 @@ app.use(helmet({
   contentSecurityPolicy: false // Disabled to allow flexibility with frontend images/scripts
 }));
 
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT || 8080;
 
 // ==========================================
 // STRIPE WEBHOOK (Raw Body)
