@@ -73,12 +73,13 @@ const {
   REDIS_URL
 } = process.env;
 
-// Environment variable validation
+// Environment variable validation (FIXED: Do not exit)
 const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET', 'SESSION_SECRET'];
 const missingEnv = REQUIRED_ENV.filter(key => !process.env[key]);
 if (missingEnv.length) {
-  console.error(`❌ Missing required environment variables: ${missingEnv.join(', ')}`);
-  process.exit(1);
+  console.error(`⚠️  WARNING: Missing required environment variables: ${missingEnv.join(', ')}`);
+  console.error(`⚠️  Server starting in DEGRADED MODE. Please set variables in Railway settings.`);
+  // process.exit(1) REMOVED to prevent 502s
 }
 
 // CORS middleware
@@ -432,8 +433,19 @@ if (GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET) {
 // API ROUTES
 // ==========================================
 
-// Health check endpoint
-app.get("/api/health", (req, res) => { res.json({ status: "ok", timestamp: new Date().toISOString() }); });
+// FIX: Improved Health Check
+app.get("/api/health", async (req, res) => {
+  try {
+    if (!DATABASE_URL) {
+      return res.status(503).json({ status: "degraded", database: "disconnected", message: "DATABASE_URL missing" });
+    }
+    await pool.query("SELECT 1");
+    res.json({ status: "ok", timestamp: new Date().toISOString() });
+  } catch (err) {
+    res.status(503).json({ status: "error", database: "error", message: err.message });
+  }
+});
+
 app.get("/videos", (req, res) => { res.redirect("/api/videos"); });
 app.get("/users/me", (req, res) => { res.redirect("/api/users/me"); });
 
@@ -731,6 +743,12 @@ app.use((err, req, res, next) => { console.error("Unhandled error:", err); res.s
 if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 
 async function initializeDatabase() {
+  // FIX: Skip initialization if DATABASE_URL is missing
+  if (!DATABASE_URL) {
+    console.log("⚠️ Skipping Database Init: DATABASE_URL missing.");
+    return;
+  }
+
   const MAX_RETRIES = 10;
   for (let i = 1; i <= MAX_RETRIES; i++) {
     try {
