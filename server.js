@@ -1196,6 +1196,104 @@ app.get("/api/search", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Search failed" }); }
 });
 
+// ... existing imports
+// Make sure you have the checkHiveAI, checkDeepAI, checkSightengine helpers from the previous step
+
+app.post("/api/music/upload", authMiddleware, upload.fields([{ name: 'audio', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const userId = req.user.id;
+    const { title, artist, album, genre, explicit, tags } = req.body;
+    
+    // Emit Start
+    io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Running Checks: Hive AI', progress: 0 });
+
+    if (!req.files?.audio) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: "Audio file required" });
+    }
+    
+    const audioFile = req.files.audio[0];
+    let coverFile = req.files?.cover?.[0];
+
+    // --- STEP 1: HIVE AI (Check Cover) ---
+    if (coverFile) {
+      console.log(`Checking Cover Hive AI for user ${userId}...`);
+      io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Checking Cover: Hive AI...', progress: 25 });
+      const hiveResult = await checkHiveAI(coverFile.path);
+      if (!hiveResult.allowed) {
+        fs.unlinkSync(coverFile.path);
+        await handleContentViolation(userId, hiveResult.reason, client);
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: "Inappropriate Cover Detected", reason: hiveResult.reason });
+      }
+
+      // --- STEP 2: DEEP AI (Check Cover) ---
+      console.log(`Checking Cover DeepAI for user ${userId}...`);
+      io.to(`user-${userId}`).emit('upload-status', { step: 2, status: 'Checking Cover: DeepAI...', progress: 50 });
+      const deepResult = await checkDeepAI(coverFile.path);
+      if (!deepResult.allowed) {
+        fs.unlinkSync(coverFile.path);
+        await handleContentViolation(userId, deepResult.reason, client);
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: "Inappropriate Cover Detected", reason: deepResult.reason });
+      }
+
+      // --- STEP 3: SIGHTENGINE (Check Cover) ---
+      console.log(`Checking Cover Sightengine for user ${userId}...`);
+      io.to(`user-${userId}`).emit('upload-status', { step: 3, status: 'Checking Cover: Sightengine...', progress: 75 });
+      const sightResult = await checkSightengine(coverFile.path);
+      if (!sightResult.allowed) {
+        fs.unlinkSync(coverFile.path);
+        await handleContentViolation(userId, sightResult.reason, client);
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: "Inappropriate Cover Detected", reason: sightResult.reason });
+      }
+    }
+
+    // --- STEP 4: UPLOAD TO AWS S3 ---
+    console.log(`Uploading to S3 for user ${userId}...`);
+    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Uploading to Cloud...', progress: 0 });
+
+    const audioKey = `music/${userId}/${Date.now()}-${audioFile.originalname}`;
+    const audioUrl = await uploadToS3(audioFile, audioKey, audioFile.mimetype);
+    
+    let coverUrl = "https://placehold.co/300x300?text=No+Cover";
+    if (coverFile) {
+      const coverKey = `covers/${userId}/${Date.now()}-${coverFile.originalname}`;
+      coverUrl = await uploadToS3(coverFile, coverKey, coverFile.mimetype);
+    }
+
+    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Finished', progress: 100 });
+
+    // DB INSERT
+    const tagsJson = typeof tags === 'string' ? tags : JSON.parse(tags || "[]");
+    const tagsString = JSON.stringify(tagsJson); 
+    
+    // Assuming you have a 'music' table. If not, use 'videos' table with is_music flag
+    // await client.query(`INSERT INTO music (user_id, title, artist, album, genre, explicit, audio_url, cover_url, tags) ...`);
+    
+    // For this example, let's assume a 'music' table or similar structure:
+    await client.query(
+      `INSERT INTO music (user_id, title, artist, album, genre, is_explicit, audio_url, cover_url, tags) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [userId, title, artist, album, genre, explicit, audioUrl, coverUrl, tagsString]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json({ success: true, message: "Music uploaded successfully" });
+
+  } catch (err) { 
+    console.error("Music Upload error:", err); 
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: "Upload failed" }); 
+  } finally {
+    if (client) client.release();
+  }
+});
+
 // --- MISC ---
 app.post("/api/livestreams", authMiddleware, async (req, res) => {
   try {
