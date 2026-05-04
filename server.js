@@ -830,71 +830,246 @@ app.post("/auth/check-vpn", async (req, res) => {
 // --- REGISTER ---
 app.post("/api/auth/register", checkBan, async (req, res) => {
   try {
-    const { username, email, password, dob, captchaToken, profile_url } = req.body;
-    if (!username || !email || !password) return res.status(400).json({ error: "All fields required" });
-    if (!dob) return res.status(400).json({ error: "Date of birth required" });
-    
+    const {
+      username,
+      email,
+      password,
+      dob,
+      captchaToken,
+      profile_url
+    } = req.body;
+
+    if (!username || !email || !password)
+      return res.status(400).json({ error: "All fields required" });
+
+    if (!dob)
+      return res.status(400).json({ error: "Date of birth required" });
+
     const birthDate = new Date(dob);
-    if (isNaN(birthDate.getTime())) return res.status(400).json({ error: "Invalid date of birth" });
+    if (isNaN(birthDate.getTime()))
+      return res.status(400).json({ error: "Invalid date of birth" });
+
     const today = new Date();
     let age = today.getFullYear() - birthDate.getFullYear();
-    if (today.getMonth() < birthDate.getMonth() || (today.getMonth() === birthDate.getMonth() && today.getDate() < birthDate.getDate())) age--;
-    if (age < 1 || age > 130) return res.status(400).json({ error: "Invalid age" });
+    if (
+      today.getMonth() < birthDate.getMonth() ||
+      (today.getMonth() === birthDate.getMonth() &&
+        today.getDate() < birthDate.getDate())
+    ) {
+      age--;
+    }
 
-    if (TURNSTILE_SECRET_KEY && captchaToken) { if (!await verifyTurnstile(captchaToken)) return res.status(403).json({ error: "Security verification failed" }); } 
-    else if (TURNSTILE_SECRET_KEY && !captchaToken) return res.status(403).json({ error: "Security verification required" });
+    if (age < 1 || age > 130)
+      return res.status(400).json({ error: "Invalid age" });
 
-    const emailCheck = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
-    const usernameCheck = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [username]);
-    if (emailCheck.rows.length && usernameCheck.rows.length) return res.status(409).json({ error: "Email and username already taken" });
-    if (emailCheck.rows.length) return res.status(409).json({ error: "Email already registered" });
-    if (usernameCheck.rows.length) return res.status(409).json({ error: "Username already taken" });
+    // =========================
+    // TURNSTILE VERIFY
+    // =========================
+    if (TURNSTILE_SECRET_KEY) {
+      if (!captchaToken) {
+        return res
+          .status(403)
+          .json({ error: "Security verification required" });
+      }
+
+      const ip =
+        req.headers["x-forwarded-for"]?.split(",")[0] ||
+        req.socket.remoteAddress;
+
+      const valid = await verifyTurnstile(captchaToken, ip);
+      if (!valid) {
+        return res
+          .status(403)
+          .json({ error: "Security verification failed" });
+      }
+    }
+
+    const emailCheck = await pool.query(
+      "SELECT id FROM users WHERE email = $1",
+      [email]
+    );
+
+    const usernameCheck = await pool.query(
+      "SELECT id FROM users WHERE LOWER(username) = LOWER($1)",
+      [username]
+    );
+
+    if (emailCheck.rows.length && usernameCheck.rows.length)
+      return res
+        .status(409)
+        .json({ error: "Email and username already taken" });
+
+    if (emailCheck.rows.length)
+      return res.status(409).json({ error: "Email already registered" });
+
+    if (usernameCheck.rows.length)
+      return res.status(409).json({ error: "Username already taken" });
 
     let profileUrl = null;
+
     if (profile_url && profile_url.startsWith("data:") && s3) {
       try {
-        const matches = profile_url.match(/^data:(image\/\w+);base64,(.+)$/);
-        if (matches && matches[1] && matches[2]) {
-          const buffer = await sharp(Buffer.from(matches[2], "base64")).resize(400, 400, { fit: "cover", withoutEnlargement: true }).rotate().jpeg({ quality: 85 }).toBuffer();
+        const matches = profile_url.match(
+          /^data:(image\/\w+);base64,(.+)$/
+        );
+
+        if (matches) {
+          const buffer = await sharp(
+            Buffer.from(matches[2], "base64")
+          )
+            .resize(400, 400, { fit: "cover", withoutEnlargement: true })
+            .rotate()
+            .jpeg({ quality: 85 })
+            .toBuffer();
+
           const s3Key = `profile-pics/${Date.now()}-${username}.jpg`;
-          await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET_NAME, Key: s3Key, Body: buffer, ContentType: "image/jpeg" }));
+
+          await s3.send(
+            new PutObjectCommand({
+              Bucket: S3_BUCKET_NAME,
+              Key: s3Key,
+              Body: buffer,
+              ContentType: "image/jpeg",
+            })
+          );
+
           profileUrl = `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`;
         }
-      } catch (s3Err) { console.error("Profile pic S3 upload failed:", s3Err.message); }
+      } catch (err) {
+        console.error("Profile upload failed:", err.message);
+      }
     }
 
     const password_hash = await argon2.hash(password);
     const isKid = age <= 12;
-    const { rows } = await pool.query(`INSERT INTO users (username, email, password_hash, dob, profile_url, role, preferences) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, username, email, role, profile_url, dob, preferences`, [username, email, password_hash, dob, profileUrl, isKid ? "kid" : "free", isKid ? { kids_mode: true, restricted: true } : {}]);
-    
-    ensureCreatorStats(rows[0].id);
-    if (transporter) transporter.sendMail({ from: `"MintZa" <${EMAIL_USER}>`, to: email, subject: "Welcome to MintZa!", html: `<h1>Welcome!</h1>` }).catch(() => {});
-    
-    pool.query(`INSERT INTO security_logs (event_type, user_id, ip_address, details) VALUES ($1, $2, $3, $4)`, ["register", rows[0].id, req.headers["x-forwarded-for"], { provider: "email" }]).catch(() => {});
 
-    res.status(201).json({ user: rows[0], token: jwt.sign({ id: rows[0].id }, JWT_SECRET, { expiresIn: "7d" }) });
-  } catch (err) { 
-    console.error("Register error:", err); 
-    if (err.code === "23505") return res.status(409).json({ error: "Account already exists" });
-    res.status(500).json({ error: "Registration failed" }); 
+    const { rows } = await pool.query(
+      `INSERT INTO users (username, email, password_hash, dob, profile_url, role, preferences)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, username, email, role, profile_url, dob, preferences`,
+      [
+        username,
+        email,
+        password_hash,
+        dob,
+        profileUrl,
+        isKid ? "kid" : "free",
+        isKid ? { kids_mode: true, restricted: true } : {},
+      ]
+    );
+
+    ensureCreatorStats(rows[0].id);
+
+    if (transporter) {
+      transporter
+        .sendMail({
+          from: `"MintZa" <${EMAIL_USER}>`,
+          to: email,
+          subject: "Welcome to MintZa!",
+          html: `<h1>Welcome!</h1>`,
+        })
+        .catch(() => {});
+    }
+
+    pool
+      .query(
+        `INSERT INTO security_logs (event_type, user_id, ip_address, details)
+         VALUES ($1, $2, $3, $4)`,
+        [
+          "register",
+          rows[0].id,
+          req.headers["x-forwarded-for"],
+          { provider: "email" },
+        ]
+      )
+      .catch(() => {});
+
+    res.status(201).json({
+      user: rows[0],
+      token: jwt.sign({ id: rows[0].id }, JWT_SECRET, {
+        expiresIn: "7d",
+      }),
+    });
+  } catch (err) {
+    console.error("Register error:", err);
+
+    if (err.code === "23505")
+      return res.status(409).json({ error: "Account already exists" });
+
+    res.status(500).json({ error: "Registration failed" });
   }
 });
 
 // --- LOGIN ---
 app.post("/api/auth/login", checkBan, async (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: "Email and password required" });
-    const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
-    if (!rows.length) return res.status(401).json({ error: "Invalid credentials" });
+    const { email, password, captchaToken } = req.body;
+
+    if (!email || !password)
+      return res
+        .status(400)
+        .json({ error: "Email and password required" });
+
+    // =========================
+    // TURNSTILE VERIFY (FIXED)
+    // =========================
+    if (TURNSTILE_SECRET_KEY) {
+      if (!captchaToken) {
+        return res
+          .status(403)
+          .json({ error: "Security verification required" });
+      }
+
+      const ip =
+        req.headers["x-forwarded-for"]?.split(",")[0] ||
+        req.socket.remoteAddress;
+
+      const valid = await verifyTurnstile(captchaToken, ip);
+      if (!valid) {
+        return res
+          .status(403)
+          .json({ error: "Security verification failed" });
+      }
+    }
+
+    const { rows } = await pool.query(
+      "SELECT * FROM users WHERE email = $1",
+      [email]
+    );
+
+    if (!rows.length)
+      return res.status(401).json({ error: "Invalid credentials" });
+
     const user = rows[0];
-    if (!user.password_hash) return res.status(401).json({ error: "Use OAuth to login" });
-    if (!await argon2.verify(user.password_hash, password)) return res.status(401).json({ error: "Invalid credentials" });
-    
-    await pool.query("UPDATE users SET last_login_at = NOW(), failed_login_count = 0 WHERE id = $1", [user.id]);
+
+    if (!user.password_hash)
+      return res.status(401).json({ error: "Use OAuth to login" });
+
+    const validPass = await argon2.verify(
+      user.password_hash,
+      password
+    );
+
+    if (!validPass)
+      return res.status(401).json({ error: "Invalid credentials" });
+
+    await pool.query(
+      "UPDATE users SET last_login_at = NOW(), failed_login_count = 0 WHERE id = $1",
+      [user.id]
+    );
+
     const { password_hash, ...safeUser } = user;
-    res.json({ user: safeUser, token: jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "7d" }) });
-  } catch (err) { res.status(500).json({ error: "Login failed" }); }
+
+    res.json({
+      user: safeUser,
+      token: jwt.sign({ id: user.id }, JWT_SECRET, {
+        expiresIn: "7d",
+      }),
+    });
+  } catch (err) {
+    console.error("Login error:", err);
+    res.status(500).json({ error: "Login failed" });
+  }
 });
 
 // OAuth Routes
