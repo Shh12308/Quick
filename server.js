@@ -355,6 +355,107 @@ async function detectInappropriateContent(imagePath) {
   }
 }
 
+async function checkHiveAI(imagePath) {
+  if (!process.env.HIVE_API_KEY) return { allowed: true, reason: "Hive Missing" };
+  try {
+    const formData = new FormData();
+    formData.append('media', fs.createReadStream(imagePath));
+    
+    // Models: nudity-2.0, gore, hate
+    formData.append('models', 'nudity-2.0,gore,hate');
+
+    const response = await axios.post(
+      'https://api.thehive.ai/api/v2/task/sync',
+      formData,
+      {
+        headers: formData.getHeaders(),
+        headers: { 'Authorization': `Bearer ${process.env.HIVE_API_KEY}` }
+      }
+    );
+
+    const data = response.data;
+    // Check Nudity
+    if (data.response && data.response['nudity-2.0']) {
+      // If 'sexual_display' or 'erotica' or 'pornography' is high
+      if (data.response['nudity-2.0'].probability > 0.8) {
+        return { allowed: false, reason: "Hive: NSFW Content Detected" };
+      }
+    }
+    // Check Gore
+    if (data.response && data.response.gore && data.response.gore.probability > 0.8) {
+      return { allowed: false, reason: "Hive: Gore Detected" };
+    }
+
+    return { allowed: true };
+  } catch (err) {
+    console.error("Hive Error:", err.message);
+    return { allowed: true }; // Fail open
+  }
+}
+
+// 2. SIGHTENGINE
+async function checkSightengine(imagePath) {
+  if (!process.env.SIGHTENGINE_USER) return { allowed: true, reason: "Sightengine Missing" };
+  try {
+    const formData = new FormData();
+    formData.append('media', fs.createReadStream(imagePath));
+    formData.append('models', 'nudity,wad,gore');
+    
+    const response = await axios.post(
+      'https://api.sightengine.com/1.0/check.json',
+      formData,
+      {
+        headers: formData.getHeaders(),
+        auth: { username: process.env.SIGHTENGINE_USER, password: process.env.SIGHTENGINE_SECRET }
+      }
+    );
+
+    const data = response.data;
+    
+    if (data.nudity && (data.nudity.pornography > 0.8 || data.nudity.sexual_display > 0.8)) {
+      return { allowed: false, reason: "Sightengine: Nudity Detected" };
+    }
+    if (data.gore && data.gore.prob > 0.7) {
+      return { allowed: false, reason: "Sightengine: Gore Detected" };
+    }
+    if (data.weapon && data.weapon.weapon > 0.8) {
+      return { allowed: false, reason: "Sightengine: Weapon Detected" };
+    }
+    
+    return { allowed: true };
+  } catch (err) {
+    console.error("Sightengine Error:", err.message);
+    return { allowed: true };
+  }
+}
+
+// 3. DEEP AI
+async function checkDeepAI(imagePath) {
+  if (!process.env.DEEP_AI_KEY) return { allowed: true, reason: "DeepAI Missing" };
+  try {
+    const formData = new FormData();
+    formData.append('image', fs.createReadStream(imagePath));
+
+    const response = await axios.post(
+      'https://api.deepai.org/api/nsfw-detector',
+      formData,
+      {
+        headers: formData.getHeaders(),
+        headers: { 'api-key': process.env.DEEP_AI_KEY }
+      }
+    );
+
+    const score = response.data.output?.nsfw_score;
+    if (score && score > 0.6) {
+      return { allowed: false, reason: "DeepAI: Inappropriate Content" };
+    }
+    return { allowed: true };
+  } catch (err) {
+    console.error("DeepAI Error:", err.message);
+    return { allowed: true };
+  }
+}
+
 /**
  * PROGRESSIVE BAN SYSTEM
  * 1. 2 Weeks
@@ -993,13 +1094,18 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), 
 // ==========================================
 // VIDEO UPLOAD & MODERATION
 // ==========================================
+// ... inside server.js
+
 app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const { title, description, category, is_short, tags, is_public } = req.body;
     const userId = req.user.id;
+    const { title, description, category, is_short, tags, is_public } = req.body;
+
+    // Emit Start
+    io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Running Checks: Hive AI', progress: 0 });
 
     if (!req.files?.video) {
       await client.query('ROLLBACK');
@@ -1014,11 +1120,10 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
     let thumbnailPath = req.files?.thumbnail?.[0]?.path;
     let thumbFileName = req.files?.thumbnail?.[0]?.filename;
 
-    // If no thumbnail provided, generate one using ffmpeg for moderation & storage
+    // Generate thumbnail if needed
     if (!thumbnailPath) {
       thumbFileName = `thumb-${Date.now()}.jpg`;
       thumbnailPath = path.join(UPLOAD_DIR, 'thumbnails', thumbFileName);
-      
       await new Promise((resolve, reject) => {
         ffmpeg(videoFile.path)
           .setFfmpegPath(ffmpegPath)
@@ -1033,37 +1138,64 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
       });
     }
 
-    // --- CONTENT MODERATION CHECK (DEEP AI) ---
-    console.log(`Checking content for user ${userId}...`);
-    const moderationResult = await detectInappropriateContent(thumbnailPath);
-
-    if (!moderationResult.allowed) {
-      // Clean up files
+    // --- STEP 1: HIVE AI ---
+    console.log(`Checking Hive AI for user ${userId}...`);
+    io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Checking Hive AI...', progress: 25 });
+    const hiveResult = await checkHiveAI(thumbnailPath);
+    if (!hiveResult.allowed) {
       fs.unlinkSync(videoFile.path);
-      if (thumbnailPath && fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
-
-      // Handle Violation (Progressive Ban Logic)
-      await handleContentViolation(userId, moderationResult.reason, client);
-      
-      await client.query('ROLLBACK'); // Rollback transaction as we are failing
-      return res.status(403).json({ 
-        error: "Inappropriate Content Detected", 
-        reason: moderationResult.reason,
-        message: "Your account has been flagged for a violation. Check your email for details."
-      });
+      if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+      await handleContentViolation(userId, hiveResult.reason, client);
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: "Violation Detected", reason: hiveResult.reason });
     }
 
-    // --- PROCESS UPLOAD ---
-    const videoKey = `videos/${userId}/${Date.now()}-${videoFile.originalname}`;
-    const videoUrl = await uploadToS3(videoFile, videoKey, videoFile.mimetype);
+    // --- STEP 2: DEEP AI ---
+    console.log(`Checking DeepAI for user ${userId}...`);
+    io.to(`user-${userId}`).emit('upload-status', { step: 2, status: 'Checking DeepAI...', progress: 50 });
+    const deepResult = await checkDeepAI(thumbnailPath);
+    if (!deepResult.allowed) {
+      fs.unlinkSync(videoFile.path);
+      if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+      await handleContentViolation(userId, deepResult.reason, client);
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: "Violation Detected", reason: deepResult.reason });
+    }
 
-    // Upload Thumbnail to S3
+    // --- STEP 3: SIGHTENGINE ---
+    console.log(`Checking Sightengine for user ${userId}...`);
+    io.to(`user-${userId}`).emit('upload-status', { step: 3, status: 'Checking Sightengine...', progress: 75 });
+    const sightResult = await checkSightengine(thumbnailPath);
+    if (!sightResult.allowed) {
+      fs.unlinkSync(videoFile.path);
+      if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+      await handleContentViolation(userId, sightResult.reason, client);
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: "Violation Detected", reason: sightResult.reason });
+    }
+
+    // --- STEP 4: UPLOAD TO AWS S3 ---
+    console.log(`Uploading to S3 for user ${userId}...`);
+    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Uploading to Cloud...', progress: 0 }); // Reset progress for bar 4
+
+    const videoKey = `videos/${userId}/${Date.now()}-${videoFile.originalname}`;
+    // For real S3 progress, we usually need the AWS SDK v3 managed upload event listeners
+    // For this demo, we will do a quick loop to simulate progress events to frontend
+    const videoUrl = await uploadToS3(videoFile, videoKey, videoFile.mimetype);
+    
+    // Simulate progress fill for S3 bar (since simple upload waits till end)
+    // In production, use onHttpUploadProgress from AWS SDK
+    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Finalizing...', progress: 90 });
+    
     let thumbnailUrl = `https://placehold.co/1280x720?text=${encodeURIComponent(title || 'Video')}`;
     if (thumbnailPath) {
       const thumbKey = `thumbnails/${userId}/${Date.now()}-${thumbFileName}`;
       thumbnailUrl = await uploadToS3({ path: thumbnailPath }, thumbKey, 'image/jpeg');
     }
 
+    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Finished', progress: 100 });
+
+    // DB INSERT
     const isShortBoolean = is_short === 'true';
     const tagsJson = typeof tags === 'string' ? tags : JSON.parse(tags || "{}");
     const tagsString = JSON.stringify(tagsJson); 
