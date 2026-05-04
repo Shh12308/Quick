@@ -68,7 +68,7 @@ const {
   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME,
   OPENAI_API_KEY,
   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
-  DEEP_AI_KEY,
+  DEEP_AI_KEY, // Used for Video Moderation
   TURNSTILE_SECRET_KEY,
   IPINFO_TOKEN,
   REDIS_URL
@@ -218,7 +218,7 @@ io.on("connection", (socket) => {
 // ==========================================
 async function initializeTables() {
   try {
-    // 1. Users Table - Added warning_count, bio, location, website
+    // 1. Users Table
     await pool.query(`CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY, 
       username VARCHAR(255) UNIQUE NOT NULL, 
@@ -258,7 +258,7 @@ async function initializeTables() {
     await pool.query(`CREATE TABLE IF NOT EXISTS security_logs (id SERIAL PRIMARY KEY, event_type VARCHAR(50) NOT NULL, user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, ip_address VARCHAR(45), device_id VARCHAR(255), details JSONB, created_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS creator_stats (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, total_likes INTEGER DEFAULT 0, total_follows INTEGER DEFAULT 0, total_views INTEGER DEFAULT 0, total_tips DECIMAL(10,2) DEFAULT 0, total_merch_sales INTEGER DEFAULT 0, earnings DECIMAL(10,2) DEFAULT 0, updated_at TIMESTAMP DEFAULT NOW())`);
     
-    // 2. Unified Moderation Tables
+    // 2. Moderation Tables
     await pool.query(`CREATE TABLE IF NOT EXISTS chat_moderation (
       user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
       chat_id TEXT, 
@@ -290,8 +290,8 @@ async function initializeTables() {
     await pool.query(`CREATE TABLE IF NOT EXISTS content_reactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, reaction_type VARCHAR(10), created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_id, content_type))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS comments (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE, content TEXT NOT NULL, likes INTEGER DEFAULT 0, dislikes INTEGER DEFAULT 0, replies_count INTEGER DEFAULT 0, is_pinned BOOLEAN DEFAULT false, is_deleted BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS notifications (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL, type VARCHAR(50) NOT NULL, title VARCHAR(255), message TEXT, data JSON, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS likes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_id))`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS dislikes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS likes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_type))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS dislikes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_type))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS livestreams (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(255) NOT NULL, description TEXT, category VARCHAR(100), thumbnail_url VARCHAR(500), stream_key VARCHAR(255) UNIQUE NOT NULL, is_live BOOLEAN DEFAULT false, is_scheduled BOOLEAN DEFAULT false, scheduled_start TIMESTAMP, viewers INTEGER DEFAULT 0, peak_viewers INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, shares INTEGER DEFAULT 0, duration INTEGER, recording_url VARCHAR(500), chat_enabled BOOLEAN DEFAULT true, delay_seconds INTEGER DEFAULT 0, tags JSON, earnings DECIMAL(10, 2) DEFAULT 0, started_at TIMESTAMP, ended_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS email_confirmations (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, token VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMP NOT NULL, created_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS stripe_events (id SERIAL PRIMARY KEY, event_id TEXT UNIQUE NOT NULL, processed_at TIMESTAMP DEFAULT NOW())`);
@@ -320,13 +320,127 @@ async function initializeTables() {
 // --- Helpers ---
 
 // ==========================================
-// MODERATION HELPERS
+// VIDEO CONTENT MODERATION (DEEP AI)
 // ==========================================
+async function detectInappropriateContent(imagePath) {
+  if (!DEEP_AI_KEY) return { allowed: true, reason: "Moderation Service Unavailable" };
+
+  try {
+    // Read file as buffer for upload
+    const imageBuffer = await fs.promises.readFile(imagePath);
+    const formData = new FormData();
+    formData.append('image', new Blob([imageBuffer]), 'image.jpg');
+
+    const response = await axios.post('https://api.deepai.org/api/nsfw-detector', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+        'api-key': DEEP_AI_KEY
+      }
+    });
+
+    const score = response.data.output?.nsfw_score;
+
+    // Threshold > 0.5 (50% confidence)
+    if (score && score > 0.5) {
+      // Map reasons based on high score
+      return { allowed: false, reason: "Nudity or Gore detected" };
+    }
+    
+    return { allowed: true };
+
+  } catch (err) {
+    console.error("Video moderation error:", err.message);
+    // Fail safe to true to prevent blocking uploads if API is down
+    return { allowed: true }; 
+  }
+}
 
 /**
- * Checks if a user is globally banned before allowing access.
- * Checks Device ID, Email, and Username against blacklist.
+ * PROGRESSIVE BAN SYSTEM
+ * 1. 2 Weeks
+ * 2. 4 Weeks
+ * 3. 2 Months
+ * 4. Permanent Ban (Email, User, Phone, Device ID)
  */
+async function handleContentViolation(userId, reason, client = pool) {
+  const db = client || pool; 
+  try {
+    // Get user details
+    const { rows } = await db.query(
+      `SELECT username, email, phone, device_id, warning_count FROM users WHERE id = $1`,
+      [userId]
+    );
+    
+    if (!rows.length) throw new Error("User not found");
+    const user = rows[0];
+    
+    // Increment warning count
+    const newWarningCount = (user.warning_count || 0) + 1;
+    const now = new Date();
+    let suspendUntil = null;
+    let actionMessage = "";
+    let isPermanentBan = false;
+
+    // Determine Punishment
+    switch (newWarningCount) {
+      case 1:
+        suspendUntil = new Date(now.getTime() + (14 * 24 * 60 * 60 * 1000)); // 2 Weeks
+        actionMessage = "Account suspended for 2 weeks.";
+        break;
+      case 2:
+        suspendUntil = new Date(now.getTime() + (28 * 24 * 60 * 60 * 1000)); // 4 Weeks
+        actionMessage = "Account suspended for 4 weeks.";
+        break;
+      case 3:
+        suspendUntil = new Date(now.getTime() + (60 * 24 * 60 * 60 * 1000)); // 2 Months
+        actionMessage = "Account suspended for 2 months.";
+        break;
+      default: // >= 4
+        isPermanentBan = true;
+        actionMessage = "Account permanently banned.";
+        break;
+    }
+
+    // Execute Updates
+    await db.query(`UPDATE users SET warning_count = $1, suspend_until = $2, status = $3, updated_at = NOW() WHERE id = $4`, 
+      [newWarningCount, suspendUntil, isPermanentBan ? 'banned' : 'suspended', userId]
+    );
+
+    // Send Notification
+    await db.query(`
+      INSERT INTO notifications (user_id, type, title, message, data) 
+      VALUES ($1, 'warning', 'Community Guidelines Violation', $2, $3)
+    `, [userId, `${actionMessage} Reason: ${reason}`, { warnings: newWarningCount, reason }]);
+
+    // If Permanent Ban, blacklist identifiers
+    if (isPermanentBan) {
+      const identifiers = [user.email, user.username, user.phone, user.device_id].filter(Boolean);
+      for (const id of identifiers) {
+        try {
+          await db.query(`INSERT INTO banned_devices (identifier, reason) VALUES ($1, $2) ON CONFLICT (identifier) DO NOTHING`,
+            [id, `Permanent Ban: ${reason}`]);
+        } catch (e) {}
+      }
+    }
+
+    return {
+      success: true,
+      warningCount: newWarningCount,
+      suspendUntil,
+      isBanned: isPermanentBan,
+      message: actionMessage
+    };
+
+  } catch (err) {
+    console.error("Error in handleContentViolation:", err);
+    throw err;
+  }
+}
+
+// ==========================================
+// OTHER MODERATION HELPERS
+// ==========================================
+
 async function checkBan(req, res, next) {
   try {
     const deviceId = req.headers['x-device-id'] || req.body.device_id;
@@ -363,118 +477,40 @@ async function checkTextModeration(text, userId) {
   }
 }
 
-/**
- * Logic to prevent media sharing between Adults and Minors.
- * Fetches user DOB. Checks age. 
- * If Mixed (Adult vs Minor), return false.
- */
 async function isMediaAllowed(userId, chatId) {
-  try {
-    // Fetch user DOB
-    const { rows: userRows } = await pool.query("SELECT dob FROM users WHERE id = $1", [userId]);
-    const user = userRows[0];
-    const senderAge = user.dob ? new Date().getFullYear() - new Date(user.dob).getFullYear() : 99;
-    const isSenderAdult = senderAge >= 18;
-
-    // Fetch participants (Simplified: In real app, query 'chats' table for participants array)
-    // Since we don't have the full chat schema here, we assume a safe default or fail safe.
-    // To implement strictly: Fetch chat participants -> Check ages -> Return false if mixed.
-    // For now, we assume safe if sender is adult > 18 or just a mock.
-    return true; 
-  } catch (err) { return true; }
+  // Simplified logic for demo
+  return true; 
 }
 
 /**
- * Issues a warning. If 3 warnings, triggers Global Ban logic.
- * Increments user.warning_count.
- */
-async function issueGlobalWarning(userId, reason, client) {
-  const db = client || pool; 
-  try {
-    const { rows } = await db.query(
-      `UPDATE users SET warning_count = warning_count + 1, updated_at = NOW() 
-       WHERE id = $1 
-       RETURNING warning_count, email, phone, username, device_id`,
-      [userId]
-    );
-    if (!rows.length) return { banned: false };
-    const user = rows[0];
-    const warnings = user.warning_count;
-
-    await db.query(`
-      INSERT INTO notifications (user_id, type, title, message, data) 
-      VALUES ($1, 'warning', 'Safety Violation', $2, $3)
-    `, [userId, `Warning ${warnings}/5: ${reason}`, { warnings }]);
-
-    if (warnings >= 5) {
-      const identifiers = [user.email, user.phone, user.username, user.device_id].filter(Boolean);
-      
-      await db.query(`UPDATE users SET status = 'banned' WHERE id = $1`, [userId]);
-      
-      for (let id of identifiers) {
-        try {
-          await db.query(`
-            INSERT INTO banned_devices (identifier, reason) 
-            VALUES ($1, $2)
-            ON CONFLICT (identifier) DO NOTHING
-          `, [id, `Global Ban: 5 Warnings Reached`]);
-        } catch (e) {}
-      }
-      return { banned: true, warnings, message: "Account Banned due to 5 warnings." };
-    }
-    return { banned: false, warnings };
-  } catch (err) { console.error("Error issuing global warning:", err); throw err; }
-}
-
-/**
- * Handles Chat Specific Violations.
- * 1. Increments warning in chat_moderation.
- * 2. If warnings 1 or 2 -> Suspend Chat (14 days).
- * 3. -> Suspend Account.
- * 4. Calls globalWarning.
+ * Handles Chat Specific Violations (Text based)
+ * Uses the same progressive ban system
  */
 async function handleChatViolation(userId, chatId, reason) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // 1. Chat Level Warning
+    
+    // Update Chat Moderation table (Log it there too)
     const { rows } = await client.query(
       `SELECT * FROM chat_moderation WHERE user_id = $1 AND chat_id = $2`,
       [userId, chatId]
     );
     let warnings = rows.length ? rows[0].warning_count : 0;
     warnings++;
-    const now = new Date();
-    let suspensionEnd = null;
-    let chatAction = "";
-
-    if (warnings === 1 || warnings === 2) {
-      suspensionEnd = new Date(now.getTime() + (14 * 24 * 60 * 60 * 1000));
-      chatAction = "Chat Suspended 14 days.";
-    } else if (warnings >= 3) {
-      suspensionEnd = new Date(now.getTime() + (14 * 24 * 60 * 60 * 1000));
-      chatAction = "Account Suspended.";
-      await client.query(`UPDATE users SET status = 'suspended' WHERE id = $1`, [userId]);
-    }
 
     await client.query(`
-      INSERT INTO chat_moderation (user_id, chat_id, warning_count, chat_suspended_until, last_warning_at)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO chat_moderation (user_id, chat_id, warning_count, last_warning_at)
+      VALUES ($1, $2, $3, NOW())
       ON CONFLICT (user_id, chat_id) 
-      DO UPDATE SET warning_count = $3, chat_suspended_until = $4, last_warning_at = $5
-    `, [userId, chatId, warnings, suspensionEnd, now]);
+      DO UPDATE SET warning_count = $3, last_warning_at = NOW()
+    `, [userId, chatId, warnings]);
 
-    await client.query(`
-      INSERT INTO notifications (user_id, type, title, message, data)
-      VALUES ($1, 'warning', 'Chat Violation', $2, $3)
-    `, [userId, chatAction, { reason, warnings }]);
-
-    // 2. Global Warning
-    const globalResult = await issueGlobalWarning(userId, reason, client);
+    // Call Global Progressive Ban Logic
+    const result = await handleContentViolation(userId, reason, client);
 
     await client.query('COMMIT');
-    return { allowed: false, message: globalResult.banned ? globalResult.message : chatAction, isBanned: globalResult.banned };
+    return { allowed: false, message: result.message, isBanned: result.isBanned };
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -483,7 +519,6 @@ async function handleChatViolation(userId, chatId, reason) {
   }
 }
 
-// Original Helpers
 function generateAgoraToken(channelName, userId) {
   if (!RtcTokenBuilder || !AGORA_APP_ID || !AGORA_APP_CERTIFICATE) return null;
   const role = RtcRole.PUBLISHER;
@@ -803,6 +838,8 @@ app.get("/api/me/restrictions", authMiddleware, async (req, res) => {
 
     res.json({
       isBanned,
+      suspendUntil: userRows[0].suspend_until, // Account level suspension
+      warningCount: userRows[0].warning_count,
       chatRestrictions
     });
   } catch (err) {
@@ -816,39 +853,16 @@ app.post("/api/forgot-password", async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: "Email is required" });
-
-    // Check if user exists
     const { rows } = await pool.query("SELECT id, email FROM users WHERE email = $1", [email]);
-
-    // Security: Always return success to prevent email enumeration
     if (rows.length > 0) {
       const code = Math.floor(100000 + Math.random() * 900000).toString();
-      const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
-
-      // Save code to DB
-      await pool.query(
-        `INSERT INTO password_resets (email, code, expires_at) VALUES ($1, $2, $3)`,
-        [email, code, expiresAt]
-      );
-
-      // Send Email
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+      await pool.query(`INSERT INTO password_resets (email, code, expires_at) VALUES ($1, $2, $3)`, [email, code, expiresAt]);
       if (transporter) {
-        const mailOptions = {
-          from: `"MintZa" <${EMAIL_USER}>`,
-          to: email,
-          subject: "Your Password Reset Code",
-          text: `Your verification code is ${code}. It will expire in 15 minutes.`
-        };
-        try {
-          await transporter.sendMail(mailOptions);
-        } catch (mailErr) {
-          console.error("Error sending email:", mailErr);
-        }
-      } else {
-        console.warn("Email transporter not configured. Code not sent:", code);
+        const mailOptions = { from: `"MintZa" <${EMAIL_USER}>`, to: email, subject: "Your Password Reset Code", text: `Your verification code is ${code}. It will expire in 15 minutes.` };
+        try { await transporter.sendMail(mailOptions); } catch (mailErr) { console.error("Error sending email:", mailErr); }
       }
     }
-
     res.json({ message: "If an account with that email exists, a code has been sent." });
   } catch (err) {
     console.error("Forgot password error:", err);
@@ -860,18 +874,8 @@ app.post("/api/verify-code", async (req, res) => {
   try {
     const { email, code } = req.body;
     if (!email || !code) return res.status(400).json({ error: "Email and code required" });
-
-    const { rows } = await pool.query(
-      `SELECT * FROM password_resets 
-       WHERE email = $1 AND code = $2 AND expires_at > NOW() 
-       ORDER BY created_at DESC LIMIT 1`,
-      [email, code]
-    );
-
-    if (rows.length === 0) {
-      return res.status(400).json({ error: "Invalid or expired code." });
-    }
-
+    const { rows } = await pool.query(`SELECT * FROM password_resets WHERE email = $1 AND code = $2 AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1`, [email, code]);
+    if (rows.length === 0) return res.status(400).json({ error: "Invalid or expired code." });
     res.json({ message: "Code verified." });
   } catch (err) {
     console.error("Verify code error:", err);
@@ -882,37 +886,13 @@ app.post("/api/verify-code", async (req, res) => {
 app.post("/api/reset-password", async (req, res) => {
   try {
     const { email, code, newPassword } = req.body;
-    if (!email || !code || !newPassword) {
-      return res.status(400).json({ error: "Missing fields" });
-    }
-    if (newPassword.length < 8) {
-      return res.status(400).json({ error: "Password must be at least 8 characters" });
-    }
-
-    // Verify code one last time before resetting
-    const { rows } = await pool.query(
-      `SELECT * FROM password_resets 
-       WHERE email = $1 AND code = $2 AND expires_at > NOW() 
-       ORDER BY created_at DESC LIMIT 1`,
-      [email, code]
-    );
-
-    if (rows.length === 0) {
-      return res.status(400).json({ error: "Invalid or expired code." });
-    }
-
-    // Hash new password
+    if (!email || !code || !newPassword) return res.status(400).json({ error: "Missing fields" });
+    if (newPassword.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+    const { rows } = await pool.query(`SELECT * FROM password_resets WHERE email = $1 AND code = $2 AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1`, [email, code]);
+    if (rows.length === 0) return res.status(400).json({ error: "Invalid or expired code." });
     const password_hash = await argon2.hash(newPassword);
-
-    // Update user password
-    await pool.query(
-      "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE email = $2",
-      [password_hash, email]
-    );
-
-    // Clean up used codes
+    await pool.query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE email = $2", [password_hash, email]);
     await pool.query("DELETE FROM password_resets WHERE email = $1", [email]);
-
     res.json({ message: "Password reset successfully." });
   } catch (err) {
     console.error("Reset password error:", err);
@@ -920,23 +900,16 @@ app.post("/api/reset-password", async (req, res) => {
   }
 });
 
-// --- GET USER CONTENT (NEW) ---
+// --- GET USER CONTENT ---
 app.get("/api/users/:username/content", async (req, res) => {
   try {
     const { username } = req.params;
     const { rows: userRows } = await pool.query("SELECT id FROM users WHERE username = $1", [username]);
     if (!userRows.length) return res.status(404).json({ error: "User not found" });
-    
     const userId = userRows[0].id;
-
     const { rows: videos } = await pool.query("SELECT * FROM videos WHERE user_id = $1 AND is_public = true AND is_short = false ORDER BY created_at DESC LIMIT 20", [userId]);
     const { rows: shorts } = await pool.query("SELECT * FROM videos WHERE user_id = $1 AND is_public = true AND is_short = true ORDER BY created_at DESC LIMIT 20", [userId]);
-    
-    // Mock music/reposts for now as table schemas weren't fully provided
-    const music = []; 
-    const reposts = [];
-    const likes = [];
-
+    const music = []; const reposts = []; const likes = [];
     res.json({ videos, shorts, music, reposts, likes });
   } catch (err) { res.status(500).json({ error: "Failed to fetch content" }); }
 });
@@ -946,26 +919,10 @@ app.get("/api/users/:username", async (req, res) => {
   try {
     const { username } = req.params;
     const { rows } = await pool.query("SELECT id, username, profile_url, cover_url, bio, location, website, is_verified, is_creator, is_musician, dob, created_at FROM users WHERE username = $1", [username]);
-    
     if (!rows.length) return res.status(404).json({ error: "Not found" });
-
     const user = rows[0];
-    
-    // Calculate is_kid for frontend
     const isKid = user.dob ? (new Date().getFullYear() - new Date(user.dob).getFullYear() <= 12) : false;
-
-    res.json({ 
-      user: { 
-        ...user, 
-        is_kid: isKid,
-        displayName: user.username // Map username to displayName for frontend consistency
-      },
-      stories: [],
-      highlights: [],
-      followers: [],
-      following: [],
-      isFollowing: false
-    });
+    res.json({ user: { ...user, is_kid: isKid, displayName: user.username }, stories: [], highlights: [], followers: [], following: [], isFollowing: false });
   } catch (err) { res.status(500).json({ error: "Error" }); }
 });
 
@@ -974,40 +931,31 @@ app.post("/api/users/:username/follow", authMiddleware, async (req, res) => {
   try {
     const { username } = req.params;
     const userId = req.user.id;
-    
     const { rows: target } = await pool.query("SELECT id FROM users WHERE username = $1", [username]);
     if (!target.length) return res.status(404).json({ error: "User not found" });
     const targetId = target[0].id;
-
-    // Using chat_moderation table to store simple follow status for now (can create dedicated follows table later)
     const { rows: exists } = await pool.query("SELECT 1 FROM chat_moderation WHERE user_id = $1 AND chat_id = $2", [userId, `follow-${targetId}`]); 
-    
-    // Toggle follow logic would go here. For now, simple response.
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: "Failed" }); }
 });
 
-// --- CHAT MESSAGES (UPDATED WITH MODERATION) ---
+// --- CHAT MESSAGES (UPDATED WITH PROGRESSIVE BAN) ---
 app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), async (req, res) => {
   const { chatId } = req.params;
   const { content, type } = req.body;
   const userId = req.user.id;
 
   try {
-    // 1. Check Suspension (Chat Level)
-    const { rows: suspCheck } = await pool.query(
-      `SELECT chat_suspended_until FROM chat_moderation WHERE user_id = $1 AND chat_id = $2`,
-      [userId, chatId]
-    );
-    if (suspCheck.length > 0 && suspCheck[0].chat_suspended_until && new Date(suspCheck[0].chat_suspended_until) > new Date()) {
-      return res.status(403).json({ error: "You are suspended from this chat.", until: suspCheck[0].chat_suspended_until });
+    // 1. Check Suspension
+    const { rows: userStatus } = await pool.query("SELECT suspend_until, status FROM users WHERE id = $1", [userId]);
+    const uStatus = userStatus[0];
+
+    if (uStatus.status === 'banned') return res.status(403).json({ error: "Account Permanently Banned", type: "banned" });
+    if (uStatus.suspend_until && new Date(uStatus.suspend_until) > new Date()) {
+      return res.status(403).json({ error: "Account Suspended", type: "suspended", until: uStatus.suspend_until });
     }
 
-    // 2. Check Global Status
-    const { rows: userStatus } = await pool.query("SELECT status FROM users WHERE id = $1", [userId]);
-    if (userStatus[0].status !== 'active') return res.status(403).json({ error: `Account is ${userStatus[0].status}.` });
-
-    // 3. Adult/Minor Media Restriction
+    // 2. Adult/Minor Check
     const mediaTypes = ['image', 'video', 'gif', 'audio', 'voice']; 
     const isMedia = mediaTypes.includes(type) || req.file;
     if (isMedia) {
@@ -1015,7 +963,7 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), 
       if (!mediaAllowed) return res.status(403).json({ error: "Restricted. Media disabled between Adults and Minors." });
     }
 
-    // 4. Text Moderation
+    // 3. Text Moderation (OpenAI)
     if (content) {
       const moderationResult = await checkTextModeration(content, userId);
       if (!moderationResult.allowed) {
@@ -1024,7 +972,7 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), 
       }
     }
 
-    // 5. Send Message
+    // 4. Send Message
     let mediaUrl = null; 
     let messageType = type === 'text' ? 'text' : 'media';
     if (req.file) {
@@ -1042,49 +990,99 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), 
   } catch (err) { console.error(err); res.status(500).json({ error: "Failed to send" }); }
 });
 
-// --- CONTENT ---
+// ==========================================
+// VIDEO UPLOAD & MODERATION
+// ==========================================
 app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
     const { title, description, category, is_short, tags, is_public } = req.body;
     const userId = req.user.id;
 
-    if (!req.files?.video) return res.status(400).json({ error: "Video file required" });
-    if (!s3) return res.status(500).json({ error: "S3 not configured" });
+    if (!req.files?.video) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: "Video file required" });
+    }
+    if (!s3) {
+      await client.query('ROLLBACK');
+      return res.status(500).json({ error: "S3 not configured" });
+    }
 
-    // 1. Process Video File
     const videoFile = req.files.video[0];
+    let thumbnailPath = req.files?.thumbnail?.[0]?.path;
+    let thumbFileName = req.files?.thumbnail?.[0]?.filename;
+
+    // If no thumbnail provided, generate one using ffmpeg for moderation & storage
+    if (!thumbnailPath) {
+      thumbFileName = `thumb-${Date.now()}.jpg`;
+      thumbnailPath = path.join(UPLOAD_DIR, 'thumbnails', thumbFileName);
+      
+      await new Promise((resolve, reject) => {
+        ffmpeg(videoFile.path)
+          .setFfmpegPath(ffmpegPath)
+          .screenshots({
+            count: 1,
+            folder: path.join(UPLOAD_DIR, 'thumbnails'),
+            filename: thumbFileName,
+            size: '1280x720'
+          })
+          .on('end', resolve)
+          .on('error', reject);
+      });
+    }
+
+    // --- CONTENT MODERATION CHECK (DEEP AI) ---
+    console.log(`Checking content for user ${userId}...`);
+    const moderationResult = await detectInappropriateContent(thumbnailPath);
+
+    if (!moderationResult.allowed) {
+      // Clean up files
+      fs.unlinkSync(videoFile.path);
+      if (thumbnailPath && fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+
+      // Handle Violation (Progressive Ban Logic)
+      await handleContentViolation(userId, moderationResult.reason, client);
+      
+      await client.query('ROLLBACK'); // Rollback transaction as we are failing
+      return res.status(403).json({ 
+        error: "Inappropriate Content Detected", 
+        reason: moderationResult.reason,
+        message: "Your account has been flagged for a violation. Check your email for details."
+      });
+    }
+
+    // --- PROCESS UPLOAD ---
     const videoKey = `videos/${userId}/${Date.now()}-${videoFile.originalname}`;
     const videoUrl = await uploadToS3(videoFile, videoKey, videoFile.mimetype);
 
-    // 2. Process Thumbnail (if provided)
+    // Upload Thumbnail to S3
     let thumbnailUrl = `https://placehold.co/1280x720?text=${encodeURIComponent(title || 'Video')}`;
-    if (req.files?.thumbnail?.[0]) {
-      const thumbFile = req.files.thumbnail[0];
-      const thumbKey = `thumbnails/${userId}/${Date.now()}-${thumbFile.originalname}`;
-      thumbnailUrl = await uploadToS3(thumbFile, thumbKey, thumbFile.mimetype);
+    if (thumbnailPath) {
+      const thumbKey = `thumbnails/${userId}/${Date.now()}-${thumbFileName}`;
+      thumbnailUrl = await uploadToS3({ path: thumbnailPath }, thumbKey, 'image/jpeg');
     }
 
-    // 3. Prepare Data
-    // FIX: Pre-calculate these variables so we can use them cleanly in the SQL
-    const isShortBoolean = is_short === 'true'; // Explicitly ensure boolean type for DB
-    const tagsJson = typeof tags === 'string' ? tags : JSON.parse(tags || "{}"); // Parse JSON if it's a string from frontend
-    
-    // FIX: Serialize tags to JSON string here, NOT inside the query
+    const isShortBoolean = is_short === 'true';
+    const tagsJson = typeof tags === 'string' ? tags : JSON.parse(tags || "{}");
     const tagsString = JSON.stringify(tagsJson); 
-    const isPublic = is_public === 'true'; // Ensure boolean
+    const isPublic = is_public === 'true';
 
-    // 4. Database Insert
-    const { rows } = await pool.query(
+    const { rows } = await client.query(
       `INSERT INTO videos (user_id, title, description, video_url, thumbnail_url, category, is_short, processing_status, tags, is_public) VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', $8, $9, $10) RETURNING *`,
-      [
-        userId, title, description, videoUrl, thumbnailUrl, category, isShortBoolean, "processing", tagsString, isPublic
-      ]
+      [userId, title, description, videoUrl, thumbnailUrl, category, isShortBoolean, "processing", tagsString, isPublic]
     );
 
+    await client.query('COMMIT');
     res.status(201).json({ video: rows[0] });
+
   } catch (err) { 
     console.error("Upload error:", err); 
+    await client.query('ROLLBACK');
     res.status(500).json({ error: "Upload failed" }); 
+  } finally {
+    if (client) client.release();
   }
 });
 
@@ -1116,13 +1114,8 @@ app.get("/api/videos/:id/ad-tag", authMiddleware, async (req, res) => {
     const { rows } = await pool.query("SELECT duration, is_short, monetization_enabled FROM videos WHERE id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "Video not found" });
     const video = rows[0];
-
-    if (req.user.role && req.user.role !== 'free') {
-      return res.json({ vastUrl: null, isPremium: true });
-    }
-
+    if (req.user.role && req.user.role !== 'free') return res.json({ vastUrl: null, isPremium: true });
     if (video.is_short || !video.monetization_enabled || (video.duration && video.duration < 60)) return res.json({ vastUrl: null });
-
     const providers = ["google", "freewheel", "roku"];
     const provider = providers[Math.floor(Math.random() * providers.length)];
     let vastUrl = provider === "google" 
@@ -1214,41 +1207,31 @@ app.post("/api/livestreams", authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed to start stream" }); }
 });
 
-// --- ELITE PRIVACY ALERTS ---
 app.post("/api/elite/trigger-alert", authMiddleware, async (req, res) => {
   try {
     if (req.user.role !== 'elite') return res.status(403).json({ error: "This feature is for Elite members only." });
     const { alertType, details } = req.body;
     const alertPayload = { id: uuidv4(), type: alertType || 'screenshot', message: details || "Someone took a screenshot of your content.", timestamp: new Date() };
-    
     const targetUserId = req.body.targetUserId || req.user.id; 
-    
     io.to(`user-${targetUserId}`).emit("privacy_alert", alertPayload);
     res.json({ success: true, alert: alertPayload });
   } catch (err) { console.error("Elite alert error:", err); res.status(500).json({ error: "Failed to send alert" }); }
 });
 
-// --- ADMIN/USER SETTINGS (NEW) ---
 app.get("/api/admin/users", adminMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT id, username, email, status, warning_count FROM users ORDER BY created_at DESC LIMIT 100");
     res.json({ users: rows });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch users" });
-  }
+  } catch (err) { res.status(500).json({ error: "Failed to fetch users" }); }
 });
 
 app.post("/api/admin/warn-user/:id", adminMiddleware, async (req, res) => {
   try {
     const userId = parseInt(req.params.id);
     const { reason } = req.body;
-    
-    // Force a warning which triggers global ban logic (if >= 5)
-    const result = await issueGlobalWarning(userId, reason);
+    const result = await handleContentViolation(userId, reason);
     res.json({ result });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to warn user" });
-  }
+  } catch (err) { res.status(500).json({ error: "Failed to warn user" }); }
 });
 
 app.use((req, res) => { res.status(404).json({ error: "Route not found" }); });
@@ -1258,10 +1241,8 @@ app.use((err, req, res, next) => { console.error("Unhandled error:", err); res.s
 // SERVER STARTUP
 // ==========================================
 (async () => {
-  // 1. Listen on port BEFORE connecting to DB
   server.listen(PORT, '0.0.0.0', () => { console.log(`🚀 Server running on port ${PORT}`); });
 
-  // 2. Initialize services in the background
   try {
     if (DATABASE_URL) {
        await initializeTables();
