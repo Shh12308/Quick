@@ -590,6 +590,60 @@ app.get("/api/videos", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed to fetch videos" }); } 
 });
 
+app.get("/api/user/access", async (req, res) => {
+
+  try {
+
+    const auth = req.headers.authorization;
+
+    if (!auth) {
+
+      return res.status(401).json({ error: "No token" });
+
+    }
+
+    const token = auth.split(" ")[1];
+
+    // ✅ verify token
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    // ✅ fetch user
+
+    const result = await pool.query(
+
+      `SELECT username, is_kid FROM users WHERE id = $1`,
+
+      [decoded.id]
+
+    );
+
+    if (result.rows.length === 0) {
+
+      return res.status(404).json({ error: "User not found" });
+
+    }
+
+    const user = result.rows[0];
+
+    res.json({
+
+      username: user.username,
+
+      is_kid: user.is_kid,
+
+    });
+
+  } catch (err) {
+
+    console.error("Access route error:", err);
+
+    res.status(401).json({ error: "Invalid token" });
+
+  }
+
+});
+
 app.get("/api/videos/:id", async (req, res) => { 
   try { 
     const { rows } = await pool.query(`SELECT v.*, u.username, u.profile_url FROM videos v JOIN users u ON v.user_id = u.id WHERE v.id = $1`, [req.params.id]); 
