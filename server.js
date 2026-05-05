@@ -35,7 +35,8 @@ import {
   S3Client, 
   GetObjectCommand, 
   PutObjectCommand, 
-  DeleteObjectCommand 
+  DeleteObjectCommand,
+  HeadObjectCommand
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { 
@@ -66,12 +67,14 @@ const {
   FRONTEND_URL, ADMIN_KEY,
   AGORA_APP_ID, AGORA_APP_CERTIFICATE,
   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME,
+  AWS_CLOUDFRONT_DOMAIN,  // NEW: CDN domain for faster media delivery
   OPENAI_API_KEY,
   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
   DEEP_AI_KEY, 
   TURNSTILE_SECRET_KEY,
   IPINFO_TOKEN,
-  REDIS_URL
+  REDIS_URL,
+  SIGNED_URL_EXPIRY  // NEW: Configurable presigned URL expiry (seconds)
 } = process.env;
 
 const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET', 'SESSION_SECRET'];
@@ -156,14 +159,12 @@ pool.on('error', (err) => { console.error('PostgreSQL Pool Error:', err.message)
 // ==========================================
 let pubClient = null;
 let subClient = null;
-let redisConnected = false;
 
 if (REDIS_URL) {
   try {
     const isTLS = REDIS_URL.startsWith("rediss://");
     pubClient = createClient({ url: REDIS_URL, socket: { tls: isTLS ? { rejectUnauthorized: false } : undefined } });
     subClient = pubClient.duplicate();
-    
     pubClient.on('error', (err) => console.error('Redis Pub Client Error:', err.message));
     subClient.on('error', (err) => console.error('Redis Sub Client Error:', err.message));
   } catch (err) {
@@ -175,9 +176,10 @@ if (REDIS_URL) {
 const cache = new NodeCache({ stdTTL: 600 });
 
 // ==========================================
-// MISC SETUP
+// AWS S3 + CLOUDFRONT SETUP
 // ==========================================
 const { RtcRole, RtcTokenBuilder } = pkg || {};
+
 const s3 = AWS_REGION && AWS_ACCESS_KEY_ID ? new S3Client({ 
   region: AWS_REGION,
   credentials: { accessKeyId: AWS_ACCESS_KEY_ID, secretAccessKey: AWS_SECRET_ACCESS_KEY }
@@ -276,14 +278,50 @@ async function initializeTables() {
     )`);
 
     await pool.query(`CREATE TABLE IF NOT EXISTS chats (id SERIAL PRIMARY KEY, creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(10), name VARCHAR(255), avatar TEXT, participants INTEGER[] DEFAULT '{}', admin_id INTEGER REFERENCES users(id), pinned_by INTEGER[] DEFAULT '{}', muted_by JSONB DEFAULT '{}', last_message_id INTEGER, last_message_at TIMESTAMP, is_archived BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, chat_id TEXT, sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(20), content TEXT, media_url TEXT, is_deleted BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, chat_id TEXT, sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(20), content TEXT, media_url TEXT, thumbnail_url TEXT, is_deleted BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS message_reactions (id SERIAL PRIMARY KEY, message_id TEXT, user_id INTEGER REFERENCES users(id), reaction TEXT, created_at TIMESTAMP DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS videos (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(255) NOT NULL, description TEXT, video_url VARCHAR(500) NOT NULL, thumbnail_url VARCHAR(500), duration INTEGER, tags JSON, category VARCHAR(100), is_public BOOLEAN DEFAULT true, is_short BOOLEAN DEFAULT false, processing_status VARCHAR(20) DEFAULT 'pending', views INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, dislikes INTEGER DEFAULT 0, comments_count INTEGER DEFAULT 0, shares INTEGER DEFAULT 0, earnings DECIMAL(10, 2) DEFAULT 0, content_rating VARCHAR(10) DEFAULT 'general', language VARCHAR(10) DEFAULT 'en', transcription TEXT, auto_captions JSON, custom_captions JSON, download_allowed BOOLEAN DEFAULT true, monetization_enabled BOOLEAN DEFAULT true, ad_breaks JSON, featured BOOLEAN DEFAULT false, trending_score DECIMAL(10, 2) DEFAULT 0, recommendation_score DECIMAL(10, 2) DEFAULT 0, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
+    
+    // Videos table with s3_key fields for deletion support
+    await pool.query(`CREATE TABLE IF NOT EXISTS videos (
+      id SERIAL PRIMARY KEY, 
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
+      title VARCHAR(255) NOT NULL, 
+      description TEXT, 
+      video_url VARCHAR(500) NOT NULL, 
+      video_s3_key VARCHAR(500),
+      thumbnail_url VARCHAR(500), 
+      thumbnail_s3_key VARCHAR(500),
+      duration INTEGER, 
+      tags JSON, 
+      category VARCHAR(100), 
+      is_public BOOLEAN DEFAULT true, 
+      is_short BOOLEAN DEFAULT false, 
+      processing_status VARCHAR(20) DEFAULT 'pending', 
+      views INTEGER DEFAULT 0, 
+      likes INTEGER DEFAULT 0, 
+      dislikes INTEGER DEFAULT 0, 
+      comments_count INTEGER DEFAULT 0, 
+      shares INTEGER DEFAULT 0, 
+      earnings DECIMAL(10, 2) DEFAULT 0, 
+      content_rating VARCHAR(10) DEFAULT 'general', 
+      language VARCHAR(10) DEFAULT 'en', 
+      transcription TEXT, 
+      auto_captions JSON, 
+      custom_captions JSON, 
+      download_allowed BOOLEAN DEFAULT true, 
+      monetization_enabled BOOLEAN DEFAULT true, 
+      ad_breaks JSON, 
+      featured BOOLEAN DEFAULT false, 
+      trending_score DECIMAL(10, 2) DEFAULT 0, 
+      recommendation_score DECIMAL(10, 2) DEFAULT 0, 
+      created_at TIMESTAMP DEFAULT NOW(), 
+      updated_at TIMESTAMP DEFAULT NOW()
+    )`);
+    
     await pool.query(`CREATE TABLE IF NOT EXISTS content_reactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, reaction_type VARCHAR(10), created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_id, content_type))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS comments (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE, content TEXT NOT NULL, likes INTEGER DEFAULT 0, dislikes INTEGER DEFAULT 0, replies_count INTEGER DEFAULT 0, is_pinned BOOLEAN DEFAULT false, is_deleted BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS notifications (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL, type VARCHAR(50) NOT NULL, title VARCHAR(255), message TEXT, data JSON, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`);
     
-    // FIXED: UNIQUE constraint was using content_type twice instead of content_id
     await pool.query(`CREATE TABLE IF NOT EXISTS likes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_id))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS dislikes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_id))`);
     
@@ -295,7 +333,7 @@ async function initializeTables() {
     await pool.query(`CREATE TABLE IF NOT EXISTS user_subscriptions (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, tier_id INTEGER REFERENCES subscription_tiers(id) ON DELETE SET NULL, stripe_subscription_id TEXT, status TEXT, current_period_start TIMESTAMP, current_period_end TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), amount DECIMAL(10,2), status TEXT, type TEXT, created_at TIMESTAMP DEFAULT NOW())`);
     
-    // ADDED: Music table required by the /api/music/upload route
+    // Music table with s3_key fields
     await pool.query(`CREATE TABLE IF NOT EXISTS music (
       id SERIAL PRIMARY KEY, 
       user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
@@ -305,7 +343,10 @@ async function initializeTables() {
       genre VARCHAR(100), 
       is_explicit BOOLEAN DEFAULT false, 
       audio_url VARCHAR(500) NOT NULL, 
+      audio_s3_key VARCHAR(500),
       cover_url VARCHAR(500), 
+      cover_s3_key VARCHAR(500),
+      duration INTEGER DEFAULT 0,
       tags JSON, 
       plays INTEGER DEFAULT 0,
       likes INTEGER DEFAULT 0,
@@ -330,6 +371,216 @@ async function initializeTables() {
 }
 
 // ==========================================
+// AWS S3 HELPERS (Complete Media System)
+// ==========================================
+
+/**
+ * Build the public URL for an S3 key.
+ * Uses CloudFront if configured, otherwise falls back to direct S3 URL.
+ */
+function buildMediaUrl(key) {
+  if (AWS_CLOUDFRONT_DOMAIN) {
+    return `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`;
+  }
+  return `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+}
+
+/**
+ * Upload a file to S3 with caching headers.
+ * Deletes the local temp file after upload.
+ * Returns { url, s3Key }
+ */
+async function uploadToS3(file, key, mimeType, cacheControl = null) {
+  if (!s3 || !S3_BUCKET_NAME) throw new Error("S3 not configured");
+  
+  const fileContent = await fs.promises.readFile(file.path);
+  let buffer = fileContent;
+  
+  // Auto-process images with sharp
+  if (mimeType.startsWith('image/')) {
+    buffer = await sharp(fileContent).rotate().toBuffer();
+  }
+  
+  const params = {
+    Bucket: S3_BUCKET_NAME,
+    Key: key,
+    Body: buffer, 
+    ContentType: mimeType,
+  };
+  
+  // Add cache control for CDN optimization
+  if (cacheControl) {
+    params.CacheControl = cacheControl;
+  } else {
+    // Default: cache for 1 year (immutable media files)
+    params.CacheControl = 'public, max-age=31536000, immutable';
+  }
+  
+  await s3.send(new PutObjectCommand(params));
+  
+  // Clean up local temp file
+  try { await fs.promises.unlink(file.path); } catch (e) {}
+  
+  return {
+    url: buildMediaUrl(key),
+    s3Key: key
+  };
+}
+
+/**
+ * Upload a Buffer directly to S3 (for base64 profile pics, etc.)
+ */
+async function uploadBufferToS3(buffer, key, mimeType) {
+  if (!s3 || !S3_BUCKET_NAME) throw new Error("S3 not configured");
+  
+  await s3.send(new PutObjectCommand({
+    Bucket: S3_BUCKET_NAME,
+    Key: key,
+    Body: buffer, 
+    ContentType: mimeType,
+    CacheControl: 'public, max-age=31536000, immutable'
+  }));
+  
+  return {
+    url: buildMediaUrl(key),
+    s3Key: key
+  };
+}
+
+/**
+ * Delete a file from S3 by its key
+ */
+async function deleteFromS3(key) {
+  if (!s3 || !S3_BUCKET_NAME || !key) return;
+  try {
+    await s3.send(new DeleteObjectCommand({
+      Bucket: S3_BUCKET_NAME,
+      Key: key
+    }));
+    console.log(`🗑️  Deleted S3 object: ${key}`);
+  } catch (err) {
+    console.error(`Failed to delete S3 object ${key}:`, err.message);
+  }
+}
+
+/**
+ * Generate a presigned URL for secure, temporary access to a private S3 object.
+ * Use this for premium content or private media.
+ */
+async function generatePresignedUrl(key, expiresInSeconds = 3600) {
+  if (!s3 || !S3_BUCKET_NAME || !key) return null;
+  
+  const expiry = parseInt(SIGNED_URL_EXPIRY) || expiresInSeconds;
+  
+  const command = new GetObjectCommand({
+    Bucket: S3_BUCKET_NAME,
+    Key: key
+  });
+  
+  return await getSignedUrl(s3, command, { expiresIn: expiry });
+}
+
+/**
+ * Process and upload an image at multiple sizes.
+ * Returns { full, thumbnail, medium }
+ */
+async function processAndUploadImage(filePath, userId, purpose = 'generic') {
+  if (!s3 || !S3_BUCKET_NAME) throw new Error("S3 not configured");
+  
+  const results = {};
+  const timestamp = Date.now();
+  const baseKey = `${purpose}/${userId}/${timestamp}`;
+  
+  // Full size (max 1920px wide)
+  const fullBuffer = await sharp(filePath)
+    .rotate()
+    .resize(1920, null, { withoutEnlargement: true, fit: 'inside' })
+    .jpeg({ quality: 90 })
+    .toBuffer();
+  
+  const fullKey = `${baseKey}-full.jpg`;
+  await uploadBufferToS3(fullBuffer, fullKey, 'image/jpeg');
+  results.full = { url: buildMediaUrl(fullKey), s3Key: fullKey };
+  
+  // Medium (max 640px wide) - for feeds/lists
+  const mediumBuffer = await sharp(filePath)
+    .rotate()
+    .resize(640, null, { withoutEnlargement: true, fit: 'inside' })
+    .jpeg({ quality: 80 })
+    .toBuffer();
+  
+  const mediumKey = `${baseKey}-medium.jpg`;
+  await uploadBufferToS3(mediumBuffer, mediumKey, 'image/jpeg');
+  results.medium = { url: buildMediaUrl(mediumKey), s3Key: mediumKey };
+  
+  // Thumbnail (max 320px wide) - for search/previews
+  const thumbBuffer = await sharp(filePath)
+    .rotate()
+    .resize(320, null, { withoutEnlargement: true, fit: 'inside' })
+    .jpeg({ quality: 70 })
+    .toBuffer();
+  
+  const thumbKey = `${baseKey}-thumb.jpg`;
+  await uploadBufferToS3(thumbBuffer, thumbKey, 'image/jpeg');
+  results.thumbnail = { url: buildMediaUrl(thumbKey), s3Key: thumbKey };
+  
+  // Clean up local file
+  try { await fs.promises.unlink(filePath); } catch (e) {}
+  
+  return results;
+}
+
+/**
+ * Get video duration using ffprobe
+ */
+function getVideoDuration(filePath) {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err || !metadata?.format?.duration) {
+        resolve(null);
+      } else {
+        resolve(Math.round(parseFloat(metadata.format.duration)));
+      }
+    });
+  });
+}
+
+/**
+ * Get audio duration using ffprobe
+ */
+function getAudioDuration(filePath) {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err || !metadata?.format?.duration) {
+        resolve(0);
+      } else {
+        resolve(Math.round(parseFloat(metadata.format.duration)));
+      }
+    });
+  });
+}
+
+/**
+ * Extract a thumbnail from a video at a specific timestamp
+ */
+function extractVideoThumbnail(videoPath, timestampSec = 1) {
+  return new Promise((resolve, reject) => {
+    const thumbPath = videoPath.replace(/\.[^/.]+$/, '-thumb.jpg');
+    
+    ffmpeg(videoPath)
+      .setFfmpegPath(ffmpegPath)
+      .screenshots({
+        timestamps: [timestampSec],
+        filename: path.basename(thumbPath),
+        folder: path.dirname(thumbPath),
+        size: '1280x720'
+      })
+      .on('end', () => resolve(thumbPath))
+      .on('error', (err) => reject(err));
+  });
+}
+
+// ==========================================
 // MODERATION HELPERS
 // ==========================================
 
@@ -340,7 +591,6 @@ async function checkHiveAI(imagePath) {
     formData.append('media', fs.createReadStream(imagePath));
     formData.append('models', 'nudity-2.0,gore,hate');
 
-    // FIXED: Merged headers properly (was duplicate keys)
     const response = await axios.post(
       'https://api.thehive.ai/api/v2/task/sync',
       formData,
@@ -375,8 +625,6 @@ async function checkSightengine(imagePath) {
     const formData = new FormData();
     formData.append('media', fs.createReadStream(imagePath));
     formData.append('models', 'nudity,wad,gore');
-    
-    // FIXED: Sightengine uses form fields for auth, not HTTP auth
     formData.append('api_user', process.env.SIGHTENGINE_USER);
     formData.append('api_secret', process.env.SIGHTENGINE_SECRET);
 
@@ -431,6 +679,25 @@ async function checkDeepAI(imagePath) {
     console.error("DeepAI Error:", err.message);
     return { allowed: true };
   }
+}
+
+/**
+ * Run all 3 moderation checks on an image path
+ */
+async function runAllModerationChecks(imagePath, userId) {
+  // 1. Hive AI
+  const hiveResult = await checkHiveAI(imagePath);
+  if (!hiveResult.allowed) return hiveResult;
+
+  // 2. DeepAI
+  const deepResult = await checkDeepAI(imagePath);
+  if (!deepResult.allowed) return deepResult;
+
+  // 3. Sightengine
+  const sightResult = await checkSightengine(imagePath);
+  if (!sightResult.allowed) return sightResult;
+
+  return { allowed: true };
 }
 
 /**
@@ -592,43 +859,59 @@ const transporter = EMAIL_HOST && EMAIL_USER ? nodemailer.createTransport({
   auth: { user: EMAIL_USER, pass: EMAIL_PASS } 
 }) : null;
 
+// ==========================================
+// MULTER SETUP
+// ==========================================
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
+// Create subdirectories for each media type
+const MEDIA_DIRS = {
+  video: path.join(UPLOAD_DIR, 'videos'),
+  thumbnail: path.join(UPLOAD_DIR, 'thumbnails'),
+  audio: path.join(UPLOAD_DIR, 'audio'),
+  cover: path.join(UPLOAD_DIR, 'covers'),
+  image: path.join(UPLOAD_DIR, 'images'),
+  voice: path.join(UPLOAD_DIR, 'voice'),
+  profile: path.join(UPLOAD_DIR, 'profile'),
+};
+Object.values(MEDIA_DIRS).forEach(dir => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => { 
-    const dir = path.join(UPLOAD_DIR, file.fieldname === 'thumbnail' ? 'thumbnails' : 'uploads'); 
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); 
+    const dirMap = {
+      video: MEDIA_DIRS.video,
+      thumbnail: MEDIA_DIRS.thumbnail,
+      audio: MEDIA_DIRS.audio,
+      cover: MEDIA_DIRS.cover,
+      image: MEDIA_DIRS.image,
+      voice: MEDIA_DIRS.voice,
+      profile: MEDIA_DIRS.profile,
+      media: MEDIA_DIRS.image,  // generic chat media
+    };
+    const dir = dirMap[file.fieldname] || MEDIA_DIRS.image;
     cb(null, dir); 
   },
-  filename: (req, file, cb) => { cb(null, `${Date.now()}-${file.fieldname}${path.extname(file.originalname)}`); },
+  filename: (req, file, cb) => { 
+    const ext = path.extname(file.originalname);
+    cb(null, `${Date.now()}-${file.fieldname}${ext}`); 
+  },
 });
 
 export const upload = multer({ 
   storage, 
-  limits: { fileSize: 100 * 1024 * 1024 }, 
+  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB for large videos
   fileFilter: (req, file, cb) => { 
-    const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'video/webm', 'video/ogg', 'audio/mpeg', 'audio/wav', 'audio/webm', 'audio/ogg', 'audio/mp4']; 
+    const allowed = [
+      'image/jpeg', 'image/png', 'image/gif', 'image/webp', 
+      'video/mp4', 'video/webm', 'video/ogg', 'video/quicktime',
+      'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/webm', 'audio/mp4'
+    ]; 
     cb(null, allowed.includes(file.mimetype)); 
   } 
 });
-
-async function uploadToS3(file, key, mimeType) {
-  if (!s3 || !S3_BUCKET_NAME) throw new Error("S3 not configured");
-  const fileContent = await fs.promises.readFile(file.path);
-  let buffer = fileContent;
-  if (mimeType.startsWith('image/')) {
-    buffer = await sharp(fileContent).rotate().toBuffer();
-  }
-  await s3.send(new PutObjectCommand({
-    Bucket: S3_BUCKET_NAME,
-    Key: key,
-    Body: buffer, 
-    ContentType: mimeType
-  }));
-  await fs.promises.unlink(file.path);
-  return `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
-}
 
 async function ensureCreatorStats(userId) { 
   try { 
@@ -751,10 +1034,10 @@ if (GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET) {
 app.get("/api/health", async (req, res) => {
   try {
     if (!DATABASE_URL) {
-      return res.status(503).json({ status: "degraded", database: "disconnected", message: "DATABASE_URL missing" });
+      return res.status(503).json({ status: "degraded", database: "disconnected", s3: !!s3, cdn: !!AWS_CLOUDFRONT_DOMAIN });
     }
     await pool.query("SELECT 1");
-    res.json({ status: "ok", timestamp: new Date().toISOString() });
+    res.json({ status: "ok", timestamp: new Date().toISOString(), s3: !!s3, cdn: !!AWS_CLOUDFRONT_DOMAIN });
   } catch (err) {
     res.status(503).json({ status: "error", database: "error", message: err.message });
   }
@@ -784,7 +1067,10 @@ app.post("/auth/check-vpn", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed to check VPN status" }); }
 });
 
-// --- REGISTER ---
+// ==========================================
+// AUTH ROUTES
+// ==========================================
+
 app.post("/api/auth/register", checkBan, async (req, res) => {
   try {
     const { username, email, password, dob, captchaToken, profile_url } = req.body;
@@ -824,8 +1110,8 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
         if (matches) {
           const buffer = await sharp(Buffer.from(matches[2], "base64")).resize(400, 400, { fit: "cover", withoutEnlargement: true }).rotate().jpeg({ quality: 85 }).toBuffer();
           const s3Key = `profile-pics/${Date.now()}-${username}.jpg`;
-          await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET_NAME, Key: s3Key, Body: buffer, ContentType: "image/jpeg" }));
-          profileUrl = `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`;
+          const result = await uploadBufferToS3(buffer, s3Key, 'image/jpeg');
+          profileUrl = result.url;
         }
       } catch (err) { console.error("Profile upload failed:", err.message); }
     }
@@ -857,7 +1143,6 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
   }
 });
 
-// --- LOGIN ---
 app.post("/api/auth/login", checkBan, async (req, res) => {
   try {
     const { email, password, captchaToken } = req.body;
@@ -1003,7 +1288,8 @@ app.get("/api/users/:username/content", async (req, res) => {
     const userId = userRows[0].id;
     const { rows: videos } = await pool.query("SELECT * FROM videos WHERE user_id = $1 AND is_public = true AND is_short = false ORDER BY created_at DESC LIMIT 20", [userId]);
     const { rows: shorts } = await pool.query("SELECT * FROM videos WHERE user_id = $1 AND is_public = true AND is_short = true ORDER BY created_at DESC LIMIT 20", [userId]);
-    res.json({ videos, shorts, music: [], reposts: [], likes: [] });
+    const { rows: musicRows } = await pool.query("SELECT * FROM music WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20", [userId]);
+    res.json({ videos, shorts, music: musicRows, reposts: [], likes: [] });
   } catch (err) { res.status(500).json({ error: "Failed to fetch content" }); }
 });
 
@@ -1019,7 +1305,7 @@ app.get("/api/users/:username", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Error" }); }
 });
 
-// --- FOLLOW/UNFOLLOW (FIXED) ---
+// --- FOLLOW ---
 app.post("/api/users/:username/follow", authMiddleware, async (req, res) => {
   try {
     const { username } = req.params;
@@ -1027,7 +1313,6 @@ app.post("/api/users/:username/follow", authMiddleware, async (req, res) => {
     const { rows: target } = await pool.query("SELECT id FROM users WHERE username = $1", [username]);
     if (!target.length) return res.status(404).json({ error: "User not found" });
     const targetId = target[0].id;
-    
     if (userId === targetId) return res.status(400).json({ error: "Cannot follow yourself" });
     
     await pool.query(
@@ -1048,8 +1333,10 @@ app.post("/api/users/:username/follow", authMiddleware, async (req, res) => {
   }
 });
 
-// --- CHAT MESSAGES ---
-app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), async (req, res) => {
+// ==========================================
+// CHAT MESSAGES (with full media upload)
+// ==========================================
+app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('media'), async (req, res) => {
   const { chatId } = req.params;
   const { content, type } = req.body;
   const userId = req.user.id;
@@ -1063,13 +1350,7 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), 
       return res.status(403).json({ error: "Account Suspended", type: "suspended", until: uStatus.suspend_until });
     }
 
-    const mediaTypes = ['image', 'video', 'gif', 'audio', 'voice']; 
-    const isMedia = mediaTypes.includes(type) || req.file;
-    if (isMedia) {
-      const mediaAllowed = await isMediaAllowed(userId, chatId);
-      if (!mediaAllowed) return res.status(403).json({ error: "Restricted. Media disabled between Adults and Minors." });
-    }
-
+    // Text moderation
     if (content) {
       const moderationResult = await checkTextModeration(content, userId);
       if (!moderationResult.allowed) {
@@ -1079,20 +1360,100 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('voice'), 
     }
 
     let mediaUrl = null; 
-    let messageType = type === 'text' ? 'text' : 'media';
+    let thumbnailUrl = null;
+    let messageType = type || 'text';
+
+    // Handle file upload (images, videos, voice notes)
     if (req.file) {
       if (!s3) return res.status(500).json({ error: "S3 not configured" });
-      const voiceKey = `voice-msgs/${chatId}/${Date.now()}.webm`;
-      mediaUrl = await uploadToS3(req.file, voiceKey, req.file.mimetype);
-      messageType = 'audio';
-    } else if (content && (type === 'gif' || type === 'image' || type === 'video')) {
+      
+      const file = req.file;
+      const timestamp = Date.now();
+      
+      if (file.mimetype.startsWith('image/')) {
+        // Process image at multiple sizes
+        const imageResults = await processAndUploadImage(file.path, userId, 'chat-media');
+        mediaUrl = imageResults.full.url;
+        thumbnailUrl = imageResults.thumbnail.url;
+        messageType = 'image';
+      } else if (file.mimetype.startsWith('video/')) {
+        // Upload video
+        const videoKey = `chat-media/videos/${userId}/${timestamp}-${file.originalname}`;
+        const videoResult = await uploadToS3(file, videoKey, file.mimetype);
+        mediaUrl = videoResult.url;
+        
+        // Extract thumbnail
+        try {
+          const thumbPath = await extractVideoThumbnail(file.path, 1);
+          const thumbKey = `chat-media/thumbs/${userId}/${timestamp}-thumb.jpg`;
+          const thumbResult = await uploadToS3({ path: thumbPath }, thumbKey, 'image/jpeg');
+          thumbnailUrl = thumbResult.url;
+        } catch (e) {
+          // Thumbnail extraction failed, continue without it
+        }
+        messageType = 'video';
+      } else if (file.mimetype.startsWith('audio/')) {
+        // Upload audio/voice
+        const audioKey = `chat-media/audio/${userId}/${timestamp}-${file.originalname}`;
+        const audioResult = await uploadToS3(file, audioKey, file.mimetype);
+        mediaUrl = audioResult.url;
+        messageType = file.fieldname === 'voice' ? 'voice' : 'audio';
+      }
+    } else if (content && (type === 'gif' || type === 'image')) {
        mediaUrl = content; 
+       messageType = 'gif';
     }
     
-    const { rows } = await pool.query(`INSERT INTO chat_messages (chat_id, sender_id, content, media_url, type) VALUES ($1, $2, $3, $4, $5) RETURNING *`, [chatId, userId, (messageType === 'text') ? content : null, mediaUrl, messageType]);
+    const { rows } = await pool.query(
+      `INSERT INTO chat_messages (chat_id, sender_id, content, media_url, thumbnail_url, type) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, 
+      [chatId, userId, messageType === 'text' ? content : null, mediaUrl, thumbnailUrl, messageType]
+    );
+    
     io.to(`chat-${chatId}`).emit("new-message", rows[0]);
+    
+    // Update chat's last_message_at
+    await pool.query(`UPDATE chats SET last_message_at = NOW(), last_message_id = $1 WHERE id = $2`, [rows[0].id, parseInt(chatId)]).catch(() => {});
+    
     res.status(201).json({ message: rows[0] });
-  } catch (err) { console.error(err); res.status(500).json({ error: "Failed to send" }); }
+  } catch (err) { 
+    console.error("Chat message error:", err); 
+    res.status(500).json({ error: "Failed to send" }); 
+  }
+});
+
+// ==========================================
+// IMAGE UPLOAD (Generic - Profile, Cover, Posts)
+// ==========================================
+app.post("/api/upload/image", authMiddleware, upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Image file required" });
+    if (!s3) return res.status(500).json({ error: "S3 not configured" });
+
+    const userId = req.user.id;
+    const { purpose } = req.body; // 'profile', 'cover', 'post', 'generic'
+    const folder = purpose || 'images';
+
+    // Run moderation on the image
+    const moderationResult = await runAllModerationChecks(req.file.path, userId);
+    if (!moderationResult.allowed) {
+      try { fs.unlinkSync(req.file.path); } catch (e) {}
+      await handleContentViolation(userId, moderationResult.reason);
+      return res.status(403).json({ error: "Violation Detected", reason: moderationResult.reason });
+    }
+
+    // Process and upload at multiple sizes
+    const results = await processAndUploadImage(req.file.path, userId, folder);
+
+    res.status(201).json({
+      success: true,
+      full: results.full,
+      medium: results.medium,
+      thumbnail: results.thumbnail,
+    });
+  } catch (err) {
+    console.error("Image upload error:", err);
+    res.status(500).json({ error: "Upload failed" });
+  }
 });
 
 // ==========================================
@@ -1106,7 +1467,7 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
     const userId = req.user.id;
     const { title, description, category, is_short, tags, is_public } = req.body;
 
-    io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Running Checks: Hive AI', progress: 0 });
+    io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Running Checks', progress: 0 });
 
     if (!req.files?.video) {
       await client.query('ROLLBACK');
@@ -1118,83 +1479,71 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
     }
 
     const videoFile = req.files.video[0];
-    let thumbnailPath = req.files?.thumbnail?.[0]?.path;
-    let thumbFileName = req.files?.thumbnail?.[0]?.filename;
+    let thumbnailFile = req.files?.thumbnail?.[0];
+    let thumbnailPath = thumbnailFile?.path;
+    let thumbFileName = thumbnailFile?.filename;
 
+    // Get video duration using ffprobe
+    const duration = await getVideoDuration(videoFile.path);
+
+    // Generate thumbnail if not provided
     if (!thumbnailPath) {
-      thumbFileName = `thumb-${Date.now()}.jpg`;
-      thumbnailPath = path.join(UPLOAD_DIR, 'thumbnails', thumbFileName);
-      await new Promise((resolve, reject) => {
-        ffmpeg(videoFile.path)
-          .setFfmpegPath(ffmpegPath)
-          .screenshots({
-            count: 1,
-            folder: path.join(UPLOAD_DIR, 'thumbnails'),
-            filename: thumbFileName,
-            size: '1280x720'
-          })
-          .on('end', resolve)
-          .on('error', reject);
-      });
+      try {
+        thumbnailPath = await extractVideoThumbnail(videoFile.path, 1);
+        thumbFileName = path.basename(thumbnailPath);
+      } catch (e) {
+        console.error("Thumbnail extraction failed:", e.message);
+      }
     }
 
-    io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Checking Hive AI...', progress: 25 });
-    const hiveResult = await checkHiveAI(thumbnailPath);
-    if (!hiveResult.allowed) {
-      fs.unlinkSync(videoFile.path);
-      if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
-      await handleContentViolation(userId, hiveResult.reason, client);
-      await client.query('ROLLBACK');
-      return res.status(403).json({ error: "Violation Detected", reason: hiveResult.reason });
+    // Run moderation on thumbnail
+    if (thumbnailPath && fs.existsSync(thumbnailPath)) {
+      io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Checking content...', progress: 25 });
+      
+      const moderationResult = await runAllModerationChecks(thumbnailPath, userId);
+      if (!moderationResult.allowed) {
+        try { fs.unlinkSync(videoFile.path); } catch (e) {}
+        try { if (thumbnailPath) fs.unlinkSync(thumbnailPath); } catch (e) {}
+        await handleContentViolation(userId, moderationResult.reason, client);
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: "Violation Detected", reason: moderationResult.reason });
+      }
     }
 
-    io.to(`user-${userId}`).emit('upload-status', { step: 2, status: 'Checking DeepAI...', progress: 50 });
-    const deepResult = await checkDeepAI(thumbnailPath);
-    if (!deepResult.allowed) {
-      fs.unlinkSync(videoFile.path);
-      if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
-      await handleContentViolation(userId, deepResult.reason, client);
-      await client.query('ROLLBACK');
-      return res.status(403).json({ error: "Violation Detected", reason: deepResult.reason });
-    }
+    // Upload video to S3
+    io.to(`user-${userId}`).emit('upload-status', { step: 2, status: 'Uploading video...', progress: 40 });
 
-    io.to(`user-${userId}`).emit('upload-status', { step: 3, status: 'Checking Sightengine...', progress: 75 });
-    const sightResult = await checkSightengine(thumbnailPath);
-    if (!sightResult.allowed) {
-      fs.unlinkSync(videoFile.path);
-      if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
-      await handleContentViolation(userId, sightResult.reason, client);
-      await client.query('ROLLBACK');
-      return res.status(403).json({ error: "Violation Detected", reason: sightResult.reason });
-    }
-
-    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Uploading to Cloud...', progress: 0 });
-
-    const videoKey = `videos/${userId}/${Date.now()}-${videoFile.originalname}`;
-    const videoUrl = await uploadToS3(videoFile, videoKey, videoFile.mimetype);
+    const timestamp = Date.now();
+    const videoKey = `videos/${userId}/${timestamp}-${videoFile.originalname}`;
+    const videoResult = await uploadToS3(videoFile, videoKey, videoFile.mimetype);
     
-    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Finalizing...', progress: 90 });
+    io.to(`user-${userId}`).emit('upload-status', { step: 3, status: 'Uploading thumbnail...', progress: 70 });
     
+    // Upload thumbnail to S3
     let thumbnailUrl = `https://placehold.co/1280x720?text=${encodeURIComponent(title || 'Video')}`;
-    if (thumbnailPath) {
-      const thumbKey = `thumbnails/${userId}/${Date.now()}-${thumbFileName}`;
-      thumbnailUrl = await uploadToS3({ path: thumbnailPath }, thumbKey, 'image/jpeg');
+    let thumbnailS3Key = null;
+    if (thumbnailPath && fs.existsSync(thumbnailPath)) {
+      const thumbKey = `thumbnails/${userId}/${timestamp}-${thumbFileName || 'thumb.jpg'}`;
+      const thumbResult = await uploadToS3({ path: thumbnailPath }, thumbKey, 'image/jpeg');
+      thumbnailUrl = thumbResult.url;
+      thumbnailS3Key = thumbKey;
     }
 
-    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Finished', progress: 100 });
+    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Finalizing...', progress: 90 });
 
     const isShortBoolean = is_short === 'true';
     const tagsJson = typeof tags === 'string' ? tags : JSON.parse(tags || "{}");
     const tagsString = JSON.stringify(tagsJson); 
     const isPublic = is_public === 'true';
 
-    // FIXED: SQL insert had 11 values for 10 columns. Aligned parameters properly.
     const { rows } = await client.query(
-      `INSERT INTO videos (user_id, title, description, video_url, thumbnail_url, category, is_short, processing_status, tags, is_public) VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', $8, $9) RETURNING *`,
-      [userId, title, description, videoUrl, thumbnailUrl, category, isShortBoolean, tagsString, isPublic]
+      `INSERT INTO videos (user_id, title, description, video_url, video_s3_key, thumbnail_url, thumbnail_s3_key, duration, category, is_short, processing_status, tags, is_public) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'processing', $11, $12) RETURNING *`,
+      [userId, title, description, videoResult.url, videoResult.s3Key, thumbnailUrl, thumbnailS3Key, duration, category, isShortBoolean, tagsString, isPublic]
     );
 
     await client.query('COMMIT');
+    
+    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Finished', progress: 100 });
     res.status(201).json({ video: rows[0] });
 
   } catch (err) { 
@@ -1203,6 +1552,31 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
     res.status(500).json({ error: "Upload failed" }); 
   } finally {
     if (client) client.release();
+  }
+});
+
+// DELETE video + S3 files
+app.delete("/api/videos/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const { rows } = await pool.query("SELECT * FROM videos WHERE id = $1 AND user_id = $2", [id, userId]);
+    if (!rows.length) return res.status(404).json({ error: "Video not found" });
+
+    const video = rows[0];
+
+    // Delete from S3
+    if (video.video_s3_key) await deleteFromS3(video.video_s3_key);
+    if (video.thumbnail_s3_key) await deleteFromS3(video.thumbnail_s3_key);
+
+    // Delete from DB
+    await pool.query("DELETE FROM videos WHERE id = $1", [id]);
+
+    res.json({ success: true, message: "Video deleted" });
+  } catch (err) {
+    console.error("Delete video error:", err);
+    res.status(500).json({ error: "Failed to delete video" });
   }
 });
 
@@ -1226,6 +1600,33 @@ app.get("/api/videos/:id", async (req, res) => {
     pool.query(`UPDATE videos SET views = views + 1 WHERE id = $1`, [req.params.id]).catch(()=>{}); 
     res.json({ video: rows[0] }); 
   } catch (err) { res.status(500).json({ error: "Failed" }); } 
+});
+
+// Secure streaming URL for videos (presigned URL for private content)
+app.get("/api/videos/:id/stream", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query("SELECT video_s3_key, video_url, is_public FROM videos WHERE id = $1", [id]);
+    if (!rows.length) return res.status(404).json({ error: "Not found" });
+
+    const video = rows[0];
+    
+    // If video is public and we have a CDN URL, just return it
+    if (video.is_public && video.video_url) {
+      return res.json({ streamUrl: video.video_url });
+    }
+
+    // For private/premium content, generate a presigned URL
+    if (video.video_s3_key) {
+      const signedUrl = await generatePresignedUrl(video.video_s3_key, 3600); // 1 hour
+      return res.json({ streamUrl: signedUrl });
+    }
+
+    res.json({ streamUrl: video.video_url });
+  } catch (err) {
+    console.error("Stream URL error:", err);
+    res.status(500).json({ error: "Failed to get stream URL" });
+  }
 });
 
 app.get("/api/videos/:id/ad-tag", authMiddleware, async (req, res) => {
@@ -1274,7 +1675,203 @@ app.post("/api/videos/:id/comments", authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed to comment" }); }
 });
 
-// --- USER SETTINGS & THEME ---
+// ==========================================
+// MUSIC UPLOAD & API
+// ==========================================
+app.post("/api/music/upload", authMiddleware, upload.fields([{ name: 'audio', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const userId = req.user.id;
+    const { title, artist, album, genre, explicit, tags } = req.body;
+    
+    io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Validating...', progress: 0 });
+
+    if (!req.files?.audio) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: "Audio file required" });
+    }
+    
+    const audioFile = req.files.audio[0];
+    let coverFile = req.files?.cover?.[0];
+
+    // Get audio duration
+    const duration = await getAudioDuration(audioFile.path);
+
+    // Moderation on cover art
+    if (coverFile) {
+      io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Checking cover art...', progress: 25 });
+      
+      const moderationResult = await runAllModerationChecks(coverFile.path, userId);
+      if (!moderationResult.allowed) {
+        try { fs.unlinkSync(coverFile.path); } catch (e) {}
+        await handleContentViolation(userId, moderationResult.reason, client);
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: "Inappropriate Cover Detected", reason: moderationResult.reason });
+      }
+    }
+
+    // Upload audio to S3
+    io.to(`user-${userId}`).emit('upload-status', { step: 2, status: 'Uploading audio...', progress: 40 });
+
+    const timestamp = Date.now();
+    const audioKey = `music/${userId}/${timestamp}-${audioFile.originalname}`;
+    const audioResult = await uploadToS3(audioFile, audioKey, audioFile.mimetype);
+    
+    // Upload cover art to S3 (with multi-size processing)
+    io.to(`user-${userId}`).emit('upload-status', { step: 3, status: 'Uploading cover...', progress: 70 });
+    
+    let coverUrl = "https://placehold.co/300x300?text=No+Cover";
+    let coverS3Key = null;
+    if (coverFile) {
+      const coverResults = await processAndUploadImage(coverFile.path, userId, 'covers');
+      coverUrl = coverResults.full.url;
+      coverS3Key = coverResults.full.s3Key;
+    }
+
+    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Finished', progress: 100 });
+
+    const tagsJson = typeof tags === 'string' ? tags : JSON.parse(tags || "[]");
+    const tagsString = JSON.stringify(tagsJson); 
+    
+    const { rows } = await client.query(
+      `INSERT INTO music (user_id, title, artist, album, genre, is_explicit, audio_url, audio_s3_key, cover_url, cover_s3_key, duration, tags) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+      [userId, title, artist, album, genre, explicit === 'true', audioResult.url, audioResult.s3Key, coverUrl, coverS3Key, duration, tagsString]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json({ success: true, music: rows[0] });
+
+  } catch (err) { 
+    console.error("Music Upload error:", err); 
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: "Upload failed" }); 
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// GET music list
+app.get("/api/music", async (req, res) => {
+  try {
+    const { filter, genre, userId: artistId } = req.query;
+    let query = `SELECT m.*, u.username, u.profile_url FROM music m JOIN users u ON m.user_id = u.id WHERE 1=1`;
+    const params = [];
+    
+    if (genre) { params.push(genre); query += ` AND m.genre = $${params.length}`; }
+    if (artistId) { params.push(artistId); query += ` AND m.user_id = $${params.length}`; }
+    
+    query += filter === 'popular' ? ` ORDER BY m.plays DESC` : ` ORDER BY m.created_at DESC`;
+    query += ` LIMIT $${params.length + 1}`; params.push(20);
+    
+    const { rows } = await pool.query(query, params);
+    res.json({ music: rows });
+  } catch (err) { 
+    res.status(500).json({ error: "Failed to fetch music" }); 
+  }
+});
+
+// GET single music track
+app.get("/api/music/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT m.*, u.username, u.profile_url FROM music m JOIN users u ON m.user_id = u.id WHERE m.id = $1`, 
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Not found" });
+    
+    // Increment play count
+    pool.query(`UPDATE music SET plays = plays + 1 WHERE id = $1`, [req.params.id]).catch(()=>{});
+    
+    res.json({ music: rows[0] });
+  } catch (err) { 
+    res.status(500).json({ error: "Failed" }); 
+  }
+});
+
+// Secure streaming URL for music (presigned URL for private content)
+app.get("/api/music/:id/stream", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query("SELECT audio_s3_key, audio_url FROM music WHERE id = $1", [id]);
+    if (!rows.length) return res.status(404).json({ error: "Not found" });
+
+    const track = rows[0];
+    
+    // If we have a CDN URL, return it directly
+    if (track.audio_url && AWS_CLOUDFRONT_DOMAIN) {
+      return res.json({ streamUrl: track.audio_url });
+    }
+
+    // Otherwise, generate a presigned URL
+    if (track.audio_s3_key) {
+      const signedUrl = await generatePresignedUrl(track.audio_s3_key, 3600);
+      return res.json({ streamUrl: signedUrl });
+    }
+
+    res.json({ streamUrl: track.audio_url });
+  } catch (err) {
+    console.error("Music stream URL error:", err);
+    res.status(500).json({ error: "Failed to get stream URL" });
+  }
+});
+
+// DELETE music + S3 files
+app.delete("/api/music/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const { rows } = await pool.query("SELECT * FROM music WHERE id = $1 AND user_id = $2", [id, userId]);
+    if (!rows.length) return res.status(404).json({ error: "Music not found" });
+
+    const track = rows[0];
+
+    // Delete from S3
+    if (track.audio_s3_key) await deleteFromS3(track.audio_s3_key);
+    if (track.cover_s3_key) await deleteFromS3(track.cover_s3_key);
+
+    // Delete from DB
+    await pool.query("DELETE FROM music WHERE id = $1", [id]);
+
+    res.json({ success: true, message: "Music deleted" });
+  } catch (err) {
+    console.error("Delete music error:", err);
+    res.status(500).json({ error: "Failed to delete music" });
+  }
+});
+
+// Music reactions
+app.post("/api/music/:id/react", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reaction_type } = req.body;
+    const user_id = req.user.id;
+    
+    if (!reaction_type) return res.status(400).json({ error: "Missing reaction type" });
+    
+    await pool.query(
+      `INSERT INTO content_reactions (user_id, content_id, content_type, reaction_type) VALUES ($1, $2, 'music', $3) ON CONFLICT (user_id, content_id, content_type) DO UPDATE SET reaction_type = $3`, 
+      [user_id, id, reaction_type]
+    );
+    
+    if (reaction_type === 'like') {
+      await pool.query(
+        `UPDATE music SET likes = (SELECT COUNT(*) FROM content_reactions WHERE content_id = $1 AND content_type = 'music' AND reaction_type = 'like') WHERE id = $1`, 
+        [id]
+      );
+    }
+    
+    res.json({ success: true, reaction: reaction_type });
+  } catch (err) { 
+    res.status(500).json({ error: "Failed to react" }); 
+  }
+});
+
+// ==========================================
+// USER SETTINGS
+// ==========================================
 app.get("/api/users/me", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(`SELECT id, username, email, profile_url, cover_url, bio, is_musician, is_creator, is_verified, role, subscription_plan, preferences FROM users WHERE id = $1`, [req.user.id]);
@@ -1283,13 +1880,41 @@ app.get("/api/users/me", authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed to fetch user" }); }
 });
 
-app.put("/api/users/me", authMiddleware, async (req, res) => {
+app.put("/api/users/me", authMiddleware, upload.fields([{ name: 'profile', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), async (req, res) => {
   try {
     const userId = req.user.id;
-    const { username, bio, profile_url, cover_url, social_links, preferences } = req.body;
+    const { username, bio, social_links, preferences } = req.body;
+    
+    let profile_url = req.body.profile_url;
+    let cover_url = req.body.cover_url;
+
+    // Upload profile picture if provided
+    if (req.files?.profile?.[0]) {
+      if (!s3) return res.status(500).json({ error: "S3 not configured" });
+      const file = req.files.profile[0];
+      const buffer = await sharp(file.path)
+        .resize(400, 400, { fit: "cover", withoutEnlargement: true })
+        .rotate()
+        .jpeg({ quality: 85 })
+        .toBuffer();
+      
+      const key = `profile-pics/${userId}/${Date.now()}.jpg`;
+      const result = await uploadBufferToS3(buffer, key, 'image/jpeg');
+      profile_url = result.url;
+      try { fs.unlinkSync(file.path); } catch (e) {}
+    }
+
+    // Upload cover photo if provided
+    if (req.files?.cover?.[0]) {
+      if (!s3) return res.status(500).json({ error: "S3 not configured" });
+      const file = req.files.cover[0];
+      const coverResults = await processAndUploadImage(file.path, userId, 'covers');
+      cover_url = coverResults.full.url;
+    }
+
     const { rows } = await pool.query(
       `UPDATE users SET username = COALESCE($1, username), bio = COALESCE($2, bio), profile_url = COALESCE($3, profile_url), cover_url = COALESCE($4, cover_url), social_links = COALESCE($5, social_links), preferences = COALESCE($6, preferences), updated_at = NOW() WHERE id = $7 RETURNING id, username, email, profile_url, cover_url, bio, preferences, role`,
-      [username, bio, profile_url, cover_url, social_links, preferences, userId]
+      [username, bio, profile_url, cover_url, social_links ? JSON.parse(social_links) : null, preferences ? JSON.parse(preferences) : null, userId]
     );
     io.to(`user-${userId}`).emit("user-updated", rows[0]);
     res.json({ user: rows[0] });
@@ -1312,92 +1937,14 @@ app.get("/api/search", async (req, res) => {
     let results = {};
     if (!type || type === 'videos') { const vidRes = await pool.query(`SELECT * FROM videos WHERE LOWER(title) LIKE $1 LIMIT 10`, [searchQuery]); results.videos = vidRes.rows; }
     if (!type || type === 'users') { const usrRes = await pool.query(`SELECT id, username, profile_url, is_verified FROM users WHERE LOWER(username) LIKE $1 LIMIT 10`, [searchQuery]); results.users = usrRes.rows; }
+    if (!type || type === 'music') { const musRes = await pool.query(`SELECT * FROM music WHERE LOWER(title) LIKE $1 OR LOWER(artist) LIKE $1 LIMIT 10`, [searchQuery]); results.music = musRes.rows; }
     res.json({ results });
   } catch (err) { res.status(500).json({ error: "Search failed" }); }
 });
 
-// --- MUSIC UPLOAD ---
-app.post("/api/music/upload", authMiddleware, upload.fields([{ name: 'audio', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const userId = req.user.id;
-    const { title, artist, album, genre, explicit, tags } = req.body;
-    
-    io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Running Checks: Hive AI', progress: 0 });
-
-    if (!req.files?.audio) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: "Audio file required" });
-    }
-    
-    const audioFile = req.files.audio[0];
-    let coverFile = req.files?.cover?.[0];
-
-    if (coverFile) {
-      io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Checking Cover: Hive AI...', progress: 25 });
-      const hiveResult = await checkHiveAI(coverFile.path);
-      if (!hiveResult.allowed) {
-        fs.unlinkSync(coverFile.path);
-        await handleContentViolation(userId, hiveResult.reason, client);
-        await client.query('ROLLBACK');
-        return res.status(403).json({ error: "Inappropriate Cover Detected", reason: hiveResult.reason });
-      }
-
-      io.to(`user-${userId}`).emit('upload-status', { step: 2, status: 'Checking Cover: DeepAI...', progress: 50 });
-      const deepResult = await checkDeepAI(coverFile.path);
-      if (!deepResult.allowed) {
-        fs.unlinkSync(coverFile.path);
-        await handleContentViolation(userId, deepResult.reason, client);
-        await client.query('ROLLBACK');
-        return res.status(403).json({ error: "Inappropriate Cover Detected", reason: deepResult.reason });
-      }
-
-      io.to(`user-${userId}`).emit('upload-status', { step: 3, status: 'Checking Cover: Sightengine...', progress: 75 });
-      const sightResult = await checkSightengine(coverFile.path);
-      if (!sightResult.allowed) {
-        fs.unlinkSync(coverFile.path);
-        await handleContentViolation(userId, sightResult.reason, client);
-        await client.query('ROLLBACK');
-        return res.status(403).json({ error: "Inappropriate Cover Detected", reason: sightResult.reason });
-      }
-    }
-
-    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Uploading to Cloud...', progress: 0 });
-
-    const audioKey = `music/${userId}/${Date.now()}-${audioFile.originalname}`;
-    const audioUrl = await uploadToS3(audioFile, audioKey, audioFile.mimetype);
-    
-    let coverUrl = "https://placehold.co/300x300?text=No+Cover";
-    if (coverFile) {
-      const coverKey = `covers/${userId}/${Date.now()}-${coverFile.originalname}`;
-      coverUrl = await uploadToS3(coverFile, coverKey, coverFile.mimetype);
-    }
-
-    io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Finished', progress: 100 });
-
-    const tagsJson = typeof tags === 'string' ? tags : JSON.parse(tags || "[]");
-    const tagsString = JSON.stringify(tagsJson); 
-    
-    await client.query(
-      `INSERT INTO music (user_id, title, artist, album, genre, is_explicit, audio_url, cover_url, tags) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [userId, title, artist, album, genre, explicit === 'true', audioUrl, coverUrl, tagsString]
-    );
-
-    await client.query('COMMIT');
-    res.status(201).json({ success: true, message: "Music uploaded successfully" });
-
-  } catch (err) { 
-    console.error("Music Upload error:", err); 
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: "Upload failed" }); 
-  } finally {
-    if (client) client.release();
-  }
-});
-
-// --- MISC ---
+// ==========================================
+// LIVESTREAMS & ELITE
+// ==========================================
 app.post("/api/livestreams", authMiddleware, async (req, res) => {
   try {
     const { title, description, category } = req.body; const userId = req.user.id;
@@ -1436,10 +1983,9 @@ app.post("/api/admin/warn-user/:id", adminMiddleware, async (req, res) => {
 });
 
 // ==========================================
-// MISSING ROUTES — Required by Frontend
+// FRONTEND REQUIRED ROUTES
 // ==========================================
 
-// Alias: /api/auth/me → Fetches current user with moderation fields
 app.get("/api/auth/me", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -1456,7 +2002,6 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/chats — List current user's chats
 app.get("/api/chats", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -1495,7 +2040,6 @@ app.get("/api/chats", authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/chats/:chatId/messages — Fetch messages for a chat
 app.get("/api/chats/:chatId/messages", authMiddleware, async (req, res) => {
   try {
     const { chatId } = req.params;
@@ -1519,7 +2063,6 @@ app.get("/api/chats/:chatId/messages", authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/chats/:chatId/restrictions — Chat-specific restrictions
 app.get("/api/chats/:chatId/restrictions", authMiddleware, async (req, res) => {
   try {
     const { chatId } = req.params;
@@ -1545,7 +2088,6 @@ app.get("/api/chats/:chatId/restrictions", authMiddleware, async (req, res) => {
   }
 });
 
-// POST /api/agora/token — Generate Agora token for calls
 app.post("/api/agora/token", authMiddleware, async (req, res) => {
   try {
     const { channelName, uid } = req.body;
@@ -1560,7 +2102,6 @@ app.post("/api/agora/token", authMiddleware, async (req, res) => {
   }
 });
 
-// POST /api/chats — Create a new chat
 app.post("/api/chats", authMiddleware, async (req, res) => {
   try {
     const { participantId, type, name } = req.body;
@@ -1568,7 +2109,6 @@ app.post("/api/chats", authMiddleware, async (req, res) => {
 
     if (!participantId) return res.status(400).json({ error: "Participant required" });
 
-    // Check if chat already exists (for private chats)
     if (type !== 'group') {
       const { rows: existing } = await pool.query(
         `SELECT * FROM chats WHERE $1 = ANY(participants) AND $2 = ANY(participants) AND type = 'private'`,
@@ -1591,6 +2131,24 @@ app.post("/api/chats", authMiddleware, async (req, res) => {
 });
 
 // ==========================================
+// PRESIGNED URL ENDPOINT (for secure downloads)
+// ==========================================
+app.get("/api/media/presigned-url", authMiddleware, async (req, res) => {
+  try {
+    const { key, expiry } = req.query;
+    if (!key) return res.status(400).json({ error: "S3 key required" });
+    
+    const signedUrl = await generatePresignedUrl(key, parseInt(expiry) || 3600);
+    if (!signedUrl) return res.status(500).json({ error: "Failed to generate URL" });
+    
+    res.json({ url: signedUrl });
+  } catch (err) {
+    console.error("Presigned URL error:", err);
+    res.status(500).json({ error: "Failed to generate presigned URL" });
+  }
+});
+
+// ==========================================
 // ERROR HANDLERS
 // ==========================================
 app.use((req, res) => { res.status(404).json({ error: "Route not found" }); });
@@ -1600,7 +2158,11 @@ app.use((err, req, res, next) => { console.error("Unhandled error:", err); res.s
 // SERVER STARTUP
 // ==========================================
 (async () => {
-  server.listen(PORT, '0.0.0.0', () => { console.log(`🚀 Server running on port ${PORT}`); });
+  server.listen(PORT, '0.0.0.0', () => { 
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📦 S3: ${s3 ? 'Connected' : 'Not configured'}`);
+    console.log(`🌐 CDN: ${AWS_CLOUDFRONT_DOMAIN || 'Not configured (using direct S3)'}`);
+  });
 
   try {
     if (DATABASE_URL) {
