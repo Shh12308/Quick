@@ -608,7 +608,7 @@ export const upload = multer({
   storage, 
   limits: { fileSize: 100 * 1024 * 1024 }, 
   fileFilter: (req, file, cb) => { 
-    const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'video/webm', 'video/ogg', 'audio/mpeg', 'audio/wav']; 
+    const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'video/webm', 'video/ogg', 'audio/mpeg', 'audio/wav', 'audio/webm', 'audio/ogg', 'audio/mp4']; 
     cb(null, allowed.includes(file.mimetype)); 
   } 
 });
