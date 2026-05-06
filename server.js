@@ -1774,8 +1774,6 @@ app.post("/api/videos/:id/react", authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed to react" }); }
 });
 
-const upload = multer({ storage: multer.memoryStorage() }); // For handling images if needed
-
 // --- GET PRODUCTS ---
 app.get("/api/products", async (req, res) => {
   try {
