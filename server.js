@@ -215,6 +215,54 @@ io.on("connection", (socket) => {
 // ==========================================
 async function initializeTables() {
   try {
+    // Ensure 'orders' table exists with proper relations
+await pool.query(`CREATE TABLE IF NOT EXISTS orders (
+  id SERIAL PRIMARY KEY,
+  buyer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  seller_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  product_id INTEGER REFERENCES products(id) ON DELETE SET NULL, 
+  product_name VARCHAR(255),
+  product_image TEXT,
+  product_type VARCHAR(20), -- 'physical' or 'digital'
+  total DECIMAL(10, 5), -- High precision for crypto
+  currency VARCHAR(10) DEFAULT 'USD',
+  status VARCHAR(20) DEFAULT 'pending', -- pending, shipped, completed, cancelled
+  buyer_address TEXT,
+  tracking_number TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+)`);
+
+    // Ensure Products Table
+await pool.query(`CREATE TABLE IF NOT EXISTS products (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  name VARCHAR(255) NOT NULL,
+  description TEXT,
+  price DECIMAL(10, 2) NOT NULL,
+  type VARCHAR(20) DEFAULT 'physical', -- 'physical' or 'digital'
+  images JSONB DEFAULT '[]', -- Array of image URLs
+  stock INTEGER DEFAULT 0,
+  tags JSONB DEFAULT '[]',
+  sizes JSONB DEFAULT '[]', -- For physical
+  colors JSONB DEFAULT '[]', -- For physical
+  crypto VARCHAR(10), -- For digital (ETH, BTC, etc.)
+  category VARCHAR(100),
+  views INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW()
+)`);
+
+// Ensure Order Items Table (For Cart orders)
+await pool.query(`CREATE TABLE IF NOT EXISTS order_items (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+  product_name VARCHAR(255), -- Snapshot of name
+  product_price DECIMAL(10, 2), -- Snapshot of price
+  quantity INTEGER DEFAULT 1,
+  created_at TIMESTAMP DEFAULT NOW()
+)`);
+    
     await pool.query(`CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY, 
       username VARCHAR(255) UNIQUE NOT NULL, 
@@ -1555,6 +1603,74 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
   }
 });
 
+// --- 1. GET SELLER ORDERS ---
+app.get("/api/seller/orders", authMiddleware, async (req, res) => {
+  try {
+    const sellerId = req.user.id;
+    const { status } = req.query;
+
+    let query = `
+      SELECT o.*, u.username as buyer_username 
+      FROM orders o 
+      JOIN users u ON o.buyer_id = u.id 
+      WHERE o.seller_id = $1
+    `;
+    const params = [sellerId];
+
+    if (status && status !== 'all') {
+      params.push(status);
+      query += ` AND o.status = $${params.length}`;
+    }
+
+    query += ` ORDER BY o.created_at DESC`;
+
+    const { rows } = await pool.query(query, params);
+    res.json(rows);
+  } catch (err) {
+    console.error("Fetch seller orders error:", err);
+    res.status(500).json({ error: "Failed to fetch orders" });
+  }
+});
+
+// --- 2. UPDATE ORDER STATUS ---
+app.put("/api/seller/orders/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, tracking_number } = req.body;
+    const sellerId = req.user.id;
+
+    // 1. Verify the order belongs to this seller
+    const { rows: orderCheck } = await pool.query(
+      "SELECT * FROM orders WHERE id = $1 AND seller_id = $2", 
+      [id, sellerId]
+    );
+
+    if (orderCheck.length === 0) {
+      return res.status(404).json({ error: "Order not found or unauthorized" });
+    }
+
+    // 2. Update the order
+    const { rows } = await pool.query(
+      `UPDATE orders 
+       SET status = $1, tracking_number = $2, updated_at = NOW() 
+       WHERE id = $3 RETURNING *`,
+      [status, tracking_number || null, id]
+    );
+
+    // 3. Optional: Notify buyer via Socket.io
+    // if (status === 'shipped') {
+    //   io.to(`user-${orderCheck[0].buyer_id}`).emit("order-update", { orderId: id, status });
+    // }
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("Update order error:", err);
+    res.status(500).json({ error: "Failed to update order" });
+  }
+});
+
+
+
 // DELETE video + S3 files
 app.delete("/api/videos/:id", authMiddleware, async (req, res) => {
   try {
@@ -1656,6 +1772,150 @@ app.post("/api/videos/:id/react", authMiddleware, async (req, res) => {
     else if (reaction_type === 'dislike') await pool.query(`UPDATE videos SET dislikes = (SELECT COUNT(*) FROM content_reactions WHERE content_id = $1 AND content_type = 'video' AND reaction_type = 'dislike') WHERE id = $1`, [id]);
     res.json({ success: true, reaction: reaction_type });
   } catch (err) { res.status(500).json({ error: "Failed to react" }); }
+});
+
+const upload = multer({ storage: multer.memoryStorage() }); // For handling images if needed
+
+// --- GET PRODUCTS ---
+app.get("/api/products", async (req, res) => {
+  try {
+    const { search, type } = req.query;
+    let query = `
+      SELECT p.*, u.username as creator_name, u.profile_url as creator_avatar 
+      FROM products p 
+      JOIN users u ON p.user_id = u.id 
+      WHERE 1=1
+    `;
+    const params = [];
+
+    if (search) { 
+      params.push(`%${search}%`); 
+      query += ` AND (p.name ILIKE $${params.length} OR p.description ILIKE $${params.length})`; 
+    }
+    if (type && type !== 'All') { 
+      params.push(type); 
+      query += ` AND p.type = $${params.length}`; 
+    }
+
+    query += ` ORDER BY p.created_at DESC LIMIT 50`;
+
+    const { rows } = await pool.query(query, params);
+    res.json(rows);
+  } catch (err) {
+    console.error("Get products error:", err);
+    res.status(500).json({ error: "Failed to fetch products" });
+  }
+});
+
+// --- CREATE PRODUCT ---
+app.post("/api/products", authMiddleware, upload.array('images', 5), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const { name, description, price, type, tags, sizes, colors, crypto, stock } = req.body;
+    const userId = req.user.id;
+
+    // Handle Images (Simplistic: Assume S3 upload logic here or save URLs)
+    // In a real app, you would process req.files here.
+    // For this example, we assume the frontend sent URLs or you process files here.
+    const images = req.files && req.files.length > 0 
+      ? req.files.map(f => `/uploads/${f.filename}`) // Local storage mock
+      : [];
+
+    const { rows } = await client.query(
+      `INSERT INTO products (user_id, name, description, price, type, images, stock, tags, sizes, colors, crypto)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      [
+        userId, name, description, price, type, 
+        JSON.stringify(images), 
+        stock || 0, 
+        tags ? JSON.parse(tags) : [], 
+        sizes ? JSON.parse(sizes) : [], 
+        colors ? JSON.parse(colors) : [], 
+        crypto
+      ]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("Create product error:", err);
+    res.status(500).json({ error: "Failed to create product" });
+  } finally {
+    client.release();
+  }
+});
+
+// --- CHECKOUT / CREATE ORDER ---
+app.post("/api/orders/checkout", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const { items } = req.body; // Array of { productId, quantity }
+    const buyerId = req.user.id;
+
+    // 1. Validate Products and Calculate Total
+    let totalAmount = 0;
+    let sellers = new Set(); // Track unique sellers (for notifications later)
+
+    const processedItems = await Promise.all(items.map(async (item) => {
+      const { rows } = await client.query("SELECT * FROM products WHERE id = $1", [item.productId]);
+      if (rows.length === 0) throw new Error(`Product ${item.productId} not found`);
+      
+      const product = rows[0];
+      
+      // Check Stock for Physical
+      if (product.type === 'physical' && product.stock < item.quantity) {
+        throw new Error(`Insufficient stock for ${product.name}`);
+      }
+
+      sellers.add(product.user_id);
+      totalAmount += (parseFloat(product.price) * item.quantity);
+
+      return {
+        product_id: product.id,
+        product_name: product.name,
+        product_price: product.price,
+        quantity: item.quantity,
+        seller_id: product.user_id
+      };
+    }));
+
+    // 2. Create Order (Simplistic: One order per buyer, mixing sellers)
+    const { rows: orderRes } = await client.query(
+      `INSERT INTO orders (buyer_id, total, status) VALUES ($1, $2, 'pending') RETURNING *`,
+      [buyerId, totalAmount]
+    );
+    const orderId = orderRes[0].id;
+
+    // 3. Create Order Items & Update Stock
+    for (const item of processedItems) {
+      await client.query(
+        `INSERT INTO order_items (order_id, product_id, product_name, product_price, quantity) 
+         VALUES ($1, $2, $3, $4, $5)`,
+        [orderId, item.product_id, item.product_name, item.product_price, item.quantity]
+      );
+
+      // Reduce stock if physical
+      await client.query(
+        `UPDATE products SET stock = stock - $1 WHERE id = $2`,
+        [item.quantity, item.product_id]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json({ success: true, orderId: orderId });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("Checkout error:", err);
+    res.status(500).json({ error: err.message || "Checkout failed" });
+  } finally {
+    client.release();
+  }
 });
 
 // --- COMMENTS ---
