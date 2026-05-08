@@ -67,14 +67,15 @@ const {
   FRONTEND_URL, ADMIN_KEY,
   AGORA_APP_ID, AGORA_APP_CERTIFICATE,
   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME,
-  AWS_CLOUDFRONT_DOMAIN,  // NEW: CDN domain for faster media delivery
+  AWS_CLOUDFRONT_DOMAIN,
   OPENAI_API_KEY,
   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
   DEEP_AI_KEY, 
   TURNSTILE_SECRET_KEY,
   IPINFO_TOKEN,
   REDIS_URL,
-  SIGNED_URL_EXPIRY  // NEW: Configurable presigned URL expiry (seconds)
+  SIGNED_URL_EXPIRY,
+  PASSWORD_PEPPER // NEW: Pepper for extra hashing security
 } = process.env;
 
 const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET', 'SESSION_SECRET'];
@@ -82,6 +83,11 @@ const missingEnv = REQUIRED_ENV.filter(key => !process.env[key]);
 if (missingEnv.length) {
   console.error(`⚠️  WARNING: Missing required environment variables: ${missingEnv.join(', ')}`);
   console.error(`⚠️  Server starting in DEGRADED MODE.`);
+}
+
+// SECURITY: Warn if Pepper is missing
+if (!PASSWORD_PEPPER) {
+  console.error(`⚠️  CRITICAL: PASSWORD_PEPPER not set in environment variables. Passwords are vulnerable.`);
 }
 
 app.use(cors({
@@ -378,7 +384,7 @@ await pool.query(`CREATE TABLE IF NOT EXISTS order_items (
     await pool.query(`CREATE TABLE IF NOT EXISTS stripe_events (id SERIAL PRIMARY KEY, event_id TEXT UNIQUE NOT NULL, processed_at TIMESTAMP DEFAULT NOW())`);
     
     await pool.query(`CREATE TABLE IF NOT EXISTS subscription_tiers (id SERIAL PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2), benefits JSON, role VARCHAR(50))`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS user_subscriptions (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, tier_id INTEGER REFERENCES subscription_tiers(id) ON DELETE SET NULL, stripe_subscription_id TEXT, status TEXT, current_period_start TIMESTAMP, current_period_end TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_subscriptions (user_id PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, tier_id INTEGER REFERENCES subscription_tiers(id) ON DELETE SET NULL, stripe_subscription_id TEXT, status TEXT, current_period_start TIMESTAMP, current_period_end TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), amount DECIMAL(10,2), status TEXT, type TEXT, created_at TIMESTAMP DEFAULT NOW())`);
     
     // Music table with s3_key fields
@@ -419,13 +425,55 @@ await pool.query(`CREATE TABLE IF NOT EXISTS order_items (
 }
 
 // ==========================================
-// AWS S3 HELPERS (Complete Media System)
+// SECURITY HELPERS (PASSWORDS)
 // ==========================================
 
 /**
- * Build the public URL for an S3 key.
- * Uses CloudFront if configured, otherwise falls back to direct S3 URL.
+ * Validates password strength against strict requirements.
  */
+function validatePassword(password) {
+  const errors = [];
+  
+  if (password.length < 8) errors.push("Minimum 8 characters");
+  if (password.length > 128) errors.push("Maximum 128 characters");
+  if (!/[A-Z]/.test(password)) errors.push("At least one uppercase letter");
+  if (!/[a-z]/.test(password)) errors.push("At least one lowercase letter");
+  if (!/[0-9]/.test(password)) errors.push("At least one number");
+  if (!/[^A-Za-z0-9]/.test(password)) errors.push("At least one special character");
+  if (/(.)\1{2,}/.test(password)) errors.push("No character repeated 3+ times");
+  
+  return {
+    valid: errors.length === 0,
+    errors
+  };
+}
+
+/**
+ * Hashes a password using Argon2id with Pepper.
+ * Uses memory-hard parameters to resist GPU cracking.
+ */
+async function hashPassword(password) {
+  return argon2.hash(password + (PASSWORD_PEPPER || ""), {
+    type: argon2.argon2id,        // Hybrid mode resistant to side-channel attacks
+    memoryCost: 65536,            // 64 MB of RAM required per guess
+    timeCost: 3,                  // Iterations
+    parallelism: 4,                // Threads
+    hashLength: 32
+  });
+}
+
+/**
+ * Verifies a password against a hash.
+ * IMPORTANT: Must pepper the incoming password before verifying.
+ */
+async function verifyPassword(hash, password) {
+  return argon2.verify(hash, password + (PASSWORD_PEPPER || ""));
+}
+
+// ==========================================
+// AWS S3 HELPERS
+// ==========================================
+
 function buildMediaUrl(key) {
   if (AWS_CLOUDFRONT_DOMAIN) {
     return `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`;
@@ -433,18 +481,12 @@ function buildMediaUrl(key) {
   return `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
 }
 
-/**
- * Upload a file to S3 with caching headers.
- * Deletes the local temp file after upload.
- * Returns { url, s3Key }
- */
 async function uploadToS3(file, key, mimeType, cacheControl = null) {
   if (!s3 || !S3_BUCKET_NAME) throw new Error("S3 not configured");
   
   const fileContent = await fs.promises.readFile(file.path);
   let buffer = fileContent;
   
-  // Auto-process images with sharp
   if (mimeType.startsWith('image/')) {
     buffer = await sharp(fileContent).rotate().toBuffer();
   }
@@ -456,17 +498,14 @@ async function uploadToS3(file, key, mimeType, cacheControl = null) {
     ContentType: mimeType,
   };
   
-  // Add cache control for CDN optimization
   if (cacheControl) {
     params.CacheControl = cacheControl;
   } else {
-    // Default: cache for 1 year (immutable media files)
     params.CacheControl = 'public, max-age=31536000, immutable';
   }
   
   await s3.send(new PutObjectCommand(params));
   
-  // Clean up local temp file
   try { await fs.promises.unlink(file.path); } catch (e) {}
   
   return {
@@ -475,9 +514,6 @@ async function uploadToS3(file, key, mimeType, cacheControl = null) {
   };
 }
 
-/**
- * Upload a Buffer directly to S3 (for base64 profile pics, etc.)
- */
 async function uploadBufferToS3(buffer, key, mimeType) {
   if (!s3 || !S3_BUCKET_NAME) throw new Error("S3 not configured");
   
@@ -495,9 +531,6 @@ async function uploadBufferToS3(buffer, key, mimeType) {
   };
 }
 
-/**
- * Delete a file from S3 by its key
- */
 async function deleteFromS3(key) {
   if (!s3 || !S3_BUCKET_NAME || !key) return;
   try {
@@ -511,10 +544,6 @@ async function deleteFromS3(key) {
   }
 }
 
-/**
- * Generate a presigned URL for secure, temporary access to a private S3 object.
- * Use this for premium content or private media.
- */
 async function generatePresignedUrl(key, expiresInSeconds = 3600) {
   if (!s3 || !S3_BUCKET_NAME || !key) return null;
   
@@ -528,10 +557,6 @@ async function generatePresignedUrl(key, expiresInSeconds = 3600) {
   return await getSignedUrl(s3, command, { expiresIn: expiry });
 }
 
-/**
- * Process and upload an image at multiple sizes.
- * Returns { full, thumbnail, medium }
- */
 async function processAndUploadImage(filePath, userId, purpose = 'generic') {
   if (!s3 || !S3_BUCKET_NAME) throw new Error("S3 not configured");
   
@@ -539,7 +564,6 @@ async function processAndUploadImage(filePath, userId, purpose = 'generic') {
   const timestamp = Date.now();
   const baseKey = `${purpose}/${userId}/${timestamp}`;
   
-  // Full size (max 1920px wide)
   const fullBuffer = await sharp(filePath)
     .rotate()
     .resize(1920, null, { withoutEnlargement: true, fit: 'inside' })
@@ -550,7 +574,6 @@ async function processAndUploadImage(filePath, userId, purpose = 'generic') {
   await uploadBufferToS3(fullBuffer, fullKey, 'image/jpeg');
   results.full = { url: buildMediaUrl(fullKey), s3Key: fullKey };
   
-  // Medium (max 640px wide) - for feeds/lists
   const mediumBuffer = await sharp(filePath)
     .rotate()
     .resize(640, null, { withoutEnlargement: true, fit: 'inside' })
@@ -561,7 +584,6 @@ async function processAndUploadImage(filePath, userId, purpose = 'generic') {
   await uploadBufferToS3(mediumBuffer, mediumKey, 'image/jpeg');
   results.medium = { url: buildMediaUrl(mediumKey), s3Key: mediumKey };
   
-  // Thumbnail (max 320px wide) - for search/previews
   const thumbBuffer = await sharp(filePath)
     .rotate()
     .resize(320, null, { withoutEnlargement: true, fit: 'inside' })
@@ -572,15 +594,11 @@ async function processAndUploadImage(filePath, userId, purpose = 'generic') {
   await uploadBufferToS3(thumbBuffer, thumbKey, 'image/jpeg');
   results.thumbnail = { url: buildMediaUrl(thumbKey), s3Key: thumbKey };
   
-  // Clean up local file
   try { await fs.promises.unlink(filePath); } catch (e) {}
   
   return results;
 }
 
-/**
- * Get video duration using ffprobe
- */
 function getVideoDuration(filePath) {
   return new Promise((resolve) => {
     ffmpeg.ffprobe(filePath, (err, metadata) => {
@@ -593,9 +611,6 @@ function getVideoDuration(filePath) {
   });
 }
 
-/**
- * Get audio duration using ffprobe
- */
 function getAudioDuration(filePath) {
   return new Promise((resolve) => {
     ffmpeg.ffprobe(filePath, (err, metadata) => {
@@ -608,9 +623,6 @@ function getAudioDuration(filePath) {
   });
 }
 
-/**
- * Extract a thumbnail from a video at a specific timestamp
- */
 function extractVideoThumbnail(videoPath, timestampSec = 1) {
   return new Promise((resolve, reject) => {
     const thumbPath = videoPath.replace(/\.[^/.]+$/, '-thumb.jpg');
@@ -729,28 +741,19 @@ async function checkDeepAI(imagePath) {
   }
 }
 
-/**
- * Run all 3 moderation checks on an image path
- */
 async function runAllModerationChecks(imagePath, userId) {
-  // 1. Hive AI
   const hiveResult = await checkHiveAI(imagePath);
   if (!hiveResult.allowed) return hiveResult;
 
-  // 2. DeepAI
   const deepResult = await checkDeepAI(imagePath);
   if (!deepResult.allowed) return deepResult;
 
-  // 3. Sightengine
   const sightResult = await checkSightengine(imagePath);
   if (!sightResult.allowed) return sightResult;
 
   return { allowed: true };
 }
 
-/**
- * PROGRESSIVE BAN SYSTEM
- */
 async function handleContentViolation(userId, reason, client = pool) {
   const db = client || pool; 
   try {
@@ -913,7 +916,6 @@ const transporter = EMAIL_HOST && EMAIL_USER ? nodemailer.createTransport({
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// Create subdirectories for each media type
 const MEDIA_DIRS = {
   video: path.join(UPLOAD_DIR, 'videos'),
   thumbnail: path.join(UPLOAD_DIR, 'thumbnails'),
@@ -937,7 +939,7 @@ const storage = multer.diskStorage({
       image: MEDIA_DIRS.image,
       voice: MEDIA_DIRS.voice,
       profile: MEDIA_DIRS.profile,
-      media: MEDIA_DIRS.image,  // generic chat media
+      media: MEDIA_DIRS.image,
     };
     const dir = dirMap[file.fieldname] || MEDIA_DIRS.image;
     cb(null, dir); 
@@ -950,7 +952,7 @@ const storage = multer.diskStorage({
 
 export const upload = multer({ 
   storage, 
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB for large videos
+  limits: { fileSize: 500 * 1024 * 1024 }, 
   fileFilter: (req, file, cb) => { 
     const allowed = [
       'image/jpeg', 'image/png', 'image/gif', 'image/webp', 
@@ -1116,7 +1118,7 @@ app.post("/auth/check-vpn", async (req, res) => {
 });
 
 // ==========================================
-// AUTH ROUTES
+// AUTH ROUTES (SECURED)
 // ==========================================
 
 app.post("/api/auth/register", checkBan, async (req, res) => {
@@ -1136,6 +1138,15 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
     }
 
     if (age < 1 || age > 130) return res.status(400).json({ error: "Invalid age" });
+
+    // SECURITY: Validate Password Strength
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ 
+        error: "Password does not meet requirements", 
+        details: passwordValidation.errors 
+      });
+    }
 
     if (TURNSTILE_SECRET_KEY) {
       if (!captchaToken) return res.status(403).json({ error: "Security verification required" });
@@ -1164,7 +1175,8 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
       } catch (err) { console.error("Profile upload failed:", err.message); }
     }
 
-    const password_hash = await argon2.hash(password);
+    // SECURITY: Use Secure Hashing Function
+    const password_hash = await hashPassword(password);
     const isKid = age <= 12;
 
     const { rows } = await pool.query(
@@ -1210,7 +1222,8 @@ app.post("/api/auth/login", checkBan, async (req, res) => {
     const user = rows[0];
     if (!user.password_hash) return res.status(401).json({ error: "Use OAuth to login" });
 
-    const validPass = await argon2.verify(user.password_hash, password);
+    // SECURITY: Verify using Secure Function (includes Pepper)
+    const validPass = await verifyPassword(user.password_hash, password);
     if (!validPass) return res.status(401).json({ error: "Invalid credentials" });
 
     await pool.query("UPDATE users SET last_login_at = NOW(), failed_login_count = 0 WHERE id = $1", [user.id]);
@@ -1275,7 +1288,7 @@ app.get("/api/me/restrictions", authMiddleware, async (req, res) => {
   }
 });
 
-// --- PASSWORD RESET ROUTES ---
+// --- PASSWORD RESET ROUTES (SECURED) ---
 app.post("/api/forgot-password", async (req, res) => {
   try {
     const { email } = req.body;
@@ -1314,10 +1327,22 @@ app.post("/api/reset-password", async (req, res) => {
   try {
     const { email, code, newPassword } = req.body;
     if (!email || !code || !newPassword) return res.status(400).json({ error: "Missing fields" });
-    if (newPassword.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+
+    // SECURITY: Validate New Password
+    const passwordValidation = validatePassword(newPassword);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ 
+        error: "Password does not meet requirements", 
+        details: passwordValidation.errors 
+      });
+    }
+
     const { rows } = await pool.query(`SELECT * FROM password_resets WHERE email = $1 AND code = $2 AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1`, [email, code]);
     if (rows.length === 0) return res.status(400).json({ error: "Invalid or expired code." });
-    const password_hash = await argon2.hash(newPassword);
+    
+    // SECURITY: Use Secure Hashing Function
+    const password_hash = await hashPassword(newPassword);
+    
     await pool.query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE email = $2", [password_hash, email]);
     await pool.query("DELETE FROM password_resets WHERE email = $1", [email]);
     res.json({ message: "Password reset successfully." });
@@ -1398,7 +1423,6 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('media'), 
       return res.status(403).json({ error: "Account Suspended", type: "suspended", until: uStatus.suspend_until });
     }
 
-    // Text moderation
     if (content) {
       const moderationResult = await checkTextModeration(content, userId);
       if (!moderationResult.allowed) {
@@ -1411,7 +1435,6 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('media'), 
     let thumbnailUrl = null;
     let messageType = type || 'text';
 
-    // Handle file upload (images, videos, voice notes)
     if (req.file) {
       if (!s3) return res.status(500).json({ error: "S3 not configured" });
       
@@ -1419,29 +1442,23 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('media'), 
       const timestamp = Date.now();
       
       if (file.mimetype.startsWith('image/')) {
-        // Process image at multiple sizes
         const imageResults = await processAndUploadImage(file.path, userId, 'chat-media');
         mediaUrl = imageResults.full.url;
         thumbnailUrl = imageResults.thumbnail.url;
         messageType = 'image';
       } else if (file.mimetype.startsWith('video/')) {
-        // Upload video
         const videoKey = `chat-media/videos/${userId}/${timestamp}-${file.originalname}`;
         const videoResult = await uploadToS3(file, videoKey, file.mimetype);
         mediaUrl = videoResult.url;
         
-        // Extract thumbnail
         try {
           const thumbPath = await extractVideoThumbnail(file.path, 1);
           const thumbKey = `chat-media/thumbs/${userId}/${timestamp}-thumb.jpg`;
           const thumbResult = await uploadToS3({ path: thumbPath }, thumbKey, 'image/jpeg');
           thumbnailUrl = thumbResult.url;
-        } catch (e) {
-          // Thumbnail extraction failed, continue without it
-        }
+        } catch (e) { }
         messageType = 'video';
       } else if (file.mimetype.startsWith('audio/')) {
-        // Upload audio/voice
         const audioKey = `chat-media/audio/${userId}/${timestamp}-${file.originalname}`;
         const audioResult = await uploadToS3(file, audioKey, file.mimetype);
         mediaUrl = audioResult.url;
@@ -1459,7 +1476,6 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('media'), 
     
     io.to(`chat-${chatId}`).emit("new-message", rows[0]);
     
-    // Update chat's last_message_at
     await pool.query(`UPDATE chats SET last_message_at = NOW(), last_message_id = $1 WHERE id = $2`, [rows[0].id, parseInt(chatId)]).catch(() => {});
     
     res.status(201).json({ message: rows[0] });
@@ -1481,7 +1497,6 @@ app.post("/api/upload/image", authMiddleware, upload.single('image'), async (req
     const { purpose } = req.body; // 'profile', 'cover', 'post', 'generic'
     const folder = purpose || 'images';
 
-    // Run moderation on the image
     const moderationResult = await runAllModerationChecks(req.file.path, userId);
     if (!moderationResult.allowed) {
       try { fs.unlinkSync(req.file.path); } catch (e) {}
@@ -1489,7 +1504,6 @@ app.post("/api/upload/image", authMiddleware, upload.single('image'), async (req
       return res.status(403).json({ error: "Violation Detected", reason: moderationResult.reason });
     }
 
-    // Process and upload at multiple sizes
     const results = await processAndUploadImage(req.file.path, userId, folder);
 
     res.status(201).json({
@@ -1531,10 +1545,8 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
     let thumbnailPath = thumbnailFile?.path;
     let thumbFileName = thumbnailFile?.filename;
 
-    // Get video duration using ffprobe
     const duration = await getVideoDuration(videoFile.path);
 
-    // Generate thumbnail if not provided
     if (!thumbnailPath) {
       try {
         thumbnailPath = await extractVideoThumbnail(videoFile.path, 1);
@@ -1544,7 +1556,6 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
       }
     }
 
-    // Run moderation on thumbnail
     if (thumbnailPath && fs.existsSync(thumbnailPath)) {
       io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Checking content...', progress: 25 });
       
@@ -1558,7 +1569,6 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
       }
     }
 
-    // Upload video to S3
     io.to(`user-${userId}`).emit('upload-status', { step: 2, status: 'Uploading video...', progress: 40 });
 
     const timestamp = Date.now();
@@ -1567,7 +1577,6 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
     
     io.to(`user-${userId}`).emit('upload-status', { step: 3, status: 'Uploading thumbnail...', progress: 70 });
     
-    // Upload thumbnail to S3
     let thumbnailUrl = `https://placehold.co/1280x720?text=${encodeURIComponent(title || 'Video')}`;
     let thumbnailS3Key = null;
     if (thumbnailPath && fs.existsSync(thumbnailPath)) {
@@ -1639,7 +1648,6 @@ app.put("/api/seller/orders/:id", authMiddleware, async (req, res) => {
     const { status, tracking_number } = req.body;
     const sellerId = req.user.id;
 
-    // 1. Verify the order belongs to this seller
     const { rows: orderCheck } = await pool.query(
       "SELECT * FROM orders WHERE id = $1 AND seller_id = $2", 
       [id, sellerId]
@@ -1649,18 +1657,12 @@ app.put("/api/seller/orders/:id", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "Order not found or unauthorized" });
     }
 
-    // 2. Update the order
     const { rows } = await pool.query(
       `UPDATE orders 
        SET status = $1, tracking_number = $2, updated_at = NOW() 
        WHERE id = $3 RETURNING *`,
       [status, tracking_number || null, id]
     );
-
-    // 3. Optional: Notify buyer via Socket.io
-    // if (status === 'shipped') {
-    //   io.to(`user-${orderCheck[0].buyer_id}`).emit("order-update", { orderId: id, status });
-    // }
 
     res.json(rows[0]);
   } catch (err) {
@@ -1682,11 +1684,9 @@ app.delete("/api/videos/:id", authMiddleware, async (req, res) => {
 
     const video = rows[0];
 
-    // Delete from S3
     if (video.video_s3_key) await deleteFromS3(video.video_s3_key);
     if (video.thumbnail_s3_key) await deleteFromS3(video.thumbnail_s3_key);
 
-    // Delete from DB
     await pool.query("DELETE FROM videos WHERE id = $1", [id]);
 
     res.json({ success: true, message: "Video deleted" });
@@ -1718,7 +1718,6 @@ app.get("/api/videos/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed" }); } 
 });
 
-// Secure streaming URL for videos (presigned URL for private content)
 app.get("/api/videos/:id/stream", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1727,14 +1726,12 @@ app.get("/api/videos/:id/stream", authMiddleware, async (req, res) => {
 
     const video = rows[0];
     
-    // If video is public and we have a CDN URL, just return it
     if (video.is_public && video.video_url) {
       return res.json({ streamUrl: video.video_url });
     }
 
-    // For private/premium content, generate a presigned URL
     if (video.video_s3_key) {
-      const signedUrl = await generatePresignedUrl(video.video_s3_key, 3600); // 1 hour
+      const signedUrl = await generatePresignedUrl(video.video_s3_key, 3600);
       return res.json({ streamUrl: signedUrl });
     }
 
@@ -1814,11 +1811,8 @@ app.post("/api/products", authMiddleware, upload.array('images', 5), async (req,
     const { name, description, price, type, tags, sizes, colors, crypto, stock } = req.body;
     const userId = req.user.id;
 
-    // Handle Images (Simplistic: Assume S3 upload logic here or save URLs)
-    // In a real app, you would process req.files here.
-    // For this example, we assume the frontend sent URLs or you process files here.
     const images = req.files && req.files.length > 0 
-      ? req.files.map(f => `/uploads/${f.filename}`) // Local storage mock
+      ? req.files.map(f => `/uploads/${f.filename}`) 
       : [];
 
     const { rows } = await client.query(
@@ -1852,12 +1846,11 @@ app.post("/api/orders/checkout", authMiddleware, async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    const { items } = req.body; // Array of { productId, quantity }
+    const { items } = req.body; 
     const buyerId = req.user.id;
 
-    // 1. Validate Products and Calculate Total
     let totalAmount = 0;
-    let sellers = new Set(); // Track unique sellers (for notifications later)
+    let sellers = new Set(); 
 
     const processedItems = await Promise.all(items.map(async (item) => {
       const { rows } = await client.query("SELECT * FROM products WHERE id = $1", [item.productId]);
@@ -1865,7 +1858,6 @@ app.post("/api/orders/checkout", authMiddleware, async (req, res) => {
       
       const product = rows[0];
       
-      // Check Stock for Physical
       if (product.type === 'physical' && product.stock < item.quantity) {
         throw new Error(`Insufficient stock for ${product.name}`);
       }
@@ -1882,14 +1874,12 @@ app.post("/api/orders/checkout", authMiddleware, async (req, res) => {
       };
     }));
 
-    // 2. Create Order (Simplistic: One order per buyer, mixing sellers)
     const { rows: orderRes } = await client.query(
       `INSERT INTO orders (buyer_id, total, status) VALUES ($1, $2, 'pending') RETURNING *`,
       [buyerId, totalAmount]
     );
     const orderId = orderRes[0].id;
 
-    // 3. Create Order Items & Update Stock
     for (const item of processedItems) {
       await client.query(
         `INSERT INTO order_items (order_id, product_id, product_name, product_price, quantity) 
@@ -1897,7 +1887,6 @@ app.post("/api/orders/checkout", authMiddleware, async (req, res) => {
         [orderId, item.product_id, item.product_name, item.product_price, item.quantity]
       );
 
-      // Reduce stock if physical
       await client.query(
         `UPDATE products SET stock = stock - $1 WHERE id = $2`,
         [item.quantity, item.product_id]
@@ -1954,10 +1943,8 @@ app.post("/api/music/upload", authMiddleware, upload.fields([{ name: 'audio', ma
     const audioFile = req.files.audio[0];
     let coverFile = req.files?.cover?.[0];
 
-    // Get audio duration
     const duration = await getAudioDuration(audioFile.path);
 
-    // Moderation on cover art
     if (coverFile) {
       io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Checking cover art...', progress: 25 });
       
@@ -1970,14 +1957,12 @@ app.post("/api/music/upload", authMiddleware, upload.fields([{ name: 'audio', ma
       }
     }
 
-    // Upload audio to S3
     io.to(`user-${userId}`).emit('upload-status', { step: 2, status: 'Uploading audio...', progress: 40 });
 
     const timestamp = Date.now();
     const audioKey = `music/${userId}/${timestamp}-${audioFile.originalname}`;
     const audioResult = await uploadToS3(audioFile, audioKey, audioFile.mimetype);
     
-    // Upload cover art to S3 (with multi-size processing)
     io.to(`user-${userId}`).emit('upload-status', { step: 3, status: 'Uploading cover...', progress: 70 });
     
     let coverUrl = "https://placehold.co/300x300?text=No+Cover";
@@ -2010,7 +1995,6 @@ app.post("/api/music/upload", authMiddleware, upload.fields([{ name: 'audio', ma
   }
 });
 
-// GET music list
 app.get("/api/music", async (req, res) => {
   try {
     const { filter, genre, userId: artistId } = req.query;
@@ -2030,7 +2014,6 @@ app.get("/api/music", async (req, res) => {
   }
 });
 
-// GET single music track
 app.get("/api/music/:id", async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -2039,7 +2022,6 @@ app.get("/api/music/:id", async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     
-    // Increment play count
     pool.query(`UPDATE music SET plays = plays + 1 WHERE id = $1`, [req.params.id]).catch(()=>{});
     
     res.json({ music: rows[0] });
@@ -2048,7 +2030,6 @@ app.get("/api/music/:id", async (req, res) => {
   }
 });
 
-// Secure streaming URL for music (presigned URL for private content)
 app.get("/api/music/:id/stream", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2057,12 +2038,10 @@ app.get("/api/music/:id/stream", authMiddleware, async (req, res) => {
 
     const track = rows[0];
     
-    // If we have a CDN URL, return it directly
     if (track.audio_url && AWS_CLOUDFRONT_DOMAIN) {
       return res.json({ streamUrl: track.audio_url });
     }
 
-    // Otherwise, generate a presigned URL
     if (track.audio_s3_key) {
       const signedUrl = await generatePresignedUrl(track.audio_s3_key, 3600);
       return res.json({ streamUrl: signedUrl });
@@ -2075,7 +2054,6 @@ app.get("/api/music/:id/stream", authMiddleware, async (req, res) => {
   }
 });
 
-// DELETE music + S3 files
 app.delete("/api/music/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2086,11 +2064,9 @@ app.delete("/api/music/:id", authMiddleware, async (req, res) => {
 
     const track = rows[0];
 
-    // Delete from S3
     if (track.audio_s3_key) await deleteFromS3(track.audio_s3_key);
     if (track.cover_s3_key) await deleteFromS3(track.cover_s3_key);
 
-    // Delete from DB
     await pool.query("DELETE FROM music WHERE id = $1", [id]);
 
     res.json({ success: true, message: "Music deleted" });
@@ -2100,7 +2076,6 @@ app.delete("/api/music/:id", authMiddleware, async (req, res) => {
   }
 });
 
-// Music reactions
 app.post("/api/music/:id/react", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2146,7 +2121,6 @@ app.put("/api/users/me", authMiddleware, upload.fields([{ name: 'profile', maxCo
     let profile_url = req.body.profile_url;
     let cover_url = req.body.cover_url;
 
-    // Upload profile picture if provided
     if (req.files?.profile?.[0]) {
       if (!s3) return res.status(500).json({ error: "S3 not configured" });
       const file = req.files.profile[0];
@@ -2162,7 +2136,6 @@ app.put("/api/users/me", authMiddleware, upload.fields([{ name: 'profile', maxCo
       try { fs.unlinkSync(file.path); } catch (e) {}
     }
 
-    // Upload cover photo if provided
     if (req.files?.cover?.[0]) {
       if (!s3) return res.status(500).json({ error: "S3 not configured" });
       const file = req.files.cover[0];
@@ -2389,7 +2362,7 @@ app.post("/api/chats", authMiddleware, async (req, res) => {
 });
 
 // ==========================================
-// PRESIGNED URL ENDPOINT (for secure downloads)
+// PRESIGNED URL ENDPOINT
 // ==========================================
 app.get("/api/media/presigned-url", authMiddleware, async (req, res) => {
   try {
