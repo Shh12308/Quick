@@ -1295,8 +1295,6 @@ app.post("/api/auth/login", checkBan, async (req, res) => {
   try {
     const { email, password, captchaToken } = req.body;
 
-    if (!email || !password) return res.status(400).json({ error: " "Email and password required" });
-
     if (TURNSTILE_SECRET_KEY) {
       if (!captchaToken) return res.status(403).json({ error: "Security verification required" });
       const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
