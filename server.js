@@ -2302,7 +2302,7 @@ app.post("/api/elite/trigger-alert", authMiddleware, async (req, res) => {
     const target = targetUserId || req.user.id; 
     io.to(`user-${target}`).emit("privacy_alert", alertPayload);
     res.json({ success: true, alert: alertPayload });
-  } catch (err) { console.error("Elite alert error:", err); res.status(500).new Error("Failed to send alert" }); 
+  } catch (err) { console.error("Elite alert error:", err); res.status(500).new ("Failed to send alert" }); 
 });
 
 // ==========================================
