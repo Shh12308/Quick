@@ -2296,15 +2296,29 @@ app.post("/api/livestreams", authMiddleware, async (req, res) => {
 
 app.post("/api/elite/trigger-alert", authMiddleware, async (req, res) => {
   try {
-    if (req.user.role !== 'elite') return res.status(403).json({ error: "This feature is for Elite members only." });
+    if (req.user.role !== 'elite') {
+      return res.status(403).json({ error: "This feature is for Elite members only." });
+    }
+
     const { alertType, details, targetUserId } = req.body;
-    const alertPayload = { id: uuidv4(), type: alertType || 'screenshot', message: details || "Someone took a screenshot of your content.", timestamp: new Date() };
-    const target = targetUserId || req.user.id; 
+
+    const alertPayload = {
+      id: uuidv4(),
+      type: alertType || 'screenshot',
+      message: details || "Someone took a screenshot of your content.",
+      timestamp: new Date()
+    };
+
+    const target = targetUserId || req.user.id;
+
     io.to(`user-${target}`).emit("privacy_alert", alertPayload);
+
     res.json({ success: true, alert: alertPayload });
+
   } catch (err) {
-  console.error("Elite alert error:", err);
-  res.status(500).json({ error: "Failed to send alert" });
+    console.error("Elite alert error:", err);
+    res.status(500).json({ error: "Failed to send alert" });
+  }
 });
 
 // ==========================================
