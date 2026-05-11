@@ -1987,7 +1987,9 @@ app.post("/api/orders/checkout", authMiddleware, async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     console.error("Checkout error:", err);
-    res.status(500).new Error(err.message || "Checkout failed" });
+    res.status(500).json({
+  error: err.message || "Checkout failed"
+});
   } finally {
     client.release();
   }
