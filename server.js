@@ -1315,10 +1315,12 @@ app.post("/api/auth/login", checkBan, async (req, res) => {
     await pool.query("UPDATE users SET last_login_at = NOW(), failed_login_count = 0 WHERE id = $1", [user.id]);
 
     const { password_hash, ...safeUser } = user;
-    res.json({
-      user: safeUser,
-      jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "7d" });
-    });
+    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "7d" });
+
+res.json({
+  user: safeUser,
+  token
+});
   } catch (err) {
     console.error("Login error:", err);
     res.status(500).json({ error: "Login failed" });
