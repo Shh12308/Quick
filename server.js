@@ -1725,7 +1725,7 @@ app.get("/api/seller/orders", authMiddleware, async (req, res) => {
     res.json(rows);
   } catch (err) {
     console.error("Fetch seller orders error:", err);
-    res.status(500)..json({ error: "Failed to fetch orders" });
+    res.status(500).json({ error: "Failed to fetch orders" });
   }
 });
 
