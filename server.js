@@ -2244,11 +2244,26 @@ app.put("/api/users/me", authMiddleware, upload.fields([{ name: 'profile', maxCo
 
 app.get("/api/settings", authMiddleware, async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT id, username, email, preferences, role, subscription_plan, notification_style FROM users WHERE id = $1`, [req.user.id]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json({ settings: { preferences: rows[0].preferences || {}, role: rows[0].role, subscription_plan: rows[0].subscription_plan });
-  } catch (err) { 
-    res.status(500)..json({ error: "Failed to fetch settings" }); 
+    const { rows } = await pool.query(
+      `SELECT id, username, email, preferences, role, subscription_plan, notification_style
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json({
+      settings: {
+        preferences: rows[0].preferences || {},
+        role: rows[0].role,
+        subscription_plan: rows[0].subscription_plan
+      }
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch settings" });
   }
 });
 
