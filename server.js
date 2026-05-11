@@ -1317,7 +1317,7 @@ app.post("/api/auth/login", checkBan, async (req, res) => {
     const { password_hash, ...safeUser } = user;
     res.json({
       user: safeUser,
-      jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "7d" });,
+      jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "7d" });
     });
   } catch (err) {
     console.error("Login error:", err);
