@@ -1794,41 +1794,76 @@ app.post("/api/agora/token", authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed to generate token" }); }
 });
 
-app.post("/api/chats", authMiddleware, async (req, res) => {
-  try {
-    const { participantId, type, name } = req.body; const userId = req.user.id;
-    if (!participantId) return res.status(400).json({ error: "Participant required" });
-    if (type !== 'group') {
-      const { rows: existing } = await pool.query(`SELECT * FROM chats WHERE $1 = ANY(participants) AND $2 = ANY(participants) AND type = 'private'`, [userId, participantId]);
-      if (existing.length) return res.json({ chat: existing[0] });
-    }
-    const { rows } = await pool.query(`INSERT INTO chats (creator_id, type, name, participants, admin_id) VALUES ($1, $2, $3, $4, $1) RETURNING *`, [userId, type || 'private', name || null, [userId, participantId]]);
-    res.status(201).json({ chat: rows[0] });
-  } catch (err) { console.error("Create chat error:", err); res.status(500).json({ error: "Failed to create chat" }); }
-});
-
 app.get("/api/media/presigned-url", authMiddleware, async (req, res) => {
   try {
     const { key, expiry } = req.query;
-    if (!key) return res.status(400).json({ error: "S3 key required" });
-    const signedUrl = await generatePresignedUrl(key, parseInt(expiry) || 0);
-    if (!signedUrl) return res.status(500).json({ error: "Failed to generate presigned URL" });
+
+    if (!key) {
+      return res.status(400).json({ error: "S3 key required" });
+    }
+
+    const signedUrl = await generatePresignedUrl(
+      key,
+      Number(expiry) || 0
+    );
+
+    if (!signedUrl) {
+      return res.status(500).json({
+        error: "Failed to generate presigned URL"
+      });
+    }
+
     res.json({ url: signedUrl });
-  } catch (err) { console.error("Presigned URL error:", err); res.status(500).json({ error: "Failed to generate presigned URL" }); }
+  } catch (err) {
+    console.error("Presigned URL error:", err);
+    res.status(500).json({ error: "Failed to generate presigned URL" });
+  }
 });
 
-app.use((req, res) => { res.status(404).json({ error: "Route not found" }); });
-app.use((err, req, res, next) => { console.error("Unhandled error:", err); res.status(500).json({ error: "Internal server error" }); });
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: "Route not found" });
+});
 
-(async () => {
-  server.listen(PORT, '0.0.0.0', () => { 
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📦 S3: ${s3 ? 'Connected' : 'Not configured'}`);
-    console.log(`🌐 CDN: ${AWS_CLOUDFRONT_DOMAIN || 'Not configured (using direct S3)'}`);
-    console.log(`📲 OneSignal: ${oneSignalClient ? 'Connected' : 'Not configured'}`);
-    try {
-      if (DATABASE_URL) { await initializeTables(); console.log("✅ DB Init Complete"); }
-      if (pubClient && subClient) { await pubClient.connect(); await subClient.connect(); io.adapter(createAdapter(pubClient, subClient)); console.log("✅ Redis Connected"); }
-    } catch (err) { console.error("Init error:", err.message); }
-  });
-})();
+// global error handler
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+async function bootstrap() {
+  try {
+    // DB init
+    if (DATABASE_URL) {
+      await initializeTables();
+      console.log("✅ DB Init Complete");
+    }
+
+    // Redis init
+    if (pubClient && subClient) {
+      await pubClient.connect();
+      await subClient.connect();
+
+      io.adapter(createAdapter(pubClient, subClient));
+      console.log("✅ Redis Connected");
+    }
+
+    // Start server ONLY after dependencies are ready
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+      console.log(`📦 S3: ${s3 ? "Connected" : "Not configured"}`);
+      console.log(
+        `🌐 CDN: ${AWS_CLOUDFRONT_DOMAIN || "Not configured (using direct S3)"}`
+      );
+      console.log(
+        `📲 OneSignal: ${oneSignalClient ? "Connected" : "Not configured"}`
+      );
+    });
+
+  } catch (err) {
+    console.error("Init error:", err);
+    process.exit(1); // fail fast if critical systems fail
+  }
+}
+
+bootstrap();
