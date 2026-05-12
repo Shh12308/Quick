@@ -28,7 +28,7 @@ import NodeCache from "node-cache";
 import sharp from "sharp";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
-import OneSignal from 'onesignal-client';
+import OneSignal from "@onesignal/node-onesignal";
 import FormData from "form-data";
 
 import { 
