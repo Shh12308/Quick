@@ -426,8 +426,7 @@ async function initializeTables() {
   current_period_start TIMESTAMP,
   current_period_end TIMESTAMP,
   created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
+  updated_at TIMESTAMP DEFAULT NOW()`);
     await pool.query(`CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), amount DECIMAL(10,2), status TEXT, type TEXT, created_at TIMESTAMP DEFAULT NOW())`);
     
     // Music
