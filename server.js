@@ -10,7 +10,7 @@ import http from "http";
 import nodemailer from "nodemailer";
 import multer from "multer";
 import Stripe from "stripe";
-import path, { dirname } from 'path'; // FIXED: Merged duplicate path import
+import path, { dirname } from 'path';
 import fs from "fs"; 
 import { Server as SocketServer } from "socket.io";
 import pkg from "agora-access-token";
@@ -28,7 +28,8 @@ import NodeCache from "node-cache";
 import sharp from "sharp";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
-import OneSignal from 'onesignal-node';
+import OneSignal from 'onesignal-client';
+import FormData from "form-data";
 
 import { 
   S3Client, 
@@ -69,10 +70,8 @@ const {
   REDIS_URL,
   SIGNED_URL_EXPIRY,
   PASSWORD_PEPPER,
-  // NEW: OneSignal Credentials
   ONESIGNAL_APP_ID,
   ONESIGNAL_API_KEY,
-  // FIXED: Added missing moderation env vars
   HIVE_API_KEY,
   SIGHTENGINE_USER,
   SIGHTENGINE_SECRET
@@ -203,13 +202,13 @@ const s3 = AWS_REGION && AWS_ACCESS_KEY_ID ? new S3Client({
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
 // ==========================================
-// NODEMAILER TRANSPORTER (FIXED: Missing definition)
+// NODEMAILER TRANSPORTER
 // ==========================================
 const transporter = EMAIL_HOST && EMAIL_USER && EMAIL_PASS 
   ? nodemailer.createTransport({
       host: EMAIL_HOST,
       port: EMAIL_PORT || 587,
-      secure: EMAIL_PORT == 465, // true for 465, false for other ports
+      secure: EMAIL_PORT == 465,
       auth: {
         user: EMAIL_USER,
         pass: EMAIL_PASS,
@@ -251,57 +250,17 @@ io.on("connection", (socket) => {
 // ==========================================
 // DATABASE INITIALIZATION
 // ==========================================
+async function safeAddColumn(table, column, definition) {
+  try {
+    await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
+  } catch (err) {
+    console.warn(`Column ${table}.${column} may already exist: ${err.message}`);
+  }
+}
+
 async function initializeTables() {
   try {
-    // Orders
-    await pool.query(`CREATE TABLE IF NOT EXISTS orders (
-      id SERIAL PRIMARY KEY,
-      buyer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-      seller_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-      product_id INTEGER REFERENCES products(id) ON DELETE SET NULL, 
-      product_name VARCHAR(255),
-      product_image TEXT,
-      product_type VARCHAR(20), 
-      total DECIMAL(10, 5),
-      currency VARCHAR(10) DEFAULT 'USD',
-      status VARCHAR(20) DEFAULT 'pending',
-      buyer_address TEXT,
-      tracking_number TEXT,
-      created_at TIMESTAMP DEFAULT NOW(),
-      updated_at TIMESTAMP DEFAULT NOW()
-    )`);
-
-    // Products
-    await pool.query(`CREATE TABLE IF NOT EXISTS products (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      name VARCHAR(255) NOT NULL,
-      description TEXT,
-      price DECIMAL(10, 2) NOT NULL,
-      type VARCHAR(20) DEFAULT 'physical',
-      images JSONB DEFAULT '[]',
-      stock INTEGER DEFAULT 0,
-      tags JSONB DEFAULT '[]',
-      sizes JSONB DEFAULT '[]',
-      colors JSONB DEFAULT '[]',
-      crypto VARCHAR(10),
-      category VARCHAR(100),
-      views INTEGER DEFAULT 0,
-      created_at TIMESTAMP DEFAULT NOW()
-    )`);
-
-    // Order Items
-    await pool.query(`CREATE TABLE IF NOT EXISTS order_items (
-      id SERIAL PRIMARY KEY,
-      order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
-      product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
-      product_name VARCHAR(255),
-      product_price DECIMAL(10, 2),
-      quantity INTEGER DEFAULT 1,
-      created_at TIMESTAMP DEFAULT NOW()
-    )`);
-    
-    // Users
+    // 1. USERS FIRST — referenced by everything else
     await pool.query(`CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY, 
       username VARCHAR(255) UNIQUE NOT NULL, 
@@ -338,19 +297,7 @@ async function initializeTables() {
       notification_style VARCHAR(20) DEFAULT 'named'
     )`);
 
-    await pool.query(`CREATE TABLE IF NOT EXISTS user_devices (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, device_id VARCHAR(255) NOT NULL, ip_address VARCHAR(45), user_agent TEXT, last_seen TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, device_id))`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS security_logs (id SERIAL PRIMARY KEY, event_type VARCHAR(50) NOT NULL, user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, ip_address VARCHAR(45), device_id VARCHAR(255), details JSONB, created_at TIMESTAMP DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS creator_stats (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, total_likes INTEGER DEFAULT 0, total_follows INTEGER DEFAULT 0, total_views INTEGER DEFAULT 0, total_tips DECIMAL(10,2) DEFAULT 0, total_merch_sales INTEGER DEFAULT 0, earnings DECIMAL(10,2) DEFAULT 0, updated_at TIMESTAMP DEFAULT NOW())`);
-    
-    await pool.query(`CREATE TABLE IF NOT EXISTS chat_moderation (
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      chat_id TEXT, 
-      warning_count INTEGER DEFAULT 0,
-      chat_suspended_until TIMESTAMP,
-      last_warning_at TIMESTAMP,
-      PRIMARY KEY (user_id, chat_id)
-    )`);
-
+    // 2. INDEPENDENT TABLES (no foreign keys)
     await pool.query(`CREATE TABLE IF NOT EXISTS banned_devices (
       id SERIAL PRIMARY KEY,
       identifier VARCHAR(255) UNIQUE NOT NULL,
@@ -365,11 +312,69 @@ async function initializeTables() {
       expires_at TIMESTAMP NOT NULL
     )`);
 
-    await pool.query(`CREATE TABLE IF NOT EXISTS chats (id SERIAL PRIMARY KEY, creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(10), name VARCHAR(255), avatar TEXT, participants INTEGER[] DEFAULT '{}', admin_id INTEGER REFERENCES users(id), pinned_by INTEGER[] DEFAULT '{}', muted_by JSONB DEFAULT '{}', last_message_id INTEGER, last_message_at TIMESTAMP, is_archived BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, chat_id TEXT, sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(20), content TEXT, media_url TEXT, thumbnail_url TEXT, is_deleted BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS message_reactions (id SERIAL PRIMARY KEY, message_id TEXT, user_id INTEGER REFERENCES users(id), reaction TEXT, created_at TIMESTAMP DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS subscription_tiers (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(100),
+      price DECIMAL(10,2),
+      benefits JSON,
+      role VARCHAR(50)
+    )`);
+
+    await pool.query(`CREATE TABLE IF NOT EXISTS stripe_events (
+      id SERIAL PRIMARY KEY, 
+      event_id TEXT UNIQUE NOT NULL, 
+      processed_at TIMESTAMP DEFAULT NOW()
+    )`);
+
+    // 3. TABLES THAT REFERENCE USERS
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_devices (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, device_id VARCHAR(255) NOT NULL, ip_address VARCHAR(45), user_agent TEXT, last_seen TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, device_id))`);
     
-    // Videos
+    await pool.query(`CREATE TABLE IF NOT EXISTS security_logs (id SERIAL PRIMARY KEY, event_type VARCHAR(50) NOT NULL, user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, ip_address VARCHAR(45), device_id VARCHAR(255), details JSONB, created_at TIMESTAMP DEFAULT NOW())`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS creator_stats (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, total_likes INTEGER DEFAULT 0, total_follows INTEGER DEFAULT 0, total_views INTEGER DEFAULT 0, total_tips DECIMAL(10,2) DEFAULT 0, total_merch_sales INTEGER DEFAULT 0, earnings DECIMAL(10,2) DEFAULT 0, updated_at TIMESTAMP DEFAULT NOW())`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS chat_moderation (
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      chat_id TEXT, 
+      warning_count INTEGER DEFAULT 0,
+      chat_suspended_until TIMESTAMP,
+      last_warning_at TIMESTAMP,
+      PRIMARY KEY (user_id, chat_id)
+    )`);
+
+    await pool.query(`CREATE TABLE IF NOT EXISTS email_confirmations (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, token VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMP NOT NULL, created_at TIMESTAMP DEFAULT NOW())`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_subscriptions (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      tier_id INTEGER REFERENCES subscription_tiers(id) ON DELETE SET NULL,
+      stripe_subscription_id TEXT,
+      status TEXT,
+      current_period_start TIMESTAMP,
+      current_period_end TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )`);
+
+    await pool.query(`CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), amount DECIMAL(10,2), status TEXT, type TEXT, created_at TIMESTAMP DEFAULT NOW())`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      name VARCHAR(255) NOT NULL,
+      description TEXT,
+      price DECIMAL(10, 2) NOT NULL,
+      type VARCHAR(20) DEFAULT 'physical',
+      images JSONB DEFAULT '[]',
+      stock INTEGER DEFAULT 0,
+      tags JSONB DEFAULT '[]',
+      sizes JSONB DEFAULT '[]',
+      colors JSONB DEFAULT '[]',
+      crypto VARCHAR(10),
+      category VARCHAR(100),
+      views INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW()
+    )`);
+
     await pool.query(`CREATE TABLE IF NOT EXISTS videos (
       id SERIAL PRIMARY KEY, 
       user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
@@ -406,43 +411,6 @@ async function initializeTables() {
       updated_at TIMESTAMP DEFAULT NOW()
     )`);
     
-    await pool.query(`CREATE TABLE IF NOT EXISTS content_reactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, reaction_type VARCHAR(10), created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_id, content_type))`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS comments (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE, content TEXT NOT NULL, likes INTEGER DEFAULT 0, dislikes INTEGER DEFAULT 0, replies_count INTEGER DEFAULT 0, is_pinned BOOLEAN DEFAULT false, is_deleted BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS notifications (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL, type VARCHAR(50) NOT NULL, title VARCHAR(255), message TEXT, data JSON, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`);
-    
-    await pool.query(`CREATE TABLE IF NOT EXISTS likes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_id))`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS dislikes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_id))`);
-    
-    await pool.query(`CREATE TABLE IF NOT EXISTS livestreams (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(255) NOT NULL, description TEXT, category VARCHAR(100), thumbnail_url VARCHAR(500), stream_key VARCHAR(255) UNIQUE NOT NULL, is_live BOOLEAN DEFAULT false, is_scheduled BOOLEAN DEFAULT false, scheduled_start TIMESTAMP, viewers INTEGER DEFAULT 0, peak_viewers INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, shares INTEGER DEFAULT 0, duration INTEGER, recording_url VARCHAR(500), chat_enabled BOOLEAN DEFAULT true, delay_seconds INTEGER DEFAULT 0, tags JSON, earnings DECIMAL(10, 2) DEFAULT 0, started_at TIMESTAMP, ended_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS email_confirmations (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, token VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMP NOT NULL, created_at TIMESTAMP DEFAULT NOW())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS stripe_events (id SERIAL PRIMARY KEY, event_id TEXT UNIQUE NOT NULL, processed_at TIMESTAMP DEFAULT NOW())`);
-    
-    await pool.query(`
-  CREATE TABLE IF NOT EXISTS subscription_tiers (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(100),
-    price DECIMAL(10,2),
-    benefits JSON,
-    role VARCHAR(50)
-  )
-`);
-
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS user_subscriptions (
-    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    tier_id INTEGER REFERENCES subscription_tiers(id) ON DELETE SET NULL,
-    stripe_subscription_id TEXT,
-    status TEXT,
-    current_period_start TIMESTAMP,
-    current_period_end TIMESTAMP,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-  )
-`);
-  
-    await pool.query(`CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), amount DECIMAL(10,2), status TEXT, type TEXT, created_at TIMESTAMP DEFAULT NOW())`);
-    
-    // Music
     await pool.query(`CREATE TABLE IF NOT EXISTS music (
       id SERIAL PRIMARY KEY, 
       user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
@@ -462,7 +430,8 @@ await pool.query(`
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Calls
+    await pool.query(`CREATE TABLE IF NOT EXISTS livestreams (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(255) NOT NULL, description TEXT, category VARCHAR(100), thumbnail_url VARCHAR(500), stream_key VARCHAR(255) UNIQUE NOT NULL, is_live BOOLEAN DEFAULT false, is_scheduled BOOLEAN DEFAULT false, scheduled_start TIMESTAMP, viewers INTEGER DEFAULT 0, peak_viewers INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, shares INTEGER DEFAULT 0, duration INTEGER, recording_url VARCHAR(500), chat_enabled BOOLEAN DEFAULT true, delay_seconds INTEGER DEFAULT 0, tags JSON, earnings DECIMAL(10, 2) DEFAULT 0, started_at TIMESTAMP, ended_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
+
     await pool.query(`CREATE TABLE IF NOT EXISTS calls (
       id SERIAL PRIMARY KEY,
       caller_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -474,6 +443,79 @@ await pool.query(`
       ended_at TIMESTAMP
     )`);
 
+    await pool.query(`CREATE TABLE IF NOT EXISTS chats (id SERIAL PRIMARY KEY, creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(10), name VARCHAR(255), avatar TEXT, participants INTEGER[] DEFAULT '{}', admin_id INTEGER REFERENCES users(id), pinned_by INTEGER[] DEFAULT '{}', muted_by JSONB DEFAULT '{}', last_message_id INTEGER, last_message_at TIMESTAMP, is_archived BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, chat_id TEXT, sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(20), content TEXT, media_url TEXT, thumbnail_url TEXT, is_deleted BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS message_reactions (id SERIAL PRIMARY KEY, message_id TEXT, user_id INTEGER REFERENCES users(id), reaction TEXT, created_at TIMESTAMP DEFAULT NOW())`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS content_reactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, reaction_type VARCHAR(10), created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_id, content_type))`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS comments (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE, content TEXT NOT NULL, likes INTEGER DEFAULT 0, dislikes INTEGER DEFAULT 0, replies_count INTEGER DEFAULT 0, is_pinned BOOLEAN DEFAULT false, is_deleted BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS notifications (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL, type VARCHAR(50) NOT NULL, title VARCHAR(255), message TEXT, data JSON, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS likes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS dislikes (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, content_type VARCHAR(20), content_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, content_type, content_id))`);
+
+    // 4. TABLES THAT REFERENCE PRODUCTS (AFTER products EXISTS)
+    await pool.query(`CREATE TABLE IF NOT EXISTS orders (
+      id SERIAL PRIMARY KEY,
+      buyer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      seller_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      product_id INTEGER REFERENCES products(id) ON DELETE SET NULL, 
+      product_name VARCHAR(255),
+      product_image TEXT,
+      product_type VARCHAR(20), 
+      total DECIMAL(10, 5),
+      currency VARCHAR(10) DEFAULT 'USD',
+      status VARCHAR(20) DEFAULT 'pending',
+      buyer_address TEXT,
+      tracking_number TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )`);
+
+    await pool.query(`CREATE TABLE IF NOT EXISTS order_items (
+      id SERIAL PRIMARY KEY,
+      order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+      product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+      product_name VARCHAR(255),
+      product_price DECIMAL(10, 2),
+      quantity INTEGER DEFAULT 1,
+      created_at TIMESTAMP DEFAULT NOW()
+    )`);
+
+    // 5. MIGRATIONS — Add columns that may be missing on existing databases
+    await safeAddColumn('users', 'cover_url', 'TEXT');
+    await safeAddColumn('users', 'notification_style', "VARCHAR(20) DEFAULT 'named'");
+    await safeAddColumn('users', 'warning_count', 'INTEGER DEFAULT 0');
+    await safeAddColumn('users', 'suspend_until', 'TIMESTAMP');
+    await safeAddColumn('users', 'suspension_reason', 'TEXT');
+    await safeAddColumn('users', 'device_id', 'VARCHAR(255)');
+    await safeAddColumn('users', 'balance', 'DECIMAL(10,2) DEFAULT 0');
+    await safeAddColumn('users', 'social_links', 'JSON');
+    await safeAddColumn('users', 'preferences', 'JSON');
+    await safeAddColumn('users', 'website', 'TEXT');
+    await safeAddColumn('users', 'location', 'TEXT');
+    await safeAddColumn('users', 'failed_login_count', 'INTEGER DEFAULT 0');
+    await safeAddColumn('users', 'last_login_at', 'TIMESTAMP');
+    await safeAddColumn('users', 'phone', 'VARCHAR(20)');
+    await safeAddColumn('users', 'auth_provider', 'VARCHAR(50)');
+    await safeAddColumn('users', 'subscription_plan', "VARCHAR(20) DEFAULT 'free'");
+    await safeAddColumn('users', 'subscription_expires', 'TIMESTAMP');
+    await safeAddColumn('users', 'is_musician', 'BOOLEAN DEFAULT false');
+    await safeAddColumn('users', 'is_creator', 'BOOLEAN DEFAULT false');
+    await safeAddColumn('users', 'is_admin', 'BOOLEAN DEFAULT false');
+    await safeAddColumn('users', 'is_verified', 'BOOLEAN DEFAULT false');
+    await safeAddColumn('users', 'status', "VARCHAR(20) DEFAULT 'active'");
+    await safeAddColumn('users', 'earnings', 'DECIMAL(10,2) DEFAULT 0');
+    await safeAddColumn('videos', 'video_s3_key', 'VARCHAR(500)');
+    await safeAddColumn('videos', 'thumbnail_s3_key', 'VARCHAR(500)');
+    await safeAddColumn('music', 'audio_s3_key', 'VARCHAR(500)');
+    await safeAddColumn('music', 'cover_s3_key', 'VARCHAR(500)');
+
+    // 6. SEED SUBSCRIPTION TIERS
     const tierCount = await pool.query("SELECT COUNT(*) FROM subscription_tiers");
     if (parseInt(tierCount.rows[0].count) === 0) {
       console.log("🌱 Seeding Subscription Tiers...");
@@ -483,9 +525,9 @@ await pool.query(`
       (3, 'Elite', 14.99, '["5 Devices", "VIP Badge", "Privacy Alerts", "Custom Themes"]', 'elite')`);
     }
 
-    console.log("Database tables initialized successfully");
+    console.log("✅ Database tables initialized successfully");
   } catch (error) { 
-    console.error("Error initializing database tables:", error); 
+    console.error("❌ Error initializing database tables:", error); 
     throw error; 
   }
 }
@@ -751,7 +793,7 @@ async function checkBan(req, res, next) {
       if (rows.length > 0) return res.status(403).json({ error: "ACCESS_DENIED", reason: "This device, email, or account has been permanently banned." });
     }
     next();
-  } catch (err) { next(); }
+  } catch (err) { console.error("checkBan error:", err); next(); }
 }
 
 async function checkTextModeration(text, userId) {
@@ -828,7 +870,7 @@ const MEDIA_DIRS = {
   audio: path.join(UPLOAD_DIR, 'audio'),
   cover: path.join(UPLOAD_DIR, 'covers'),
   image: path.join(UPLOAD_DIR, 'images'),
-  voice: path.join(UPLOAD_DIR, 'voice'), // FIXED: PUTLOAD_DIR -> UPLOAD_DIR
+  voice: path.join(UPLOAD_DIR, 'voice'),
   profile: path.join(UPLOAD_DIR, 'profile'),
 };
 Object.values(MEDIA_DIRS).forEach(dir => { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); });
@@ -916,7 +958,7 @@ passport.deserializeUser(async (id, done) => {
 if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
   passport.use(new GoogleStrategy({
     clientID: GOOGLE_CLIENT_ID,
-    clientSecret: GOOGLE_CLIENT_SECRET, // FIXED: Was CLIENT_SECRET
+    clientSecret: GOOGLE_CLIENT_SECRET,
     callbackURL: GOOGLE_CALLBACK_URL,
   }, async (accessToken, refreshToken, profile, done) => {
     try {
@@ -946,7 +988,6 @@ if (DISCORD_CLIENT_ID && DISCORD_CLIENT_SECRET) {
       let { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
       if (!rows.length) {
         const username = profile.username || email.split('@')[0];
-        // FIXED: $clientID -> $2
         const result = await pool.query(`INSERT INTO users (username, email, auth_provider, profile_url) VALUES ($1, $2, 'discord', $3) RETURNING *`, [username, email, `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png`]);
         await ensureCreatorStats(result.rows[0].id);
         rows = result.rows;
@@ -986,7 +1027,7 @@ app.get("/api/health", async (req, res) => {
     if (!DATABASE_URL) return res.status(503).json({ status: "degraded", database: "disconnected", s3: !!s3, cdn: !!AWS_CLOUDFRONT_DOMAIN });
     await pool.query("SELECT 1");
     res.json({ status: "ok", timestamp: new Date().toISOString(), s3: !!s3, cdn: !!AWS_CLOUDFRONT_DOMAIN });
-  } catch (err) { res.status(503).json({ status: "error", database: "error", message: err.message }); }
+  } catch (err) { console.error("Health check failed:", err); res.status(503).json({ status: "error", database: "error", message: err.message }); }
 });
 
 app.get("/videos", (req, res) => { res.redirect("/api/videos"); });
@@ -1000,7 +1041,7 @@ app.get("/api/check-username", async (req, res) => {
     if (username) { const resU = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [username]); usernameAvailable = resU.rows.length === 0; }
     if (email) { const resE = await pool.query("SELECT id FROM users WHERE LOWER(email) = LOWER($1)", [email]); emailAvailable = resE.rows.length === 0; }
     res.json({ usernameAvailable, emailAvailable });
-  } catch (err) { res.json({ usernameAvailable: true, emailAvailable: true }); }
+  } catch (err) { console.error("check-username error:", err); res.json({ usernameAvailable: true, emailAvailable: true }); }
 });
 
 app.post("/auth/check-vpn", async (req, res) => {
@@ -1010,7 +1051,7 @@ app.post("/auth/check-vpn", async (req, res) => {
     const response = await axios.get(`https://ipinfo.io/${ip}/json?token=${IPINFO_TOKEN}`, { timeout: 5000 });
     const data = response.data;
     res.json({ ip, country: data.country, isVpn: data.privacy?.vpn || data.privacy?.proxy || false });
-  } catch (err) { res.status(500).json({ error: "Failed to check VPN status" }); }
+  } catch (err) { console.error("check-vpn error:", err); res.status(500).json({ error: "Failed to check VPN status" }); }
 });
 
 app.post("/api/auth/register", checkBan, async (req, res) => {
@@ -1103,21 +1144,16 @@ app.get("/api/auth/discord", passport.authenticate("discord", { session: false }
 app.get("/api/auth/discord/callback", passport.authenticate("discord", { failureRedirect: "/callback", session: false }), (req, res) => { const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
 app.get("/api/auth/github", passport.authenticate("github", { session: false }));
 app.get("/api/auth/github/callback", passport.authenticate("github", { failureRedirect: "/login", session: false }), (req, res) => { 
-  // FIXED: Removed invalid clientSecret from jwt.sign options
   const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" }); 
   res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); 
 });
 
-app.get("/api/me/restrictions", authMiddleware, async (req, res) => {
+app.get("/api/auth/me", authMiddleware, async (req, res) => {
   try {
-    const userId = req.user.id;
-    const { rows: userRows } = await pool.query(`SELECT u.status, u.warning_count, u.suspend_until, b.identifier FROM users u LEFT JOIN banned_devices b ON (u.email = b.identifier OR u.username = b.identifier OR u.device_id = b.identifier) WHERE u.id = $1`, [userId]);
-    const isBanned = userRows[0].status === 'banned' || userRows[0].identifier !== null;
-    const { rows: chatRows } = await pool.query(`SELECT chat_id, chat_suspended_until, warning_count FROM chat_moderation WHERE user_id = $1 AND chat_suspended_until > NOW()`, [userId]);
-    const chatRestrictions = {};
-    chatRows.forEach(row => { chatRestrictions[row.chat_id] = { suspendedUntil: row.chat_suspended_until, warningCount: row.warning_count }; });
-    res.json({ isBanned, suspendUntil: userRows[0].suspend_until, warningCount: userRows[0].warning_count, chatRestrictions });
-  } catch (err) { console.error("Failed to fetch restrictions:", err); res.status(500).json({ error: "Failed to load restrictions" }); }
+    const { rows } = await pool.query(`SELECT id, username, email, profile_url, cover_url, bio, is_musician, is_creator, is_verified, role, subscription_plan, preferences, notification_style, status, suspend_until, warning_count, dob, device_id FROM users WHERE id = $1`, [req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json({ user: rows[0] });
+  } catch (err) { console.error("GET /api/auth/me error:", err); res.status(500).json({ error: "Failed to fetch user" }); }
 });
 
 app.post("/api/forgot-password", async (req, res) => {
@@ -1163,6 +1199,95 @@ app.post("/api/reset-password", async (req, res) => {
   } catch (err) { console.error("Reset password error:", err); res.status(500).json({ error: "Internal server error" }); }
 });
 
+// ============================================================
+// STATIC /me ROUTES — MUST COME BEFORE /:username DYNAMIC ROUTES
+// ============================================================
+
+app.get("/api/users/me", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT id, username, email, profile_url, cover_url, bio, is_musician, is_creator, is_verified, role, subscription_plan, preferences, notification_style FROM users WHERE id = $1`, [req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json({ user: rows[0] });
+  } catch (err) { console.error("GET /api/users/me error:", err); res.status(500).json({ error: "Failed to fetch user" }); }
+});
+
+app.put("/api/users/me", authMiddleware, upload.fields([{ name: 'profile', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { username, bio, social_links, preferences, notificationStyle } = req.body;
+    let profile_url = req.body.profile_url; let cover_url = req.body.cover_url;
+
+    if (req.files?.profile?.[0]) {
+      if (!s3) return res.status(500).json({ error: "S3 not configured" });
+      const file = req.files.profile[0];
+      const buffer = await sharp(file.path).resize(400, 400, { fit: "cover", withoutEnlargement: true }).rotate().jpeg({ quality: 85 }).toBuffer();
+      const key = `profile-pics/${userId}/${Date.now()}.jpg`;
+      const result = await uploadBufferToS3(buffer, key, 'image/jpeg');
+      profile_url = result.url;
+      try { fs.unlinkSync(file.path); } catch (e) {}
+    }
+
+    if (req.files?.cover?.[0]) {
+      if (!s3) return res.status(500).json({ error: "S3 not configured" });
+      const file = req.files.cover[0];
+      const coverResults = await processAndUploadImage(file.path, userId, 'covers');
+      cover_url = coverResults.full.url;
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE users SET 
+        username = COALESCE($1, username), 
+        bio = COALESCE($2, bio), 
+        profile_url = COALESCE($3, profile_url), 
+        cover_url = COALESCE($4, cover_url), 
+        social_links = COALESCE($5, social_links), 
+        preferences = COALESCE($6, preferences),
+        notification_style = COALESCE($7, notification_style),
+        updated_at = NOW() 
+       WHERE id = $8 
+       RETURNING id, username, email, profile_url, cover_url, bio, social_links, preferences, notification_style, role`,
+      [username, bio, profile_url, cover_url, social_links ? JSON.parse(social_links) : null, preferences ? JSON.parse(preferences) : null, notificationStyle || 'named', userId]
+    );
+    io.to(`user-${userId}`).emit("user-updated", rows[0]);
+    res.json({ user: rows[0] });
+  } catch (err) { console.error("Update user error:", err); res.status(500).json({ error: "Failed to update profile" }); }
+});
+
+app.put("/api/users/me/settings", authMiddleware, async (req, res) => {
+  try {
+    const { notificationStyle } = req.body;
+    if (notificationStyle && ['anonymous', 'named'].includes(notificationStyle)) {
+      await pool.query(`UPDATE users SET notification_style = $1, updated_at = NOW() WHERE id = $2`, [notificationStyle, req.user.id]);
+    }
+    res.json({ success: true, notification_style: notificationStyle || null });
+  } catch (err) { console.error("Update settings error:", err); res.status(500).json({ error: "Failed to update settings" }); }
+});
+
+app.get("/api/me/restrictions", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { rows: userRows } = await pool.query(`SELECT u.status, u.warning_count, u.suspend_until, b.identifier FROM users u LEFT JOIN banned_devices b ON (u.email = b.identifier OR u.username = b.identifier OR u.device_id = b.identifier) WHERE u.id = $1`, [userId]);
+    if (!userRows.length) return res.status(404).json({ error: "User not found" });
+    const isBanned = userRows[0].status === 'banned' || userRows[0].identifier !== null;
+    const { rows: chatRows } = await pool.query(`SELECT chat_id, chat_suspended_until, warning_count FROM chat_moderation WHERE user_id = $1 AND chat_suspended_until > NOW()`, [userId]);
+    const chatRestrictions = {};
+    chatRows.forEach(row => { chatRestrictions[row.chat_id] = { suspendedUntil: row.chat_suspended_until, warningCount: row.warning_count }; });
+    res.json({ isBanned, suspendUntil: userRows[0].suspend_until, warningCount: userRows[0].warning_count, chatRestrictions });
+  } catch (err) { console.error("Failed to fetch restrictions:", err); res.status(500).json({ error: "Failed to load restrictions" }); }
+});
+
+app.get("/api/settings", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT id, username, email, preferences, role, subscription_plan, notification_style FROM users WHERE id = $1`, [req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json({ settings: { preferences: rows[0].preferences || {}, role: rows[0].role, subscription_plan: rows[0].subscription_plan } });
+  } catch (err) { console.error("GET /api/settings error:", err); res.status(500).json({ error: "Failed to fetch settings" }); }
+});
+
+// ============================================================
+// DYNAMIC /:username ROUTES — MUST COME AFTER /me ROUTES
+// ============================================================
+
 app.get("/api/users/:username/content", async (req, res) => {
   try {
     const { username } = req.params;
@@ -1173,7 +1298,7 @@ app.get("/api/users/:username/content", async (req, res) => {
     const { rows: shorts } = await pool.query("SELECT * FROM videos WHERE user_id = $1 AND is_public = true AND is_short = true ORDER BY created_at DESC LIMIT 20", [userId]);
     const { rows: musicRows } = await pool.query("SELECT * FROM music WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20", [userId]);
     res.json({ videos, shorts, music: musicRows, reposts: [], likes: [] });
-  } catch (err) { res.status(500).json({ error: "Failed to fetch content" }); }
+  } catch (err) { console.error("GET /api/users/:username/content error:", err); res.status(500).json({ error: "Failed to fetch content" }); }
 });
 
 app.get("/api/users/:username", async (req, res) => {
@@ -1184,7 +1309,7 @@ app.get("/api/users/:username", async (req, res) => {
     const user = rows[0];
     const isKid = user.dob ? (new Date().getFullYear() - new Date(user.dob).getFullYear() <= 12) : false;
     res.json({ user: { ...user, is_kid: isKid, displayName: user.username }, stories: [], highlights: [], followers: [], following: [], isFollowing: false });
-  } catch (err) { res.status(500).json({ error: "Error" }); }
+  } catch (err) { console.error("GET /api/users/:username error:", err); res.status(500).json({ error: "Error" }); }
 });
 
 app.post("/api/users/:username/follow", authMiddleware, async (req, res) => {
@@ -1201,6 +1326,10 @@ app.post("/api/users/:username/follow", authMiddleware, async (req, res) => {
     res.json({ success: true });
   } catch (err) { console.error("Follow error:", err); res.status(500).json({ error: "Failed" }); }
 });
+
+// ============================================================
+// CHAT ROUTES
+// ============================================================
 
 app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('media'), async (req, res) => {
   const { chatId } = req.params;
@@ -1234,15 +1363,23 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('media'), 
         thumbnailUrl = imageResults.thumbnail.url;
         messageType = 'image';
       } else if (file.mimetype.startsWith('video/')) {
+        // FIX: Extract thumbnail BEFORE uploadToS3 (which deletes the file)
+        let thumbPath = null;
+        try {
+          thumbPath = await extractVideoThumbnail(file.path, 1);
+        } catch (e) { console.error("Chat video thumbnail extraction failed:", e.message); }
+
         const videoKey = `chat-media/videos/${userId}/${timestamp}-${file.originalname}`;
         const videoResult = await uploadToS3(file, videoKey, file.mimetype);
         mediaUrl = videoResult.url;
-        try {
-          const thumbPath = await extractVideoThumbnail(file.path, 1);
-          const thumbKey = `chat-media/thumbs/${userId}/${timestamp}-thumb.jpg`;
-          const thumbResult = await uploadToS3({ path: thumbPath }, thumbKey, 'image/jpeg');
-          thumbnailUrl = thumbResult.url;
-        } catch (e) { }
+
+        if (thumbPath && fs.existsSync(thumbPath)) {
+          try {
+            const thumbKey = `chat-media/thumbs/${userId}/${timestamp}-thumb.jpg`;
+            const thumbResult = await uploadToS3({ path: thumbPath }, thumbKey, 'image/jpeg');
+            thumbnailUrl = thumbResult.url;
+          } catch (e) { console.error("Chat video thumb upload failed:", e.message); }
+        }
         messageType = 'video';
       } else if (file.mimetype.startsWith('audio/')) {
         const audioKey = `chat-media/audio/${userId}/${timestamp}-${file.originalname}`;
@@ -1261,6 +1398,10 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('media'), 
   } catch (err) { console.error("Chat message error:", err); res.status(500).json({ error: "Failed to send" }); }
 });
 
+// ============================================================
+// IMAGE UPLOAD
+// ============================================================
+
 app.post("/api/upload/image", authMiddleware, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Image file required" });
@@ -1278,6 +1419,10 @@ app.post("/api/upload/image", authMiddleware, upload.single('image'), async (req
     res.status(201).json({ success: true, full: results.full, medium: results.medium, thumbnail: results.thumbnail });
   } catch (err) { console.error("Image upload error:", err); res.status(500).json({ error: "Upload failed" }); }
 });
+
+// ============================================================
+// VIDEO ROUTES
+// ============================================================
 
 app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
   const client = await pool.connect();
@@ -1336,7 +1481,6 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
     const tagsString = JSON.stringify(tagsJson); 
     const isPublic = is_public === 'true';
 
-    // FIXED: SQL Columns/Values mismatch
     const { rows } = await client.query(
       `INSERT INTO videos (user_id, title, description, video_url, video_s3_key, thumbnail_url, thumbnail_s3_key, duration, category, is_short, processing_status, tags, is_public) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'processing', $11, $12) RETURNING *`,
@@ -1355,45 +1499,6 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
   }
 });
 
-app.get("/api/seller/orders", authMiddleware, async (req, res) => {
-  try {
-    const sellerId = req.user.id;
-    const { status } = req.query;
-    let query = `SELECT o.*, u.username as buyer_username FROM orders o JOIN users u ON o.buyer_id = u.id WHERE o.seller_id = $1`;
-    const params = [sellerId];
-    if (status && status !== 'all') { params.push(status); query += ` AND o.status = $${params.length}`; }
-    query += ` ORDER BY o.created_at DESC`;
-    const { rows } = await pool.query(query, params);
-    res.json(rows);
-  } catch (err) { console.error("Fetch seller orders error:", err); res.status(500).json({ error: "Failed to fetch orders" }); }
-});
-
-app.put("/api/seller/orders/:id", authMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status, tracking_number } = req.body;
-    const sellerId = req.user.id;
-    const { rows: orderCheck } = await pool.query("SELECT * FROM orders WHERE id = $1 AND seller_id = $2", [id, sellerId]);
-    if (orderCheck.length === 0) return res.status(404).json({ error: "Order not found or unauthorized" });
-    const { rows } = await pool.query(`UPDATE orders SET status = $1, tracking_number = $2, updated_at = NOW() WHERE id = $3 RETURNING *`, [status, tracking_number || null, id]);
-    res.json(rows[0]);
-  } catch (err) { console.error("Update order error:", err); res.status(500).json({ error: "FAILED to update order" }); }
-});
-
-app.delete("/api/videos/:id", authMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const userId = req.user.id;
-    const { rows } = await pool.query("SELECT * FROM videos WHERE id = $1 AND user_id = $2", [id, userId]);
-    if (!rows.length) return res.status(404).json({ error: "Video not found" });
-    const video = rows[0];
-    if (video.video_s3_key) await deleteFromS3(video.video_s3_key);
-    if (video.thumbnail_s3_key) await deleteFromS3(video.thumbnail_s3_key);
-    await pool.query("DELETE FROM videos WHERE id = $1", [id]);
-    res.json({ success: true, message: "Video deleted" });
-  } catch (err) { console.error("Delete video error:", err); res.status(500).json({ error: "Failed to delete video" }); }
-});
-
 app.get("/api/videos", async (req, res) => { 
   try { 
     const { filter, category } = req.query; 
@@ -1404,7 +1509,7 @@ app.get("/api/videos", async (req, res) => {
     query += ` LIMIT $${params.length + 1}`; params.push(20); 
     const { rows } = await pool.query(query, params); 
     res.json({ videos: rows }); 
-  } catch (err) { res.status(500).json({ error: "Failed to fetch videos" }); } 
+  } catch (err) { console.error("GET /api/videos error:", err); res.status(500).json({ error: "Failed to fetch videos" }); } 
 });
 
 app.get("/api/videos/:id", async (req, res) => { 
@@ -1413,7 +1518,7 @@ app.get("/api/videos/:id", async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "Not found" }); 
     pool.query(`UPDATE videos SET views = views + 1 WHERE id = $1`, [req.params.id]).catch(()=>{}); 
     res.json({ video: rows[0] }); 
-  } catch (err) { res.status(500).json({ error: "Failed" }); } 
+  } catch (err) { console.error("GET /api/videos/:id error:", err); res.status(500).json({ error: "Failed" }); } 
 });
 
 app.get("/api/videos/:id/stream", authMiddleware, async (req, res) => {
@@ -1443,7 +1548,7 @@ app.get("/api/videos/:id/ad-tag", authMiddleware, async (req, res) => {
     const provider = providers[Math.floor(Math.random() * providers.length)];
     let vastUrl = provider === "google" ? `https://pubads.g.doubleclick.net/gampad/ads?iu=/21775744923/external/pre-roll&sz=640x480&ciu_szs=300x250%2C728x90&gdfp_req=1&output=vast&unviewed_position_start=1&env=vp&impl=s&correlator=${Date.now()}&cust_params=vid%3D${id}` : provider === "roku" ? `https://ads.roku.com/ads/vast.xml?video_id=${id}` : `https://vast.freewheel.com/mrex.xml?cid=123&pid=456&video=${id}`;
     res.json({ vastUrl, provider });
-  } catch (err) { res.status(500).json({ error: "Failed to get ad tag" }); }
+  } catch (err) { console.error("Ad tag error:", err); res.status(500).json({ error: "Failed to get ad tag" }); }
 });
 
 app.post("/api/videos/:id/react", authMiddleware, async (req, res) => {
@@ -1452,11 +1557,45 @@ app.post("/api/videos/:id/react", authMiddleware, async (req, res) => {
     if (!reaction_type) return res.status(400).json({ error: "Missing reaction type" });
     await pool.query(`INSERT INTO content_reactions (user_id, content_id, content_type, reaction_type) VALUES ($1, $2, 'video', $3) ON CONFLICT (user_id, content_id, content_type) DO UPDATE SET reaction_type = $3`, [user_id, id, reaction_type]);
     if (reaction_type === 'like') await pool.query(`UPDATE videos SET likes = (SELECT COUNT(*) FROM content_reactions WHERE content_id = $1 AND content_type = 'video' AND reaction_type = 'like') WHERE id = $1`, [id]);
-    // FIXED: 'Disc' -> 'video'
     else if (reaction_type === 'dislike') await pool.query(`UPDATE videos SET dislikes = (SELECT COUNT(*) FROM content_reactions WHERE content_id = $1 AND content_type = 'video' AND reaction_type = 'dislike') WHERE id = $1`, [id]);
     res.json({ success: true, reaction: reaction_type });
-  } catch (err) { res.status(500).json({ error: "Failed to react" }); }
+  } catch (err) { console.error("Video react error:", err); res.status(500).json({ error: "Failed to react" }); }
 });
+
+app.delete("/api/videos/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const { rows } = await pool.query("SELECT * FROM videos WHERE id = $1 AND user_id = $2", [id, userId]);
+    if (!rows.length) return res.status(404).json({ error: "Video not found" });
+    const video = rows[0];
+    if (video.video_s3_key) await deleteFromS3(video.video_s3_key);
+    if (video.thumbnail_s3_key) await deleteFromS3(video.thumbnail_s3_key);
+    await pool.query("DELETE FROM videos WHERE id = $1", [id]);
+    res.json({ success: true, message: "Video deleted" });
+  } catch (err) { console.error("Delete video error:", err); res.status(500).json({ error: "Failed to delete video" }); }
+});
+
+app.get("/api/videos/:id/comments", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT c.*, u.username, u.profile_url FROM comments c JOIN users u ON c.user_id = u.id WHERE c.content_type = 'video' AND c.content_id = $1 AND c.is_deleted = false ORDER BY c.created_at DESC LIMIT 50`, [req.params.id]);
+    res.json({ comments: rows });
+  } catch (err) { console.error("Fetch comments error:", err); res.status(500).json({ error: "Failed to fetch comments" }); }
+});
+
+app.post("/api/videos/:id/comments", authMiddleware, async (req, res) => {
+  try {
+    const { content, parent_id } = req.body; const userId = req.user.id;
+    if (!content) return res.status(400).json({ error: "Comment content required" });
+    const { rows } = await pool.query(`INSERT INTO comments (user_id, content_type, content_id, parent_id, content) VALUES ($1, 'video', $2, $3, $4) RETURNING *`, [userId, req.params.id, parent_id || null, content]);
+    await pool.query(`UPDATE videos SET comments_count = comments_count + 1 WHERE id = $1`, [req.params.id]).catch(()=>{});
+    res.status(201).json({ comment: rows[0] });
+  } catch (err) { console.error("Post comment error:", err); res.status(500).json({ error: "Failed to comment" }); }
+});
+
+// ============================================================
+// PRODUCTS & ORDERS
+// ============================================================
 
 app.get("/api/products", async (req, res) => {
   try {
@@ -1482,6 +1621,31 @@ app.post("/api/products", authMiddleware, upload.array('images', 5), async (req,
     await client.query('COMMIT');
     res.status(201).json(rows[0]);
   } catch (err) { await client.query('ROLLBACK'); console.error("Create product error:", err); res.status(500).json({ error: "Failed to create product" }); } finally { client.release(); }
+});
+
+app.get("/api/seller/orders", authMiddleware, async (req, res) => {
+  try {
+    const sellerId = req.user.id;
+    const { status } = req.query;
+    let query = `SELECT o.*, u.username as buyer_username FROM orders o JOIN users u ON o.buyer_id = u.id WHERE o.seller_id = $1`;
+    const params = [sellerId];
+    if (status && status !== 'all') { params.push(status); query += ` AND o.status = $${params.length}`; }
+    query += ` ORDER BY o.created_at DESC`;
+    const { rows } = await pool.query(query, params);
+    res.json(rows);
+  } catch (err) { console.error("Fetch seller orders error:", err); res.status(500).json({ error: "Failed to fetch orders" }); }
+});
+
+app.put("/api/seller/orders/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, tracking_number } = req.body;
+    const sellerId = req.user.id;
+    const { rows: orderCheck } = await pool.query("SELECT * FROM orders WHERE id = $1 AND seller_id = $2", [id, sellerId]);
+    if (orderCheck.length === 0) return res.status(404).json({ error: "Order not found or unauthorized" });
+    const { rows } = await pool.query(`UPDATE orders SET status = $1, tracking_number = $2, updated_at = NOW() WHERE id = $3 RETURNING *`, [status, tracking_number || null, id]);
+    res.json(rows[0]);
+  } catch (err) { console.error("Update order error:", err); res.status(500).json({ error: "Failed to update order" }); }
 });
 
 app.post("/api/orders/checkout", authMiddleware, async (req, res) => {
@@ -1512,22 +1676,9 @@ app.post("/api/orders/checkout", authMiddleware, async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); console.error("Checkout error:", err); res.status(500).json({ error: err.message || "Checkout failed" }); } finally { client.release(); }
 });
 
-app.get("/api/videos/:id/comments", async (req, res) => {
-  try {
-    const { rows } = await pool.query(`SELECT c.*, u.username, u.profile_url FROM comments c JOIN users u ON c.user_id = u.id WHERE c.content_type = 'video' AND c.content_id = $1 AND c.is_deleted = false ORDER BY c.created_at DESC LIMIT 50`, [req.params.id]);
-    res.json({ comments: rows });
-  } catch (err) { res.status(500).json({ error: "Failed to fetch comments" }); }
-});
-
-app.post("/api/videos/:id/comments", authMiddleware, async (req, res) => {
-  try {
-    const { content, parent_id } = req.body; const userId = req.user.id;
-    if (!content) return res.status(400).json({ error: "Comment content required" });
-    const { rows } = await pool.query(`INSERT INTO comments (user_id, content_type, content_id, parent_id, content) VALUES ($1, 'video', $2, $3, $4) RETURNING *`, [userId, req.params.id, parent_id || null, content]);
-    await pool.query(`UPDATE videos SET comments_count = comments_count + 1 WHERE id = $1`, [req.params.id]).catch(()=>{});
-    res.status(201).json({ comment: rows[0] });
-  } catch (err) { res.status(500).json({ error: "Failed to comment" }); }
-});
+// ============================================================
+// MUSIC ROUTES
+// ============================================================
 
 app.post("/api/music/upload", authMiddleware, upload.fields([{ name: 'audio', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), async (req, res) => {
   const client = await pool.connect();
@@ -1583,7 +1734,7 @@ app.get("/api/music", async (req, res) => {
     query += ` LIMIT $${params.length + 1}`; params.push(20);
     const { rows } = await pool.query(query, params);
     res.json({ music: rows }); 
-  } catch (err) { res.status(500).json({ error: "Failed to fetch music" }); }
+  } catch (err) { console.error("GET /api/music error:", err); res.status(500).json({ error: "Failed to fetch music" }); }
 });
 
 app.get("/api/music/:id", async (req, res) => {
@@ -1592,12 +1743,11 @@ app.get("/api/music/:id", async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     pool.query(`UPDATE music SET plays = plays + 1 WHERE id = $1`, [req.params.id]).catch(()=>{});
     res.json({ music: rows[0] }); 
-  } catch (err) { res.status(500).json({ error: "Failed" }); }
+  } catch (err) { console.error("GET /api/music/:id error:", err); res.status(500).json({ error: "Failed" }); }
 });
 
 app.get("/api/music/:id/stream", authMiddleware, async (req, res) => {
   try {
-    // FIXED: undefined variable 'id' -> req.params.id
     const { rows } = await pool.query("SELECT audio_s3_key, audio_url FROM music WHERE id = $1", [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     const track = rows[0];
@@ -1631,67 +1781,12 @@ app.post("/api/music/:id/react", authMiddleware, async (req, res) => {
     await pool.query(`INSERT INTO content_reactions (user_id, content_id, content_type, reaction_type) VALUES ($1, $2, 'music', $3) ON CONFLICT (user_id, content_id, content_type) DO UPDATE SET reaction_type = $3`, [user_id, id, reaction_type]);
     if (reaction_type === 'like') await pool.query(`UPDATE music SET likes = (SELECT COUNT(*) FROM content_reactions WHERE content_id = $1 AND content_type = 'music' AND reaction_type = 'like') WHERE id = $1`, [id]);
     res.json({ success: true, reaction: reaction_type });
-  } catch (err) { res.status(500).json({ error: "Failed to react" }); }
+  } catch (err) { console.error("Music react error:", err); res.status(500).json({ error: "Failed to react" }); }
 });
 
-app.get("/api/users/me", authMiddleware, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`SELECT id, username, email, profile_url, cover_url, bio, is_musician, is_creator, is_verified, role, subscription_plan, preferences, notification_style FROM users WHERE id = $1`, [req.user.id]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json({ user: rows[0] });
-  } catch (err) { res.status(500).json({ error: "Failed to fetch user" }); }
-});
-
-app.put("/api/users/me", authMiddleware, upload.fields([{ name: 'profile', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { username, bio, social_links, preferences, notificationStyle } = req.body;
-    let profile_url = req.body.profile_url; let cover_url = req.body.cover_url;
-
-    if (req.files?.profile?.[0]) {
-      if (!s3) return res.status(500).json({ error: "S3 not configured" });
-      const file = req.files.profile[0];
-      const buffer = await sharp(file.path).resize(400, 400, { fit: "cover", withoutEnlargement: true }).rotate().jpeg({ quality: 85 }).toBuffer();
-      const key = `profile-pics/${userId}/${Date.now()}.jpg`;
-      const result = await uploadBufferToS3(buffer, key, 'image/jpeg');
-      profile_url = result.url;
-      try { fs.unlinkSync(file.path); } catch (e) {}
-    }
-
-    if (req.files?.cover?.[0]) {
-      if (!s3) return res.status(500).json({ error: "S3 not configured" });
-      const file = req.files.cover[0];
-      const coverResults = await processAndUploadImage(file.path, userId, 'covers');
-      cover_url = coverResults.full.url;
-    }
-
-    // FIXED: SQL Query syntax error and missing userId parameter
-    const { rows } = await pool.query(
-      `UPDATE users SET 
-        username = COALESCE($1, username), 
-        bio = COALESCE($2, bio), 
-        profile_url = COALESCE($3, profile_url), 
-        cover_url = COALESCE($4, cover_url), 
-        social_links = COALESCE($5, social_links), 
-        preferences = COALESCE($6, preferences),
-        notification_style = COALESCE($7, notification_style),
-        updated_at = NOW() 
-       WHERE id = $8 
-       RETURNING id, username, email, profile_url, cover_url, bio, social_links, preferences, notification_style, role`,
-      [username, bio, profile_url, cover_url, social_links ? JSON.parse(social_links) : null, preferences ? JSON.parse(preferences) : null, notificationStyle || 'named', userId]
-    );
-    io.to(`user-${userId}`).emit("user-updated", rows[0]);
-    res.json({ user: rows[0] });
-  } catch (err) { console.error("Update user error:", err); res.status(500).json({ error: "Failed to update profile" }); }
-});
-
-app.get("/api/settings", authMiddleware, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`SELECT id, username, email, preferences, role, subscription_plan, notification_style FROM users WHERE id = $1`, [req.user.id]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json({ settings: { preferences: rows[0].preferences || {}, role: rows[0].role, subscription_plan: rows[0].subscription_plan } });
-  } catch (err) { res.status(500).json({ error: "Failed to fetch settings" }); }
-});
+// ============================================================
+// SEARCH
+// ============================================================
 
 app.get("/api/search", async (req, res) => {
   try {
@@ -1702,8 +1797,12 @@ app.get("/api/search", async (req, res) => {
     if (!type || type === 'users') { const usrRes = await pool.query(`SELECT id, username, profile_url, is_verified FROM users WHERE LOWER(username) LIKE $1 LIMIT 10`, [searchQuery]); results.users = usrRes.rows; }
     if (!type || type === 'music') { const musRes = await pool.query(`SELECT * FROM music WHERE LOWER(title) LIKE $1 OR LOWER(artist) LIKE $1 LIMIT 10`, [searchQuery]); results.music = musRes.rows; }
     res.json({ results });
-  } catch (err) { res.status(500).json({ error: "Search failed" }); }
+  } catch (err) { console.error("Search error:", err); res.status(500).json({ error: "Search failed" }); }
 });
+
+// ============================================================
+// LIVESTREAMS
+// ============================================================
 
 app.post("/api/livestreams", authMiddleware, async (req, res) => {
   try {
@@ -1713,8 +1812,12 @@ app.post("/api/livestreams", authMiddleware, async (req, res) => {
     const { rows } = await pool.query(`INSERT INTO livestreams (user_id, title, description, category, stream_key, is_live) VALUES ($1, $2, $3, $4, $5, true) RETURNING *`, [userId, title, description, category, streamKey]);
     io.emit("stream-started", rows[0]);
     res.status(201).json({ stream: rows[0], agoraToken });
-  } catch (err) { res.status(500).json({ error: "Failed to start stream" }); }
+  } catch (err) { console.error("Start livestream error:", err); res.status(500).json({ error: "Failed to start stream" }); }
 });
+
+// ============================================================
+// ELITE FEATURES
+// ============================================================
 
 app.post("/api/elite/trigger-alert", authMiddleware, async (req, res) => {
   try {
@@ -1727,8 +1830,12 @@ app.post("/api/elite/trigger-alert", authMiddleware, async (req, res) => {
   } catch (err) { console.error("Elite alert error:", err); res.status(500).json({ error: "Failed to send alert" }); }
 });
 
+// ============================================================
+// CALLS
+// ============================================================
+
 app.post("/api/calls/start", authMiddleware, async (req, res) => {
-    const client = await pool.connect();
+  const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const { receiverId, type = 'video' } = req.body; const callerId = req.user.id;
@@ -1746,28 +1853,14 @@ app.post("/api/calls/start", authMiddleware, async (req, res) => {
 app.post("/api/calls/end", authMiddleware, async (req, res) => {
   try {
     const { callId } = req.body;
-    await pool.query(`UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = $1 AND (caller_id = $2 OR receiver_id = $2) AND status != 'ended' RETURNING *`, [callId, req.user.id, req.user.id]);
+    await pool.query(`UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = $1 AND (caller_id = $2 OR receiver_id = $2) AND status != 'ended' RETURNING *`, [callId, req.user.id]);
     res.json({ success: true });
   } catch (err) { console.error("End call error:", err); res.status(500).json({ error: "Failed to end call" }); }
 });
 
-app.put("/api/users/me/settings", authMiddleware, async (req, res) => {
-  try {
-    const { notificationStyle } = req.body;
-    if (notificationStyle && ['anonymous', 'named'].includes(notificationStyle)) {
-      await pool.query(`UPDATE users SET notification_style = $1, updated_at = NOW() WHERE id = $2`, [notificationStyle, req.user.id]);
-    }
-    res.json({ success: true, notification_style });
-  } catch (err) { res.status(500).json({ error: "Failed to update settings" }); }
-});
-
-app.get("/api/auth/me", authMiddleware, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`SELECT id, username, email, profile_url, cover_url, bio, is_musician, is_creator, is_verified, role, subscription_plan, preferences, notification_style, status, suspend_until, warning_count, dob, device_id FROM users WHERE id = $1`, [req.user.id]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json({ user: rows[0] });
-  } catch (err) { res.status(500).json({ error: `Failed to fetch user` }); }
-});
+// ============================================================
+// CHAT ROUTES
+// ============================================================
 
 app.get("/api/chats", authMiddleware, async (req, res) => {
   try {
@@ -1802,8 +1895,12 @@ app.get("/api/chats/:chatId/restrictions", authMiddleware, async (req, res) => {
     const { rows } = await pool.query(`SELECT chat_suspended_until, warning_count FROM chat_moderation WHERE user_id = $1 AND chat_id = $2`, [userId, chatId]);
     if (rows.length === 0) return res.json({ suspendedUntil: null, warningCount: 0 });
     res.json({ suspendedUntil: rows[0].chat_suspended_until, warningCount: rows[0].warning_count || 0 });
-  } catch (err) { res.status(500).json({ error: "Failed to fetch restrictions" }); }
+  } catch (err) { console.error("Chat restrictions error:", err); res.status(500).json({ error: "Failed to fetch restrictions" }); }
 });
+
+// ============================================================
+// AGORA & MEDIA HELPERS
+// ============================================================
 
 app.post("/api/agora/token", authMiddleware, async (req, res) => {
   try {
@@ -1812,7 +1909,7 @@ app.post("/api/agora/token", authMiddleware, async (req, res) => {
     const token = generateAgoraToken(channelName, uid || req.user.id);
     if (!token) return res.status(500).json({ error: "Agora not configured" });
     res.json({ token, appId: AGORA_APP_ID });
-  } catch (err) { res.status(500).json({ error: "Failed to generate token" }); }
+  } catch (err) { console.error("Agora token error:", err); res.status(500).json({ error: "Failed to generate token" }); }
 });
 
 app.get("/api/media/presigned-url", authMiddleware, async (req, res) => {
@@ -1841,16 +1938,36 @@ app.get("/api/media/presigned-url", authMiddleware, async (req, res) => {
   }
 });
 
-// 404 handler
+// ============================================================
+// DEBUG ROUTE (remove in production)
+// ============================================================
+
+app.get("/api/debug/db", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'users' ORDER BY ordinal_position");
+    res.json({ columns: rows.map(r => r.column_name) });
+  } catch (err) {
+    console.error("Debug DB error:", err);
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
+// ============================================================
+// 404 + ERROR HANDLERS
+// ============================================================
+
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
 });
 
-// global error handler
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   res.status(500).json({ error: "Internal server error" });
 });
+
+// ============================================================
+// BOOTSTRAP
+// ============================================================
 
 async function bootstrap() {
   try {
@@ -1858,6 +1975,8 @@ async function bootstrap() {
     if (DATABASE_URL) {
       await initializeTables();
       console.log("✅ DB Init Complete");
+    } else {
+      console.error("⚠️  No DATABASE_URL — skipping DB init. Most routes will fail.");
     }
 
     // Redis init
@@ -1882,8 +2001,8 @@ async function bootstrap() {
     });
 
   } catch (err) {
-    console.error("Init error:", err);
-    process.exit(1); // fail fast if critical systems fail
+    console.error("❌ Init error:", err);
+    process.exit(1);
   }
 }
 
