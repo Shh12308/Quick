@@ -418,7 +418,16 @@ async function initializeTables() {
     await pool.query(`CREATE TABLE IF NOT EXISTS stripe_events (id SERIAL PRIMARY KEY, event_id TEXT UNIQUE NOT NULL, processed_at TIMESTAMP DEFAULT NOW())`);
     
     await pool.query(`CREATE TABLE IF NOT EXISTS subscription_tiers (id SERIAL PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2), benefits JSON, role VARCHAR(50))`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS user_subscriptions (user_id PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, tier_id INTEGER REFERENCES subscription_tiers(id) ON DELETE SET NULL, stripe_subscription_id TEXT, status TEXT, current_period_start TIMESTAMP, current_period_end TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_subscriptions (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  tier_id INTEGER REFERENCES subscription_tiers(id) ON DELETE SET NULL,
+  stripe_subscription_id TEXT,
+  status TEXT,
+  current_period_start TIMESTAMP,
+  current_period_end TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
     await pool.query(`CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), amount DECIMAL(10,2), status TEXT, type TEXT, created_at TIMESTAMP DEFAULT NOW())`);
     
     // Music
