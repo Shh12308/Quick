@@ -1278,10 +1278,54 @@ app.get("/api/me/restrictions", authMiddleware, async (req, res) => {
 
 app.get("/api/settings", authMiddleware, async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT id, username, email, preferences, role, subscription_plan, notification_style FROM users WHERE id = $1`, [req.user.id]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json({ settings: { preferences: rows[0].preferences || {}, role: rows[0].role, subscription_plan: rows[0].subscription_plan } });
-  } catch (err) { console.error("GET /api/settings error:", err); res.status(500).json({ error: "Failed to fetch settings" }); }
+    const userId = req.user.id;
+
+    // 1. Fetch basic user settings
+    const { rows: userRows } = await pool.query(
+      `SELECT id, username, email, preferences, role, subscription_plan, notification_style, privacy, is_creator, is_verified 
+       FROM users WHERE id = $1`,
+      [userId]
+    );
+    
+    if (!userRows.length) return res.status(404).json({ error: "User not found" });
+    const user = userRows[0];
+
+    // 2. Fetch detailed subscription info if it exists
+    const { rows: subRows } = await pool.query(
+      `SELECT us.current_period_end, us.status, st.name as plan_name
+       FROM user_subscriptions us
+       JOIN subscription_tiers st ON us.tier_id = st.id
+       WHERE us.user_id = $1 AND us.status = 'active'
+       ORDER BY us.current_period_end DESC
+       LIMIT 1`,
+      [userId]
+    );
+
+    const subDetails = subRows[0];
+
+    // 3. Construct the response
+    const response = {
+      settings: {
+        preferences: user.preferences || {},
+        role: user.role,
+        subscription_plan: user.subscription_plan,
+        notification_style: user.notification_style,
+        privacy: user.privacy || {},
+        is_creator: user.is_creator,
+        is_verified: user.is_verified
+      },
+      subscription: {
+        plan: subDetails?.plan_name || user.subscription_plan || 'Free',
+        renewalDate: subDetails?.current_period_end || null,
+        status: subDetails?.status || 'inactive'
+      }
+    };
+
+    res.json(response);
+  } catch (err) {
+    console.error("GET /api/settings error:", err);
+    res.status(500).json({ error: "Failed to fetch settings" });
+  }
 });
 
 // ============================================================
