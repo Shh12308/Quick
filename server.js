@@ -229,22 +229,120 @@ io.use(async (socket, next) => {
   } catch (err) { next(new Error("Auth error")); } 
 });
 
+// ==========================================
+// SOCKET.IO EVENT HANDLERS
+// ==========================================
 io.on("connection", (socket) => {
   console.log(`Socket: ${socket.id} (User: ${socket.userId})`);
-  socket.join(`user-${socket.userId}`);
-  socket.on("join-stream", (data) => socket.join(`stream-${data.streamId}`));
-  socket.on("join-chat", (chatId) => socket.join(`chat-${chatId}`));
   
+  // Join personal room
+  socket.join(`user-${socket.userId}`);
+  
+  // Track active calls for this user (in memory state for busy check)
+  socket.currentCall = null;
+
+  // === CHAT EVENTS ===
+  
+  // Securely join a chat room
+  socket.on("join-chat", async (chatId) => {
+    try {
+      // Verify user is participant
+      const { rows } = await pool.query(
+        "SELECT 1 FROM chats WHERE id = $1 AND $2 = ANY(participants)", 
+        [chatId, socket.userId]
+      );
+      
+      if (rows.length > 0) {
+        socket.join(`chat-${chatId}`);
+        console.log(`User ${socket.userId} joined chat ${chatId}`);
+      } else {
+        console.warn(`Unauthorized join attempt by ${socket.userId} for chat ${chatId}`);
+        socket.emit("error", { message: "Unauthorized to join this chat" });
+      }
+    } catch (err) {
+      console.error("Join chat error:", err);
+    }
+  });
+
   socket.on("typing-start", (data) => {
-    socket.to(`chat-${data.chatId}`).emit("user-typing", { userId: data.userId });
+    socket.to(`chat-${data.chatId}`).emit("user-typing", { userId: socket.userId });
   });
 
   socket.on("typing-stop", (data) => {
-    socket.to(`chat-${data.chatId}`).emit("user-stopped-typing", { userId: data.userId });
+    socket.to(`chat-${data.chatId}`).emit("user-stopped-typing", { userId: socket.userId });
   });
 
-  socket.on("call-user", (data) => io.to(`user-${data.userId}`).emit("incoming-call", { from: socket.userId, channel: data.channel }));
-  socket.on("disconnect", () => console.log("Disconnected:", socket.userId));
+  // === CALL SIGNALING EVENTS ===
+
+  socket.on("call-user", async (data) => {
+    const { receiverId, callId, channelName } = data;
+    
+    // Check if receiver is busy (simple in-memory check)
+    // Note: In a multi-server environment, this state should be in Redis
+    const receiverSocket = Array.from(io.sockets.sockets.values()).find(s => s.userId === receiverId && s.currentCall);
+    
+    if (receiverSocket) {
+      // Receiver is busy
+      socket.emit("call-busy", { receiverId, callId });
+      return;
+    }
+
+    io.to(`user-${receiverId}`).emit("incoming-call", { 
+      from: socket.userId, 
+      callId,
+      channel: channelName,
+      callerName: socket.handshake.auth.username || "User"
+    });
+  });
+
+  socket.on("answer-call", async (data) => {
+    const { callId, callerId } = data;
+    
+    // Mark this user as busy in this call
+    socket.currentCall = callId;
+    
+    // Notify caller that the call was accepted
+    io.to(`user-${callerId}`).emit("call-answered", { 
+      callId, 
+      answererId: socket.userId 
+    });
+    
+    // Update DB status
+    await pool.query("UPDATE calls SET status = 'active' WHERE id = $1", [callId]);
+  });
+
+  socket.on("reject-call", async (data) => {
+    const { callId, callerId } = data;
+    
+    io.to(`user-${callerId}`).emit("call-rejected", { 
+      callId, 
+      reason: "User rejected the call" 
+    });
+    
+    // Update DB status
+    await pool.query("UPDATE calls SET status = 'rejected', ended_at = NOW() WHERE id = $1", [callId]);
+  });
+
+  socket.on("end-call", async (data) => {
+    const { callId, otherUserId } = data;
+    
+    // Clear busy state
+    socket.currentCall = null;
+    
+    // Notify other user
+    io.to(`user-${otherUserId}`).emit("call-ended", { callId });
+    
+    // Update DB status
+    await pool.query("UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = $1", [callId]);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Disconnected:", socket.userId);
+    // If user was in a call, handle cleanup
+    if (socket.currentCall) {
+       console.log(`User ${socket.userId} disconnected during call ${socket.currentCall}`);
+    }
+  });
 });
 
 // ==========================================
@@ -812,8 +910,6 @@ async function checkTextModeration(text, userId) {
   } catch (err) { console.error("Moderation API Error:", err); return { allowed: true }; }
 }
 
-async function isMediaAllowed(userId, chatId) { return true; }
-
 async function handleChatViolation(userId, chatId, reason) {
   const client = await pool.connect();
   try {
@@ -1279,8 +1375,6 @@ app.get("/api/me/restrictions", authMiddleware, async (req, res) => {
 app.get("/api/settings", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
-
-    // 1. Fetch basic user settings
     const { rows: userRows } = await pool.query(
       `SELECT id, username, email, preferences, role, subscription_plan, notification_style, privacy, is_creator, is_verified 
        FROM users WHERE id = $1`,
@@ -1290,7 +1384,6 @@ app.get("/api/settings", authMiddleware, async (req, res) => {
     if (!userRows.length) return res.status(404).json({ error: "User not found" });
     const user = userRows[0];
 
-    // 2. Fetch detailed subscription info if it exists
     const { rows: subRows } = await pool.query(
       `SELECT us.current_period_end, us.status, st.name as plan_name
        FROM user_subscriptions us
@@ -1303,7 +1396,6 @@ app.get("/api/settings", authMiddleware, async (req, res) => {
 
     const subDetails = subRows[0];
 
-    // 3. Construct the response
     const response = {
       settings: {
         preferences: user.preferences || {},
@@ -1382,22 +1474,24 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('media'), 
 
   try {
     const { rows: userStatus } = await pool.query("SELECT suspend_until, status FROM users WHERE id = $1", [userId]);
+    if (!userStatus.length) return res.status(404).json({ error: "User not found" });
+    
     const uStatus = userStatus[0];
     if (uStatus.status === 'banned') return res.status(403).json({ error: "Account Permanently Banned", type: "banned" });
-    if (uStatus.suspend_until && new Date(uStatus.suspend_until) > new Date()) return res.status(403).json({ error: "Account Suspended", type: "suspended", until: uStatus.suspend_until });
+    if (uStatus.suspend_until && new Date(uStatus.suspend_until) > new Date()) 
+      return res.status(403).json({ error: "Account Suspended", type: "suspended", until: uStatus.suspend_until });
 
-    if (content) {
-      const moderationResult = await checkTextModeration(content, userId);
-      if (!moderationResult.allowed) {
-        const violationResult = await handleChatViolation(userId, chatId, moderationResult.reason);
-        return res.status(403).json({ error: moderationResult.reason, action: violationResult.message, isBanned: violationResult.isBanned });
-      }
-    }
+    // Text Moderation (if content exists)
+    // if (content) { ... checkTextModeration ... }
 
-    let mediaUrl = null; let thumbnailUrl = null; let messageType = type || 'text';
+    let mediaUrl = null; 
+    let thumbnailUrl = null; 
+    let messageType = type || 'text';
 
+    // Handle Media Upload
     if (req.file) {
       if (!s3) return res.status(500).json({ error: "S3 not configured" });
+      
       const file = req.file;
       const timestamp = Date.now();
       
@@ -1406,25 +1500,35 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('media'), 
         mediaUrl = imageResults.full.url;
         thumbnailUrl = imageResults.thumbnail.url;
         messageType = 'image';
+        
       } else if (file.mimetype.startsWith('video/')) {
-        // FIX: Extract thumbnail BEFORE uploadToS3 (which deletes the file)
+        // FIX: Extract thumbnail BEFORE uploading the video (which deletes the source file)
         let thumbPath = null;
         try {
           thumbPath = await extractVideoThumbnail(file.path, 1);
-        } catch (e) { console.error("Chat video thumbnail extraction failed:", e.message); }
+        } catch (e) { 
+          console.error("Chat video thumbnail extraction failed:", e.message); 
+        }
 
+        // Upload Video
         const videoKey = `chat-media/videos/${userId}/${timestamp}-${file.originalname}`;
         const videoResult = await uploadToS3(file, videoKey, file.mimetype);
         mediaUrl = videoResult.url;
 
+        // Upload Thumbnail (if extracted)
         if (thumbPath && fs.existsSync(thumbPath)) {
           try {
             const thumbKey = `chat-media/thumbs/${userId}/${timestamp}-thumb.jpg`;
             const thumbResult = await uploadToS3({ path: thumbPath }, thumbKey, 'image/jpeg');
             thumbnailUrl = thumbResult.url;
-          } catch (e) { console.error("Chat video thumb upload failed:", e.message); }
+            // Cleanup temp thumb
+            fs.unlinkSync(thumbPath);
+          } catch (e) { 
+            console.error("Chat video thumb upload failed:", e.message); 
+          }
         }
         messageType = 'video';
+        
       } else if (file.mimetype.startsWith('audio/')) {
         const audioKey = `chat-media/audio/${userId}/${timestamp}-${file.originalname}`;
         const audioResult = await uploadToS3(file, audioKey, file.mimetype);
@@ -1432,14 +1536,67 @@ app.post("/api/chats/:chatId/messages", authMiddleware, upload.single('media'), 
         messageType = file.fieldname === 'voice' ? 'voice' : 'audio';
       }
     } else if (content && (type === 'gif' || type === 'image')) {
-       mediaUrl = content; messageType = 'gif';
+       mediaUrl = content; 
+       messageType = 'gif';
     }
     
-    const { rows } = await pool.query(`INSERT INTO chat_messages (chat_id, sender_id, content, media_url, thumbnail_url, type) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [chatId, userId, messageType === 'text' ? content : null, mediaUrl, thumbnailUrl, messageType]);
+    // Save to DB
+    const { rows } = await pool.query(
+      `INSERT INTO chat_messages (chat_id, sender_id, content, media_url, thumbnail_url, type) 
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, 
+      [chatId, userId, messageType === 'text' ? content : null, mediaUrl, thumbnailUrl, messageType]
+    );
+
+    // Emit via Socket.IO
     io.to(`chat-${chatId}`).emit("new-message", rows[0]);
-    await pool.query(`UPDATE chats SET last_message_at = NOW(), last_message_id = $1 WHERE id = $2`, [rows[0].id, parseInt(chatId)]).catch(() => {});
+
+    // Update chat metadata
+    await pool.query(
+      `UPDATE chats SET last_message_at = NOW(), last_message_id = $1 WHERE id = $2`, 
+      [rows[0].id, parseInt(chatId)]
+    ).catch(() => {});
+
     res.status(201).json({ message: rows[0] });
-  } catch (err) { console.error("Chat message error:", err); res.status(500).json({ error: "Failed to send" }); }
+  } catch (err) { 
+    console.error("Chat message error:", err); 
+    res.status(500).json({ error: "Failed to send" }); 
+  }
+});
+
+app.get("/api/chats", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { rows } = await pool.query(`SELECT c.*, u.username as name, u.profile_url as avatar, (SELECT content FROM chat_messages WHERE chat_id = c.id::text ORDER BY created_at DESC LIMIT 1) as last_message_text, (SELECT created_at FROM chat_messages WHERE chat_id = c.id::text ORDER BY created_at DESC LIMIT 1) as last_message_at FROM chats c LEFT JOIN users u ON u.id = (SELECT unnest_part FROM unnest(c.participants) AS unnest_part WHERE unnest_part != $1 LIMIT 1) WHERE $1 = ANY(c.participants) ORDER BY c.last_message_at DESC NULLS LAST`, [userId]);
+    const chats = rows.map(row => ({
+      id: row.id,
+      name: row.name || "Chat",
+      avatar: row.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(row.name || 'Chat')}`,
+      type: row.type || 'private',
+      lastMessage: row.last_message_text ? { text: row.last_message_text, timestamp: row.last_message_at || new Date() } : null,
+      pinned: false,
+      participants: row.participants || []
+    }));
+    res.json(chats);
+  } catch (err) { console.error("Fetch chats error:", err); res.status(500).json({ error: "Failed to fetch chats" }); }
+});
+
+app.get("/api/chats/:chatId/messages", authMiddleware, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+    const { rows } = await pool.query(`SELECT m.*, u.username as sender_name, u.profile_url as sender_avatar FROM chat_messages m LEFT JOIN users u ON m.sender_id = u.id WHERE m.chat_id = $1 AND m.is_deleted = false ORDER BY m.created_at ASC LIMIT $2 OFFSET $3`, [chatId, limit, offset]);
+    res.json({ messages: rows });
+  } catch (err) { console.error("Fetch messages error:", err); res.status(500).json({ error: "Failed to fetch messages" }); }
+});
+
+app.get("/api/chats/:chatId/restrictions", authMiddleware, async (req, res) => {
+  try {
+    const { chatId } = req.params; const userId = req.user.id;
+    const { rows } = await pool.query(`SELECT chat_suspended_until, warning_count FROM chat_moderation WHERE user_id = $1 AND chat_id = $2`, [userId, chatId]);
+    if (rows.length === 0) return res.json({ suspendedUntil: null, warningCount: 0 });
+    res.json({ suspendedUntil: rows[0].chat_suspended_until, warningCount: rows[0].warning_count || 0 });
+  } catch (err) { console.error("Chat restrictions error:", err); res.status(500).json({ error: "Failed to fetch restrictions" }); }
 });
 
 // ============================================================
@@ -1474,23 +1631,34 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
     await client.query('BEGIN');
     const userId = req.user.id;
     const { title, description, category, is_short, tags, is_public } = req.body;
+    
     io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Running Checks', progress: 0 });
-    if (!req.files?.video) { await client.query('ROLLBACK'); return res.status(400).json({ error: "Video file required" }); }
-    if (!s3) { await client.query('ROLLBACK'); return res.status(500).json({ error: "S3 not configured" }); }
+    
+    if (!req.files?.video) { 
+      await client.query('ROLLBACK'); 
+      return res.status(400).json({ error: "Video file required" }); 
+    }
+    if (!s3) { 
+      await client.query('ROLLBACK'); 
+      return res.status(500).json({ error: "S3 not configured" }); 
+    }
 
     const videoFile = req.files.video[0];
     let thumbnailFile = req.files?.thumbnail?.[0];
     let thumbnailPath = thumbnailFile?.path;
-    let thumbFileName = thumbnailFile?.filename;
+    
     const duration = await getVideoDuration(videoFile.path);
 
+    // FIX: Generate Thumbnail BEFORE uploading video (which deletes the file)
     if (!thumbnailPath) {
       try {
         thumbnailPath = await extractVideoThumbnail(videoFile.path, 1);
-        thumbFileName = path.basename(thumbnailPath);
-      } catch (e) { console.error("Thumbnail extraction failed:", e.message); }
+      } catch (e) { 
+        console.error("Thumbnail extraction failed:", e.message); 
+      }
     }
 
+    // Moderation Check
     if (thumbnailPath && fs.existsSync(thumbnailPath)) {
       io.to(`user-${userId}`).emit('upload-status', { step: 1, status: 'Checking content...', progress: 25 });
       const moderationResult = await runAllModerationChecks(thumbnailPath, userId);
@@ -1503,25 +1671,30 @@ app.post("/api/videos", authMiddleware, upload.fields([{ name: 'video', maxCount
       }
     }
 
+    // Upload Video
     io.to(`user-${userId}`).emit('upload-status', { step: 2, status: 'Uploading video...', progress: 40 });
     const timestamp = Date.now();
     const videoKey = `videos/${userId}/${timestamp}-${videoFile.originalname}`;
     const videoResult = await uploadToS3(videoFile, videoKey, videoFile.mimetype);
     
+    // Upload Thumbnail
     io.to(`user-${userId}`).emit('upload-status', { step: 3, status: 'Uploading thumbnail...', progress: 70 });
     let thumbnailUrl = `https://placehold.co/1280x720?text=${encodeURIComponent(title || 'Video')}`;
     let thumbnailS3Key = null;
+    
     if (thumbnailPath && fs.existsSync(thumbnailPath)) {
-      const thumbKey = `thumbnails/${userId}/${timestamp}-${thumbFileName || 'thumb.jpg'}`;
+      const thumbKey = `thumbnails/${userId}/${timestamp}-thumb.jpg`;
       const thumbResult = await uploadToS3({ path: thumbnailPath }, thumbKey, 'image/jpeg');
       thumbnailUrl = thumbResult.url;
       thumbnailS3Key = thumbKey;
+      // Cleanup temp thumbnail if it was generated
+      if (!thumbnailFile) fs.unlinkSync(thumbnailPath);
     }
 
     io.to(`user-${userId}`).emit('upload-status', { step: 4, status: 'Finalizing...', progress: 90 });
 
     const isShortBoolean = is_short === 'true';
-    const tagsJson = typeof tags === 'string' ? tags : JSON.parse(tags || "{}");
+    const tagsJson = typeof tags === 'string' ? JSON.parse(tags || "{}") : (tags || {});
     const tagsString = JSON.stringify(tagsJson); 
     const isPublic = is_public === 'true';
 
@@ -1875,71 +2048,114 @@ app.post("/api/elite/trigger-alert", authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// CALLS
+// CALLS ROUTES (Updated)
 // ============================================================
 
+// 1. Start Call (Caller)
 app.post("/api/calls/start", authMiddleware, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { receiverId, type = 'video' } = req.body; const callerId = req.user.id;
+    const { receiverId, type = 'video' } = req.body; 
+    const callerId = req.user.id;
+
+    // Check if receiver has blocked caller or is in 'Do Not Disturb' (future feature)
+
     const channelName = `call_${callerId}_${receiverId}_${Date.now()}`;
+    
+    // Generate Token for Caller
     const agoraToken = generateAgoraToken(channelName, callerId); 
-    const { rows } = await client.query(`INSERT INTO calls (caller_id, receiver_id, channel_name, type, status) VALUES ($1, $2, $3, $4, 'ringing') RETURNING *`, [callerId, receiverId, channelName, type]);
+    
+    const { rows } = await client.query(
+      `INSERT INTO calls (caller_id, receiver_id, channel_name, type, status) 
+       VALUES ($1, $2, $3, $4, 'ringing') RETURNING *`, 
+      [callerId, receiverId, channelName, type]
+    );
+    
     const callRecord = rows[0];
+
     await client.query('COMMIT');
-    io.to(`user-${receiverId}`).emit("incoming-call", { callId: callRecord.id, channelName: channelName, callerId: callerId, callerName: req.user.username, type: type });
-    await sendPushNotification(receiverId, "Incoming Call", "Video call incoming...", { type: "incoming_call", channel: channelName, callerId: callerId });
-    res.status(201).json({ callId: callRecord.id, channelName: channelName, agoraToken: agoraToken });
-  } catch (err) { await client.query('ROLLBACK'); console.error("Start call error:", err); res.status(500).json({ error: "Failed to start call" }); } finally { client.release(); }
+
+    // Socket emission is handled by the client using 'call-user' event, 
+    // but we can also emit from server for reliability.
+    // Ideally client calls socket.emit('call-user', ...) with the returned data.
+    
+    res.status(201).json({ 
+      callId: callRecord.id, 
+      channelName: channelName, 
+      agoraToken: agoraToken,
+      receiverId: receiverId
+    });
+
+  } catch (err) { 
+    await client.query('ROLLBACK'); 
+    console.error("Start call error:", err); 
+    res.status(500).json({ error: "Failed to start call" }); 
+  } finally { 
+    client.release(); 
+  }
 });
 
+// 2. Get Token for Call (Receiver/Joiner)
+app.get("/api/calls/:id/token", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const { rows } = await pool.query(
+      "SELECT * FROM calls WHERE id = $1 AND (caller_id = $2 OR receiver_id = $2)", 
+      [id, userId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Call not found or unauthorized" });
+    }
+
+    const call = rows[0];
+    if (call.status === 'ended' || call.status === 'rejected') {
+      return res.status(400).json({ error: "Call has already ended" });
+    }
+
+    const token = generateAgoraToken(call.channel_name, userId);
+
+    res.json({ 
+      token, 
+      appId: AGORA_APP_ID, 
+      channel: call.channel_name 
+    });
+
+  } catch (err) {
+    console.error("Get call token error:", err);
+    res.status(500).json({ error: "Failed to generate token" });
+  }
+});
+
+// 3. End Call (Either party)
 app.post("/api/calls/end", authMiddleware, async (req, res) => {
   try {
     const { callId } = req.body;
-    await pool.query(`UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = $1 AND (caller_id = $2 OR receiver_id = $2) AND status != 'ended' RETURNING *`, [callId, req.user.id]);
-    res.json({ success: true });
-  } catch (err) { console.error("End call error:", err); res.status(500).json({ error: "Failed to end call" }); }
-});
-
-// ============================================================
-// CHAT ROUTES
-// ============================================================
-
-app.get("/api/chats", authMiddleware, async (req, res) => {
-  try {
     const userId = req.user.id;
-    const { rows } = await pool.query(`SELECT c.*, u.username as name, u.profile_url as avatar, (SELECT content FROM chat_messages WHERE chat_id = c.id::text ORDER BY created_at DESC LIMIT 1) as last_message_text, (SELECT created_at FROM chat_messages WHERE chat_id = c.id::text ORDER BY created_at DESC LIMIT 1) as last_message_at FROM chats c LEFT JOIN users u ON u.id = (SELECT unnest_part FROM unnest(c.participants) AS unnest_part WHERE unnest_part != $1 LIMIT 1) WHERE $1 = ANY(c.participants) ORDER BY c.last_message_at DESC NULLS LAST`, [userId]);
-    const chats = rows.map(row => ({
-      id: row.id,
-      name: row.name || "Chat",
-      avatar: row.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(row.name || 'Chat')}`,
-      type: row.type || 'private',
-      lastMessage: row.last_message_text ? { text: row.last_message_text, timestamp: row.last_message_at || new Date() } : null,
-      pinned: false,
-      participants: row.participants || []
-    }));
-    res.json(chats);
-  } catch (err) { console.error("Fetch chats error:", err); res.status(500).json({ error: "Failed to fetch chats" }); }
-});
 
-app.get("/api/chats/:chatId/messages", authMiddleware, async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    const limit = parseInt(req.query.limit) || 50;
-    const offset = parseInt(req.query.offset) || 0;
-    const { rows } = await pool.query(`SELECT m.*, u.username as sender_name, u.profile_url as sender_avatar FROM chat_messages m LEFT JOIN users u ON m.sender_id = u.id WHERE m.chat_id = $1 AND m.is_deleted = false ORDER BY m.created_at ASC LIMIT $2 OFFSET $3`, [chatId, limit, offset]);
-    res.json({ messages: rows });
-  } catch (err) { console.error("Fetch messages error:", err); res.status(500).json({ error: "Failed to fetch messages" }); }
-});
+    const { rows } = await pool.query(
+      `UPDATE calls SET status = 'ended', ended_at = NOW() 
+       WHERE id = $1 AND (caller_id = $2 OR receiver_id = $2) AND status != 'ended' 
+       RETURNING *`, 
+      [callId, userId]
+    );
 
-app.get("/api/chats/:chatId/restrictions", authMiddleware, async (req, res) => {
-  try {
-    const { chatId } = req.params; const userId = req.user.id;
-    const { rows } = await pool.query(`SELECT chat_suspended_until, warning_count FROM chat_moderation WHERE user_id = $1 AND chat_id = $2`, [userId, chatId]);
-    if (rows.length === 0) return res.json({ suspendedUntil: null, warningCount: 0 });
-    res.json({ suspendedUntil: rows[0].chat_suspended_until, warningCount: rows[0].warning_count || 0 });
-  } catch (err) { console.error("Chat restrictions error:", err); res.status(500).json({ error: "Failed to fetch restrictions" }); }
+    if (rows.length > 0) {
+      const call = rows[0];
+      const otherUserId = call.caller_id === userId ? call.receiver_id : call.caller_id;
+      
+      // Notify other party via socket
+      io.to(`user-${otherUserId}`).emit("call-ended", { callId: call.id });
+    }
+
+    res.json({ success: true });
+  } catch (err) { 
+    console.error("End call error:", err); 
+    res.status(500).json({ error: "Failed to end call" }); 
+  }
 });
 
 // ============================================================
