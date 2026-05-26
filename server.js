@@ -1766,6 +1766,8 @@ async function safeAddColumn(table, column, definition) {
   }
 }
 
+// Replace the entire initializeTables function with this fixed version
+
 async function initializeTables() {
   try {
     // 1. USERS FIRST — referenced by everything else
@@ -1938,6 +1940,7 @@ async function initializeTables() {
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
+    // LIVESTREAMS - Use TEXT type for stream_key to handle both UUID and VARCHAR
     await pool.query(`CREATE TABLE IF NOT EXISTS livestreams (
       id SERIAL PRIMARY KEY, 
       user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
@@ -2098,7 +2101,17 @@ async function initializeTables() {
 
     // ============================================================
     // 5. LIVESTREAM FEATURE TABLES
+    // NOTE: Using TEXT for stream_id references to be compatible with
+    // both INTEGER and UUID primary keys in existing livestreams table
     // ============================================================
+
+    // Follows table (for followers_only chat mode)
+    await pool.query(`CREATE TABLE IF NOT EXISTS follows (
+      follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (follower_id, following_id)
+    )`);
 
     // Channel Points
     await pool.query(`CREATE TABLE IF NOT EXISTS channel_points (
@@ -2109,10 +2122,10 @@ async function initializeTables() {
       updated_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Channel Rewards
+    // Channel Rewards - NO FK to livestreams to avoid type mismatch
     await pool.query(`CREATE TABLE IF NOT EXISTS channel_rewards (
       id SERIAL PRIMARY KEY,
-      stream_id INTEGER REFERENCES livestreams(id) ON DELETE CASCADE,
+      stream_id TEXT NOT NULL,
       creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
       name VARCHAR(100) NOT NULL,
       description TEXT,
@@ -2124,21 +2137,21 @@ async function initializeTables() {
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Reward Redemptions
+    // Reward Redemptions - NO FK to livestreams
     await pool.query(`CREATE TABLE IF NOT EXISTS reward_redemptions (
       id SERIAL PRIMARY KEY,
       reward_id INTEGER REFERENCES channel_rewards(id) ON DELETE CASCADE,
       user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      stream_id INTEGER REFERENCES livestreams(id) ON DELETE CASCADE,
+      stream_id TEXT NOT NULL,
       status VARCHAR(20) DEFAULT 'pending',
       redeemed_at TIMESTAMP DEFAULT NOW(),
       fulfilled_at TIMESTAMP
     )`);
 
-    // Polls
+    // Polls - NO FK to livestreams
     await pool.query(`CREATE TABLE IF NOT EXISTS polls (
       id SERIAL PRIMARY KEY,
-      stream_id INTEGER REFERENCES livestreams(id) ON DELETE CASCADE,
+      stream_id TEXT NOT NULL,
       question TEXT NOT NULL,
       options JSONB NOT NULL,
       ends_at TIMESTAMP NOT NULL,
@@ -2155,10 +2168,10 @@ async function initializeTables() {
       PRIMARY KEY (poll_id, user_id)
     )`);
 
-    // Predictions
+    // Predictions - NO FK to livestreams
     await pool.query(`CREATE TABLE IF NOT EXISTS predictions (
       id SERIAL PRIMARY KEY,
-      stream_id INTEGER REFERENCES livestreams(id) ON DELETE CASCADE,
+      stream_id TEXT NOT NULL,
       question TEXT NOT NULL,
       outcomes JSONB NOT NULL,
       duration INTEGER NOT NULL,
@@ -2182,10 +2195,10 @@ async function initializeTables() {
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Clips
+    // Clips - NO FK to livestreams
     await pool.query(`CREATE TABLE IF NOT EXISTS clips (
       id SERIAL PRIMARY KEY,
-      stream_id INTEGER REFERENCES livestreams(id) ON DELETE CASCADE,
+      stream_id TEXT NOT NULL,
       creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
       start_time DECIMAL(10,3) NOT NULL,
       end_time DECIMAL(10,3) NOT NULL,
@@ -2197,30 +2210,30 @@ async function initializeTables() {
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Raids
+    // Raids - NO FK to livestreams
     await pool.query(`CREATE TABLE IF NOT EXISTS raids (
       id SERIAL PRIMARY KEY,
-      from_stream_id INTEGER REFERENCES livestreams(id) ON DELETE SET NULL,
-      to_stream_id INTEGER REFERENCES livestreams(id) ON DELETE SET NULL,
+      from_stream_id TEXT,
+      to_stream_id TEXT,
       raider_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
       viewer_count INTEGER DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Super Chats
+    // Super Chats - NO FK to livestreams
     await pool.query(`CREATE TABLE IF NOT EXISTS super_chats (
       id SERIAL PRIMARY KEY,
-      stream_id INTEGER REFERENCES livestreams(id) ON DELETE CASCADE,
+      stream_id TEXT NOT NULL,
       user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
       amount DECIMAL(10,2) NOT NULL,
       message TEXT NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Hype Trains
+    // Hype Trains - NO FK to livestreams
     await pool.query(`CREATE TABLE IF NOT EXISTS hype_trains (
       id SERIAL PRIMARY KEY,
-      stream_id INTEGER REFERENCES livestreams(id) ON DELETE CASCADE,
+      stream_id TEXT NOT NULL,
       level INTEGER DEFAULT 1,
       total_amount DECIMAL(10,2) DEFAULT 0,
       contributors JSONB DEFAULT '[]',
@@ -2229,15 +2242,7 @@ async function initializeTables() {
       is_active BOOLEAN DEFAULT true
     )`);
 
-    // Follows table (for followers_only chat mode)
-    await pool.query(`CREATE TABLE IF NOT EXISTS follows (
-      follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      created_at TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY (follower_id, following_id)
-    )`);
-
-    // 6. MIGRATIONS
+    // 6. MIGRATIONS — Add columns that may be missing on existing databases
     await safeAddColumn('users', 'cover_url', 'TEXT');
     await safeAddColumn('users', 'notification_style', "VARCHAR(20) DEFAULT 'named'");
     await safeAddColumn('users', 'warning_count', 'INTEGER DEFAULT 0');
