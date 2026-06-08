@@ -30,6 +30,7 @@ import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import OneSignal from "@onesignal/node-onesignal";
 import FormData from "form-data";
+import archiver from 'archiver';
 
 import { 
   S3Client, 
@@ -1766,8 +1767,6 @@ async function safeAddColumn(table, column, definition) {
   }
 }
 
-// Replace the entire initializeTables function with this fixed version
-
 async function initializeTables() {
   try {
     // 1. USERS FIRST — referenced by everything else
@@ -2242,7 +2241,43 @@ async function initializeTables() {
       is_active BOOLEAN DEFAULT true
     )`);
 
-    // 6. MIGRATIONS — Add columns that may be missing on existing databases
+    // ============================================================
+    // 6. SETTINGS & PRIVACY TABLES (NEW)
+    // ============================================================
+    
+    // Login Sessions
+    await pool.query(`CREATE TABLE IF NOT EXISTS login_sessions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      device VARCHAR(255),
+      ip_address VARCHAR(45),
+      user_agent TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      is_current BOOLEAN DEFAULT false
+    )`);
+
+    // Blocked Users
+    await pool.query(`CREATE TABLE IF NOT EXISTS blocked_users (
+      blocker_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      blocked_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (blocker_id, blocked_id)
+    )`);
+
+    // Support Tickets (Feedback, Reports, Contact)
+    await pool.query(`CREATE TABLE IF NOT EXISTS support_tickets (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      type VARCHAR(50),
+      category VARCHAR(100),
+      subject TEXT,
+      message TEXT NOT NULL,
+      email VARCHAR(255),
+      status VARCHAR(20) DEFAULT 'open',
+      created_at TIMESTAMP DEFAULT NOW()
+    )`);
+
+    // 7. MIGRATIONS — Add columns that may be missing on existing databases
     await safeAddColumn('users', 'cover_url', 'TEXT');
     await safeAddColumn('users', 'notification_style', "VARCHAR(20) DEFAULT 'named'");
     await safeAddColumn('users', 'warning_count', 'INTEGER DEFAULT 0');
@@ -2266,12 +2301,16 @@ async function initializeTables() {
     await safeAddColumn('users', 'is_verified', 'BOOLEAN DEFAULT false');
     await safeAddColumn('users', 'status', "VARCHAR(20) DEFAULT 'active'");
     await safeAddColumn('users', 'earnings', 'DECIMAL(10,2) DEFAULT 0');
-    await safeAddColumn('videos', 'video_s3_key', 'VARCHAR(500)');
-    await safeAddColumn('videos', 'thumbnail_s3_key', 'VARCHAR(500)');
-    await safeAddColumn('music', 'audio_s3_key', 'VARCHAR(500)');
-    await safeAddColumn('music', 'cover_s3_key', 'VARCHAR(500)');
+    await safeAddColumn('users', 'video_s3_key', 'VARCHAR(500)');
+    await safeAddColumn('users', 'thumbnail_s3_key', 'VARCHAR(500)');
+    await safeAddColumn('users', 'audio_s3_key', 'VARCHAR(500)');
+    await safeAddColumn('users', 'cover_s3_key', 'VARCHAR(500)');
+    
+    // Settings specific columns
+    await safeAddColumn('users', 'privacy_settings', "JSONB DEFAULT '{\"profileVisibility\":\"public\",\"allowComments\":true,\"allowDirectMessages\":true,\"allowDownloads\":true,\"privateAccount\":false,\"hideViewHistory\":false}'");
+    await safeAddColumn('users', 'hidden_words', "TEXT[] DEFAULT '{}'");
 
-    // 7. SEED SUBSCRIPTION TIERS
+    // 8. SEED SUBSCRIPTION TIERS
     const tierCount = await pool.query("SELECT COUNT(*) FROM subscription_tiers");
     if (parseInt(tierCount.rows[0].count) === 0) {
       console.log("🌱 Seeding Subscription Tiers...");
@@ -2872,6 +2911,29 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
   }
 });
 
+// Helper: Create a login session entry
+async function createLoginSession(userId, req) {
+  try {
+    const ip = req.headers["x-forwarded-for"]?.split(',')[0] || req.socket.remoteAddress;
+    const userAgent = req.headers["user-agent"] || "Unknown";
+    // Simple device detection
+    let device = "Desktop";
+    if (/mobile|android|iphone|ipad/i.test(userAgent)) device = "Mobile";
+    if (/mac|windows|linux/i.test(userAgent)) device = "Desktop";
+
+    await pool.query(
+      `INSERT INTO login_sessions (user_id, device, ip_address, user_agent, is_current) 
+       VALUES ($1, $2, $3, $4, true)`,
+      [userId, device, ip, userAgent]
+    );
+    
+    // Optional: Mark older sessions as not current if you want strict "current device" logic
+    // await pool.query(`UPDATE login_sessions SET is_current = false WHERE user_id = $1 AND id != (SELECT id FROM login_sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1)`, [userId]);
+  } catch (err) {
+    console.error("Login session error:", err);
+  }
+}
+
 app.post("/api/auth/login", checkBan, async (req, res) => {
   try {
     const { email, password, captchaToken } = req.body;
@@ -2887,6 +2949,10 @@ app.post("/api/auth/login", checkBan, async (req, res) => {
     if (!await verifyPassword(user.password_hash, password)) return res.status(401).json({ error: "Invalid credentials" });
     
     await pool.query("UPDATE users SET last_login_at = NOW(), failed_login_count = 0 WHERE id = $1", [user.id]);
+    
+    // Create Login Session
+    await createLoginSession(user.id, req);
+    
     const { password_hash, ...safeUser } = user;
     res.json({ user: safeUser, token: jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "7d" }) });
   } catch (err) { console.error("Login error:", err); res.status(500).json({ error: "Login failed" }); }
@@ -3196,6 +3262,357 @@ app.post("/api/livestreams/end/:id", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("End stream error:", err);
     res.status(500).json({ error: "Failed to end stream" });
+  }
+});
+
+// ============================================================
+// SETTINGS & PRIVACY ROUTES
+// ============================================================
+
+// GET /api/settings - Fetch all user data
+app.get("/api/settings", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT 
+        id, username, email, bio, profile_url, 
+        privacy_settings, preferences, hidden_words, 
+        subscription_plan, subscription_expires, is_creator 
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+
+    // Format response to match frontend expectations
+    const user = rows[0];
+    res.json({
+      settings: {
+        username: user.username,
+        email: user.email,
+        bio: user.bio,
+        profileImage: user.profile_url,
+        verified: user.is_verified, // Using is_verified from DB
+        isCreator: user.is_creator,
+        privacy: user.privacy_settings || {},
+        preferences: user.preferences || {},
+      },
+      subscription: {
+        plan: user.subscription_plan || 'Free',
+        renewalDate: user.subscription_expires
+      }
+    });
+  } catch (err) {
+    console.error("GET /api/settings error:", err);
+    res.status(500).json({ error: "Failed to fetch settings" });
+  }
+});
+
+// PATCH /api/settings/profile
+app.patch("/api/settings/profile", authMiddleware, async (req, res) => {
+  try {
+    const { username, email, bio } = req.body;
+    
+    // Basic validation
+    if (email) {
+      const emailCheck = await pool.query("SELECT id FROM users WHERE email = $1 AND id != $2", [email, req.user.id]);
+      if (emailCheck.rows.length) return res.status(400).json({ error: "Email taken" });
+    }
+    if (username) {
+      const userCheck = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id != $2", [username, req.user.id]);
+      if (userCheck.rows.length) return res.status(400).json({ error: "Username taken" });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE users SET 
+        username = COALESCE($1, username),
+        email = COALESCE($2, email),
+        bio = COALESCE($3, bio),
+        updated_at = NOW()
+       WHERE id = $4 RETURNING *`,
+      [username, email, bio, req.user.id]
+    );
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("PATCH /api/settings/profile error:", err);
+    res.status(500).json({ error: "Update failed" });
+  }
+});
+
+// PATCH /api/settings/privacy
+app.patch("/api/settings/privacy", authMiddleware, async (req, res) => {
+  try {
+    // req.body contains { key: value }, e.g. { privateAccount: true }
+    // We merge this into the existing JSONB column
+    const updates = req.body;
+    
+    const { rows } = await pool.query(
+      `UPDATE users SET 
+        privacy_settings = COALESCE(privacy_settings, '{}'::jsonb) || $1::jsonb,
+        updated_at = NOW()
+       WHERE id = $2 RETURNING privacy_settings`,
+      [JSON.stringify(updates), req.user.id]
+    );
+
+    res.json({ privacy: rows[0].privacy_settings });
+  } catch (err) {
+    console.error("PATCH /api/settings/privacy error:", err);
+    res.status(500).json({ error: "Update failed" });
+  }
+});
+
+// PATCH /api/settings/preferences
+app.patch("/api/settings/preferences", authMiddleware, async (req, res) => {
+  try {
+    const updates = req.body;
+    
+    const { rows } = await pool.query(
+      `UPDATE users SET 
+        preferences = COALESCE(preferences, '{}'::jsonb) || $1::jsonb,
+        updated_at = NOW()
+       WHERE id = $2 RETURNING preferences`,
+      [JSON.stringify(updates), req.user.id]
+    );
+
+    res.json({ preferences: rows[0].preferences });
+  } catch (err) {
+    console.error("PATCH /api/settings/preferences error:", err);
+    res.status(500).json({ error: "Update failed" });
+  }
+});
+
+// POST /api/settings/change-password
+app.post("/api/settings/change-password", authMiddleware, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    
+    const { rows } = await pool.query("SELECT password_hash FROM users WHERE id = $1", [req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+
+    const isValid = await verifyPassword(rows[0].password_hash, currentPassword);
+    if (!isValid) return res.status(400).json({ error: "Current password is incorrect" });
+
+    const password_hash = await hashPassword(newPassword);
+    
+    await pool.query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", [password_hash, req.user.id]);
+    
+    res.json({ message: "Password changed successfully" });
+  } catch (err) {
+    console.error("POST /api/settings/change-password error:", err);
+    res.status(500).json({ error: "Failed to change password" });
+  }
+});
+
+// GET /api/settings/login-activity
+app.get("/api/settings/login-activity", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, device, ip_address, created_at, is_current 
+       FROM login_sessions 
+       WHERE user_id = $1 
+       ORDER BY created_at DESC 
+       LIMIT 10`,
+      [req.user.id]
+    );
+    
+    // Map to frontend structure
+    const sessions = rows.map(s => ({
+      _id: s.id,
+      device: s.device,
+      ip: s.ip_address,
+      createdAt: s.created_at,
+      current: s.is_current
+    }));
+
+    res.json({ sessions });
+  } catch (err) {
+    console.error("GET /api/settings/login-activity error:", err);
+    res.status(500).json({ error: "Failed to fetch activity" });
+  }
+});
+
+// DELETE /api/settings/login-activity/:id
+app.delete("/api/settings/login-activity/:id", authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      "DELETE FROM login_sessions WHERE id = $1 AND user_id = $2",
+      [req.params.id, req.user.id]
+    );
+    res.json({ message: "Session revoked" });
+  } catch (err) {
+    console.error("DELETE /api/settings/login-activity error:", err);
+    res.status(500).json({ error: "Failed to revoke session" });
+  }
+});
+
+// GET /api/settings/blocked
+app.get("/api/settings/blocked", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.id, u.username, b.created_at as blocked_at 
+       FROM blocked_users b
+       JOIN users u ON b.blocked_id = u.id
+       WHERE b.blocker_id = $1`,
+      [req.user.id]
+    );
+    
+    const users = rows.map(u => ({
+      _id: u.id,
+      username: u.username,
+      blockedAt: u.blocked_at
+    }));
+
+    res.json({ users });
+  } catch (err) {
+    console.error("GET /api/settings/blocked error:", err);
+    res.status(500).json({ error: "Failed to fetch blocked users" });
+  }
+});
+
+// DELETE /api/settings/blocked/:id
+app.delete("/api/settings/blocked/:id", authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      "DELETE FROM blocked_users WHERE blocker_id = $1 AND blocked_id = $2",
+      [req.user.id, req.params.id]
+    );
+    res.json({ message: "Unblocked" });
+  } catch (err) {
+    console.error("DELETE /api/settings/blocked error:", err);
+    res.status(500).json({ error: "Failed to unblock" });
+  }
+});
+
+// GET /api/settings/hidden-words
+app.get("/api/settings/hidden-words", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT hidden_words FROM users WHERE id = $1", [req.user.id]);
+    res.json({ words: rows[0]?.hidden_words || [] });
+  } catch (err) {
+    console.error("GET /api/settings/hidden-words error:", err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+// POST /api/settings/hidden-words
+app.post("/api/settings/hidden-words", authMiddleware, async (req, res) => {
+  try {
+    const { word } = req.body;
+    if (!word) return res.status(400).json({ error: "Word required" });
+
+    // Append to array
+    await pool.query(
+      "UPDATE users SET hidden_words = array_append(hidden_words, $1) WHERE id = $2 AND NOT ($1 = ANY(hidden_words))",
+      [word.toLowerCase(), req.user.id]
+    );
+
+    res.json({ message: "Added" });
+  } catch (err) {
+    console.error("POST /api/settings/hidden-words error:", err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+// DELETE /api/settings/hidden-words/:word
+app.delete("/api/settings/hidden-words/:word", authMiddleware, async (req, res) => {
+  try {
+    const word = decodeURIComponent(req.params.word);
+    await pool.query(
+      "UPDATE users SET hidden_words = array_remove(hidden_words, $1) WHERE id = $2",
+      [word, req.user.id]
+    );
+    res.json({ message: "Removed" });
+  } catch (err) {
+    console.error("DELETE /api/settings/hidden-words error:", err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+// GET /api/settings/download-data
+app.get("/api/settings/download-data", authMiddleware, async (req, res) => {
+  try {
+    // 1. Fetch user data
+    const { rows: userRows } = await pool.query("SELECT * FROM users WHERE id = $1", [req.user.id]);
+    if (!userRows.length) return res.status(404).send("User not found");
+    
+    const userData = JSON.stringify(userRows[0], null, 2);
+
+    // 2. Setup Archiver for ZIP
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="mintza-data.zip"');
+
+    archive.pipe(res);
+
+    // 3. Add files to ZIP
+    archive.append(userData, { name: 'user_profile.json' });
+    
+    // You could add more data here, e.g., comments, likes, etc.
+    // archive.append(JSON.stringify(comments), { name: 'comments.json' });
+
+    archive.finalize();
+  } catch (err) {
+    console.error("Download data error:", err);
+    res.status(500).send("Failed to generate data");
+  }
+});
+
+// DELETE /api/settings/account
+app.delete("/api/settings/account", authMiddleware, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM users WHERE id = $1", [req.user.id]);
+    res.json({ message: "Account deleted" });
+  } catch (err) {
+    console.error("DELETE /api/settings/account error:", err);
+    res.status(500).json({ error: "Failed to delete account" });
+  }
+});
+
+// ============================================================
+// SUPPORT ROUTES
+// ============================================================
+
+app.post("/api/support/feedback", authMiddleware, async (req, res) => {
+  try {
+    const { subject, message } = req.body;
+    await pool.query(
+      `INSERT INTO support_tickets (user_id, type, subject, message) VALUES ($1, 'feedback', $2, $3)`,
+      [req.user.id, subject, message]
+    );
+    res.json({ message: "Feedback sent" });
+  } catch (err) {
+    console.error("Support feedback error:", err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+app.post("/api/support/report", authMiddleware, async (req, res) => {
+  try {
+    const { category, description, email } = req.body;
+    await pool.query(
+      `INSERT INTO support_tickets (user_id, type, category, subject, message, email) VALUES ($1, 'report', $2, $3, $4, $5)`,
+      [req.user.id, category, category, description, email]
+    );
+    res.json({ message: "Report submitted" });
+  } catch (err) {
+    console.error("Support report error:", err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+app.post("/api/support/contact", async (req, res) => {
+  try {
+    const { name, email, subject, message } = req.body;
+    // Allow contact without auth, so we don't use req.user.id here
+    await pool.query(
+      `INSERT INTO support_tickets (type, subject, message, email) VALUES ($1, $2, $3, $4)`,
+      ['contact', subject || `From ${name}`, message, email]
+    );
+    res.json({ message: "Message sent" });
+  } catch (err) {
+    console.error("Support contact error:", err);
+    res.status(500).json({ error: "Failed" });
   }
 });
 
