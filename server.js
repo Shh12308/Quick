@@ -2823,6 +2823,392 @@ app.get("/api/health", async (req, res) => {
   } catch (err) { console.error("Health check failed:", err); res.status(503).json({ status: "error", database: "error", message: err.message }); }
 });
 
+// ==========================================
+// AUTHENTICATION MIDDLEWARE
+// ==========================================
+// Verifies the Bearer token sent from the frontend
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+  if (!token) return res.status(401).json({ error: true, msg: "Access token required" });
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.id;
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: true, msg: "Invalid or expired token" });
+  }
+};
+
+// ==========================================
+// SETTINGS ROUTES
+// ==========================================
+
+// 1. Get All Settings (Profile, Privacy, Preferences, Subscription)
+app.get('/api/settings', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT 
+        id, username, email, bio, profile_url as "profileImage", verified, is_creator as "isCreator",
+        privacy, preferences, subscription_plan, subscription_expires
+       FROM users 
+       WHERE id = $1`,
+      [req.userId]
+    );
+
+    if (rows.length === 0) return res.status(404).json({ error: true, msg: "User not found" });
+
+    const user = rows[0];
+
+    // Format subscription data for the frontend
+    let subscription = {
+      plan: user.subscription_plan || 'Free',
+      renewalDate: user.subscription_expires,
+      features: []
+    };
+
+    // If user has an active subscription in DB, fetch more details (optional)
+    if (user.subscription_plan && user.subscription_plan !== 'Free') {
+      const subDetails = await pool.query(
+        "SELECT * FROM user_subscriptions WHERE user_id = $1 AND status = 'active'",
+        [req.userId]
+      );
+      if (subDetails.rows.length > 0) {
+        subscription = {
+          plan: user.subscription_plan,
+          renewalDate: subDetails.rows[0].current_period_end,
+          features: [] // Add feature logic if needed
+        };
+      }
+    }
+
+    res.json({
+      settings: {
+        username: user.username,
+        email: user.email,
+        bio: user.bio,
+        profileImage: user.profileImage,
+        verified: user.verified,
+        isCreator: user.isCreator,
+        privacy: user.privacy || {},
+        preferences: user.preferences || {}
+      },
+      subscription: subscription
+    });
+  } catch (err) {
+    console.error("Get settings error:", err);
+    res.status(500).json({ error: true, msg: "Server error" });
+  }
+});
+
+// 2. Update Profile
+app.patch('/api/settings/profile', authenticateToken, async (req, res) => {
+  const { username, email, bio } = req.body;
+  try {
+    await pool.query(
+      "UPDATE users SET username = $1, email = $2, bio = $3 WHERE id = $4",
+      [username, email, bio, req.userId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Update profile error:", err);
+    if (err.code === '23505') return res.status(400).json({ error: true, msg: "Username or email already taken" });
+    res.status(500).json({ error: true, msg: "Update failed" });
+  }
+});
+
+// 3. Update Privacy Settings
+app.patch('/api/settings/privacy', authenticateToken, async (req, res) => {
+  // Frontend sends body like { privateAccount: true } or { allowComments: false }
+  // We merge this into the JSONB 'privacy' column
+  try {
+    const updateData = JSON.stringify(req.body);
+    
+    await pool.query(
+      `UPDATE users 
+       SET privacy = COALESCE(privacy, '{}'::jsonb) || $1::jsonb 
+       WHERE id = $2`,
+      [updateData, req.userId]
+    );
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Update privacy error:", err);
+    res.status(500).json({ error: true, msg: "Update failed" });
+  }
+});
+
+// 4. Update Preferences
+app.patch('/api/settings/preferences', authenticateToken, async (req, res) => {
+  try {
+    const updateData = JSON.stringify(req.body);
+    
+    await pool.query(
+      `UPDATE users 
+       SET preferences = COALESCE(preferences, '{}'::jsonb) || $1::jsonb 
+       WHERE id = $2`,
+      [updateData, req.userId]
+    );
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Update preferences error:", err);
+    res.status(500).json({ error: true, msg: "Update failed" });
+  }
+});
+
+// 5. Change Password
+app.post('/api/settings/change-password', authenticateToken, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  try {
+    const { rows } = await pool.query("SELECT password_hash FROM users WHERE id = $1", [req.userId]);
+    if (rows.length === 0) return res.status(404).json({ error: true, msg: "User not found" });
+
+    const valid = await argon2.verify(rows[0].password_hash, currentPassword);
+    if (!valid) return res.status(400).json({ error: true, msg: "Current password is incorrect" });
+
+    const pepperedPassword = newPassword + (PASSWORD_PEPPER || '');
+    const hashedPassword = await argon2.hash(pepperedPassword);
+
+    await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [hashedPassword, req.userId]);
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Change password error:", err);
+    res.status(500).json({ error: true, msg: "Server error" });
+  }
+});
+
+// 6. Get Login Activity
+app.get('/api/settings/login-activity', authenticateToken, async (req, res) => {
+  try {
+    // Assuming you have a 'sessions' table. If not, this query needs adjustment.
+    const { rows } = await pool.query(
+      `SELECT id, device, ip, created_at, 
+        (id = (SELECT id FROM sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1)) as current
+       FROM sessions 
+       WHERE user_id = $1 
+       ORDER BY created_at DESC`,
+      [req.userId]
+    );
+    res.json({ sessions: rows });
+  } catch (err) {
+    console.error("Get login activity error:", err);
+    res.json({ sessions: [] }); // Fail gracefully
+  }
+});
+
+// 7. Revoke Session
+app.delete('/api/settings/login-activity/:id', authenticateToken, async (req, res) => {
+  const sessionId = req.params.id;
+  try {
+    await pool.query("DELETE FROM sessions WHERE id = $1 AND user_id = $2", [sessionId, req.userId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Revoke session error:", err);
+    res.status(500).json({ error: true, msg: "Failed to revoke session" });
+  }
+});
+
+// 8. Get Blocked Users
+app.get('/api/settings/blocked', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.id, u.username, u.profile_url, b.blocked_at 
+       FROM blocked_users b
+       JOIN users u ON b.blocked_id = u.id
+       WHERE b.user_id = $1`,
+      [req.userId]
+    );
+    res.json({ users: rows });
+  } catch (err) {
+    console.error("Get blocked users error:", err);
+    res.json({ users: [] });
+  }
+});
+
+// 9. Unblock User
+app.delete('/api/settings/blocked/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM blocked_users WHERE blocked_id = $1 AND user_id = $2", [req.params.id, req.userId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Unblock user error:", err);
+    res.status(500).json({ error: true, msg: "Failed" });
+  }
+});
+
+// 10. Get Hidden Words
+app.get('/api/settings/hidden-words', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT word FROM hidden_words WHERE user_id = $1",
+      [req.userId]
+    );
+    res.json({ words: rows.map(r => r.word) });
+  } catch (err) {
+    res.json({ words: [] });
+  }
+});
+
+// 11. Add Hidden Word
+app.post('/api/settings/hidden-words', authenticateToken, async (req, res) => {
+  const { word } = req.body;
+  if (!word) return res.status(400).json({ error: true, msg: "Word required" });
+  try {
+    await pool.query("INSERT INTO hidden_words (user_id, word) VALUES ($1, $2)", [req.userId, word.toLowerCase()]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: true, msg: "Failed" });
+  }
+});
+
+// 12. Remove Hidden Word
+app.delete('/api/settings/hidden-words/:word', authenticateToken, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM hidden_words WHERE user_id = $1 AND word = $2", [req.userId, req.params.word]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: true, msg: "Failed" });
+  }
+});
+
+// 13. Download Data (Zip File)
+app.get('/api/settings/download-data', authenticateToken, async (req, res) => {
+  try {
+    // 1. Setup Archiver
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    
+    // Catch warnings (e.g. stat failures)
+    archive.on('warning', (err) => { if (err.code !== 'ENOENT') throw err; });
+    archive.on('error', (err) => { throw err; });
+
+    // 2. Set Headers
+    res.attachment('mintza-data.zip');
+    archive.pipe(res);
+
+    // 3. Fetch Data to include
+    const { rows: userData } = await pool.query("SELECT * FROM users WHERE id = $1", [req.userId]);
+    // Exclude sensitive fields from JSON export
+    const { password_hash, ...safeUser } = userData[0];
+
+    // 4. Append files to zip
+    archive.append(JSON.stringify(safeUser, null, 2), { name: 'profile.json' });
+    
+    // You can add more data here, e.g., user's videos, comments, etc.
+    // Example:
+    // const videos = await pool.query("SELECT * FROM videos WHERE user_id = $1", [req.userId]);
+    // archive.append(JSON.stringify(videos.rows, null, 2), { name: 'videos.json' });
+
+    archive.finalize();
+  } catch (err) {
+    console.error("Download data error:", err);
+    if (!res.headersSent) res.status(500).json({ error: true, msg: "Failed to generate data" });
+  }
+});
+
+// 14. Delete Account
+app.delete('/api/settings/account', authenticateToken, async (req, res) => {
+  try {
+    // 1. Begin transaction
+    await pool.query('BEGIN');
+
+    // 2. Delete related data (You should addCASCADE constraints in your DB schema instead of doing this manually for better performance)
+    await pool.query("DELETE FROM sessions WHERE user_id = $1", [req.userId]);
+    await pool.query("DELETE FROM hidden_words WHERE user_id = $1", [req.userId]);
+    await pool.query("DELETE FROM blocked_users WHERE user_id = $1 OR blocked_id = $1", [req.userId]);
+    
+    // 3. Delete User
+    await pool.query("DELETE FROM users WHERE id = $1", [req.userId]);
+
+    // 4. Commit
+    await pool.query('COMMIT');
+
+    res.json({ success: true });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error("Delete account error:", err);
+    res.status(500).json({ error: true, msg: "Failed to delete account" });
+  }
+});
+
+// ==========================================
+// SUPPORT ROUTES
+// ==========================================
+
+app.post('/api/support/feedback', authenticateToken, async (req, res) => {
+  const { subject, message } = req.body;
+  try {
+    // Save to DB
+    await pool.query(
+      "INSERT INTO support_tickets (user_id, type, subject, message, status, created_at) VALUES ($1, 'feedback', $2, $3, 'open', NOW())",
+      [req.userId, subject, message]
+    );
+    
+    // Optional: Send Email
+    if (transporter) {
+      await transporter.sendMail({
+        from: `"MintZa Support" <${EMAIL_USER}>`,
+        to: 'support@mintza.com', // Your support email
+        subject: `New Feedback: ${subject}`,
+        text: `From User ID: ${req.userId}\n\n${message}`
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Feedback error:", err);
+    res.status(500).json({ error: true, msg: "Failed" });
+  }
+});
+
+app.post('/api/support/report', async (req, res) => {
+  const { category, description, email } = req.body;
+  // Report can be sent anonymously (no authenticateToken middleware)
+  try {
+    const userId = req.userId || null;
+    
+    await pool.query(
+      "INSERT INTO support_tickets (user_id, type, subject, message, contact_email, status, created_at) VALUES ($1, 'report', $2, $3, $4, 'open', NOW())",
+      [userId, category, description, email]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Report error:", err);
+    res.status(500).json({ error: true, msg: "Failed" });
+  }
+});
+
+app.post('/api/support/contact', async (req, res) => {
+  const { name, email, subject, message } = req.body;
+  try {
+    await pool.query(
+      "INSERT INTO contact_messages (name, email, subject, message, created_at) VALUES ($1, $2, $3, $4, NOW())",
+      [name, email, subject, message]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Contact error:", err);
+    res.status(500).json({ error: true, msg: "Failed" });
+  }
+});
+
+// 15. Logout
+app.post('/api/auth/logout', authenticateToken, async (req, res) => {
+  try {
+    // If you are using a 'sessions' table for persistent login sessions (beyond just JWT)
+    // you would delete the specific session here.
+    // Currently, we just return success, as JWT is stateless and will be removed from localStorage on frontend.
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: true, msg: "Failed" });
+  }
+});
+
 app.get("/videos", (req, res) => { res.redirect("/api/videos"); });
 app.get("/users/me", (req, res) => { res.redirect("/api/users/me"); });
 
