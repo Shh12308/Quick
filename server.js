@@ -2940,6 +2940,286 @@ app.patch('/api/settings/privacy', authenticateToken, async (req, res) => {
   }
 });
 
+// ==========================================
+// AUTHENTICATION MIDDLEWARE (Reuse)
+// ==========================================
+// If you already added this from the previous prompt, you can skip this.
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) return res.status(401).json({ error: true, msg: "Access token required" });
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.id;
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: true, msg: "Invalid or expired token" });
+  }
+};
+
+// ==========================================
+// VIDEO & CONTENT ROUTES
+// ==========================================
+
+// 1. GET /api/videos - List all videos (Feed)
+app.get('/api/videos', async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        v.id, v.title, v.description, v.video_url, v.thumbnail_url, 
+        v.duration, v.views, v.likes, v.dislikes, v.created_at,
+        u.id as user_id, u.username, u.profile_url, 
+        (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as subscriber_count
+      FROM videos v
+      JOIN users u ON v.user_id = u.id
+      ORDER BY v.created_at DESC
+      LIMIT 50;
+    `;
+
+    const { rows } = await pool.query(query);
+    
+    // Format to match frontend expectations loosely
+    const videos = rows.map(v => ({
+      ...v,
+      src: v.video_url,
+      thumbnail: v.thumbnail_url,
+      channelName: v.username,
+      channelAvatar: v.profile_url,
+      channelSubscribers: parseInt(v.subscriber_count),
+    }));
+
+    res.json({ data: videos });
+  } catch (err) {
+    console.error("Get videos error:", err);
+    res.status(500).json({ error: true, msg: "Server error" });
+  }
+});
+
+// 2. GET /api/livestreams/active - List active streams
+app.get('/api/livestreams/active', async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        l.id, l.title, l.thumbnail_url, l.category, l.is_live, 
+        l.viewers as views, l.created_at,
+        u.username, u.profile_url
+      FROM livestreams l
+      JOIN users u ON l.user_id = u.id
+      WHERE l.is_live = true
+      ORDER BY l.viewers DESC
+      LIMIT 20;
+    `;
+
+    const { rows } = await pool.query(query);
+    res.json({ livestreams: rows });
+  } catch (err) {
+    console.error("Get streams error:", err);
+    res.status(500).json({ error: true, msg: "Server error" });
+  }
+});
+
+// 3. GET /api/videos/:id - Get single video details (Increment View)
+app.get('/api/videos/:id', async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    // Increment view count (Simple logic - normally you'd track unique views via IP/Session)
+    await pool.query("UPDATE videos SET views = views + 1 WHERE id = $1", [id]);
+
+    const query = `
+      SELECT 
+        v.id, v.title, v.description, v.video_url, v.thumbnail_url, 
+        v.duration, v.views, v.likes, v.dislikes, v.created_at,
+        u.id as user_id, u.username, u.profile_url,
+        (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as subscriber_count
+      FROM videos v
+      JOIN users u ON v.user_id = u.id
+      WHERE v.id = $1;
+    `;
+
+    const { rows } = await pool.query(query, [id]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: true, msg: "Video not found" });
+    }
+
+    const video = {
+      ...rows[0],
+      src: rows[0].video_url,
+      thumbnail: rows[0].thumbnail_url,
+      channelName: rows[0].username,
+      channelAvatar: rows[0].profile_url,
+      channelSubscribers: parseInt(rows[0].subscriber_count),
+    };
+
+    res.json({ video });
+  } catch (err) {
+    console.error("Get video error:", err);
+    res.status(500).json({ error: true, msg: "Server error" });
+  }
+});
+
+// ==========================================
+// COMMENTS ROUTES
+// ==========================================
+
+// 4. GET /api/videos/:id/comments - Fetch comments
+app.get('/api/videos/:id/comments', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const query = `
+      SELECT 
+        c.id, c.content, c.likes, c.created_at,
+        u.username, u.profile_url
+      FROM comments c
+      JOIN users u ON c.user_id = u.id
+      WHERE c.video_id = $1
+      ORDER BY c.created_at DESC;
+    `;
+
+    const { rows } = await pool.query(query, [id]);
+
+    const comments = rows.map(c => ({
+      ...c,
+      authorName: c.username,
+      authorAvatar: c.profile_url,
+      text: c.content,
+    }));
+
+    res.json({ comments });
+  } catch (err) {
+    console.error("Get comments error:", err);
+    res.status(500).json({ error: true, msg: "Server error" });
+  }
+});
+
+// 5. POST /api/videos/:id/comments - Post a comment
+app.post('/api/videos/:id/comments', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { content } = req.body;
+  const userId = req.userId;
+
+  if (!content || !content.trim()) {
+    return res.status(400).json({ error: true, msg: "Comment cannot be empty" });
+  }
+
+  try {
+    const query = `
+      INSERT INTO comments (video_id, user_id, content, created_at)
+      VALUES ($1, $2, $3, NOW())
+      RETURNING *;
+    `;
+
+    const { rows } = await pool.query(query, [id, userId, content.trim()]);
+    
+    // Fetch user details again to return full comment object
+    const userQuery = "SELECT username, profile_url FROM users WHERE id = $1";
+    const { rows: userRows } = await pool.query(userQuery, [userId]);
+
+    const newComment = {
+      ...rows[0],
+      username: userRows[0].username,
+      profile_url: userRows[0].profile_url,
+    };
+
+    res.json({ comment: newComment });
+  } catch (err) {
+    console.error("Post comment error:", err);
+    res.status(500).json({ error: true, msg: "Failed to post comment" });
+  }
+});
+
+// ==========================================
+// REACTIONS (LIKE / DISLIKE) ROUTES
+// ==========================================
+
+// 6. GET /api/videos/:id/reaction-status - Check if user liked/disliked
+app.get('/api/videos/:id/reaction-status', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const userId = req.userId;
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT type FROM video_reactions WHERE video_id = $1 AND user_id = $2",
+      [id, userId]
+    );
+
+    const liked = rows.length > 0 && rows[0].type === 'like';
+    const disliked = rows.length > 0 && rows[0].type === 'dislike';
+
+    res.json({ liked, disliked });
+  } catch (err) {
+    console.error("Get reaction status error:", err);
+    res.status(500).json({ error: true, msg: "Server error" });
+  }
+});
+
+// 7. POST /api/videos/:id/react - Like, Dislike, or Remove Reaction
+app.post('/api/videos/:id/react', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { reaction } = req.body; // 'like', 'dislike', or 'none'
+  const userId = req.userId;
+
+  if (
+!['like', 'dislike', 'none'].includes(reaction)
+) {
+    return res.status(400).json({ error: true, msg: "Invalid reaction type" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (reaction === 'none') {
+      // Remove reaction
+      await client.query(
+        "DELETE FROM video_reactions WHERE video_id = $1 AND user_id = $2",
+        [id, userId]
+      );
+    } else {
+      // Upsert reaction (Insert or Update)
+      // PostgreSQL ON CONFLICT requires a unique constraint on (video_id, user_id)
+      const query = `
+        INSERT INTO video_reactions (video_id, user_id, type)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (video_id, user_id) 
+        DO UPDATE SET type = EXCLUDED.type;
+      `;
+      await client.query(query, [id, userId, reaction]);
+    }
+
+    // Recalculate counts for the video
+    const countQuery = `
+      UPDATE videos 
+      SET likes = (SELECT COUNT(*) FROM video_reactions WHERE video_id = $1 AND type = 'like'),
+          dislikes = (SELECT COUNT(*) FROM video_reactions WHERE video_id = $1 AND type = 'dislike')
+      WHERE id = $1
+      RETURNING likes, dislikes;
+    `;
+
+    const { rows } = await client.query(countQuery, [id]);
+
+    await client.query('COMMIT');
+
+    res.json({ 
+      reaction: reaction === 'none' ? null : reaction,
+      counts: { 
+        likes: parseInt(rows[0].likes), 
+        dislikes: parseInt(rows[0].dislikes) 
+      } 
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("React error:", err);
+    res.status(500).json({ error: true, msg: "Failed to update reaction" });
+  } finally {
+    client.release();
+  }
+});
+
 // 4. Update Preferences
 app.patch('/api/settings/preferences', authenticateToken, async (req, res) => {
   try {
