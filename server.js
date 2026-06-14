@@ -2846,6 +2846,111 @@ const authenticateToken = (req, res, next) => {
 // SETTINGS ROUTES
 // ==========================================
 
+
+// ==========================================
+// LIBRARY / USER DATA ROUTES
+// ==========================================
+
+// 1. GET /users/me/history - Watch History
+app.get('/users/me/history', authenticateToken, async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        v.id, 
+        v.thumbnail_url as thumbnail, 
+        v.title, 
+        v.duration,
+        u.username as creator_name, 
+        u.profile_url as avatar
+      FROM view_history vh
+      JOIN videos v ON vh.video_id = v.id
+      JOIN users u ON v.user_id = u.id
+      WHERE vh.user_id = $1
+      GROUP BY v.id, v.thumbnail_url, v.title, v.duration, u.username, u.profile_url
+      ORDER BY MAX(vh.timestamp) DESC
+      LIMIT 50;
+    `;
+
+    const { rows } = await pool.query(query, [req.userId]);
+    res.json({ data: rows });
+  } catch (err) {
+    console.error("Get history error:", err);
+    res.status(500).json({ error: true, msg: "Server error" });
+  }
+});
+
+// 2. GET /users/me/liked - Liked Videos
+app.get('/users/me/liked', authenticateToken, async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        v.id, 
+        v.thumbnail_url as thumbnail, 
+        v.title, 
+        v.duration,
+        u.username as creator_name, 
+        u.profile_url as avatar
+      FROM video_reactions vr
+      JOIN videos v ON vr.video_id = v.id
+      JOIN users u ON v.user_id = u.id
+      WHERE vr.user_id = $1 AND vr.type = 'like'
+      ORDER BY vr.created_at DESC
+      LIMIT 50;
+    `;
+
+    const { rows } = await pool.query(query, [req.userId]);
+    res.json({ data: rows });
+  } catch (err) {
+    console.error("Get liked videos error:", err);
+    res.status(500).json({ error: true, msg: "Server error" });
+  }
+});
+
+// 3. GET /users/me/music - Saved Music Library
+// Note: This assumes you have a way to mark videos as "Music". 
+// Here we use a 'user_saved_music' table.
+app.get('/users/me/music', authenticateToken, async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        v.id, 
+        v.thumbnail_url as thumbnail, 
+        v.title, 
+        v.duration,
+        u.username as creator_name, 
+        u.profile_url as avatar
+      FROM user_saved_music usm
+      JOIN videos v ON usm.video_id = v.id
+      JOIN users u ON v.user_id = u.id
+      WHERE usm.user_id = $1
+      ORDER BY usm.saved_at DESC
+      LIMIT 50;
+    `;
+
+    const { rows } = await pool.query(query, [req.userId]);
+    res.json({ data: rows });
+  } catch (err) {
+    console.error("Get music library error:", err);
+    res.status(500).json({ error: true, msg: "Server error" });
+  }
+});
+
+// 4. (Optional) POST /users/me/music/:id - Save to Music Library
+// You would need a frontend button to call this, e.g., "Add to Library"
+app.post('/users/me/music/:id', authenticateToken, async (req, res) => {
+  const { id: videoId } = req.params;
+  try {
+    await pool.query(
+      "INSERT INTO user_saved_music (user_id, video_id, saved_at) VALUES ($1, $2, NOW()) ON CONFLICT DO NOTHING",
+      [req.userId, videoId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Save music error:", err);
+    res.status(500).json({ error: true, msg: "Failed to save" });
+  }
+});
+
 // 1. Get All Settings (Profile, Privacy, Preferences, Subscription)
 app.get('/api/settings', authenticateToken, async (req, res) => {
   try {
