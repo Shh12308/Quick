@@ -90,7 +90,7 @@ if (!PASSWORD_PEPPER) {
 }
 
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "https://mintza.xyz",
+  origin: process.env.FRONTEND_URL || "https://mint-za.vercel.app",
   credentials: true,
 }));
 
