@@ -3578,15 +3578,42 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
 app.get("/videos", (req, res) => { res.redirect("/api/videos"); });
 app.get("/users/me", (req, res) => { res.redirect("/api/users/me"); });
 
-app.get("/api/check-username", async (req, res) => {
+app.post("/api/check-username", async (req, res) => {
   try {
-    const { username, email } = req.query;
-    if (!username && !email) return res.status(400).json({ error: "Username or email required" });
-    let usernameAvailable = true, emailAvailable = true;
-    if (username) { const resU = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [username]); usernameAvailable = resU.rows.length === 0; }
-    if (email) { const resE = await pool.query("SELECT id FROM users WHERE LOWER(email) = LOWER($1)", [email]); emailAvailable = resE.rows.length === 0; }
-    res.json({ usernameAvailable, emailAvailable });
-  } catch (err) { console.error("check-username error:", err); res.json({ usernameAvailable: true, emailAvailable: true }); }
+    const { username, email } = req.body;
+
+    let usernameAvailable = true;
+    let emailAvailable = true;
+
+    if (username) {
+      const result = await pool.query(
+        "SELECT id FROM users WHERE LOWER(username)=LOWER($1)",
+        [username]
+      );
+
+      usernameAvailable = result.rows.length === 0;
+    }
+
+    if (email) {
+      const result = await pool.query(
+        "SELECT id FROM users WHERE LOWER(email)=LOWER($1)",
+        [email]
+      );
+
+      emailAvailable = result.rows.length === 0;
+    }
+
+    res.json({
+      usernameAvailable,
+      emailAvailable,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      usernameAvailable: true,
+      emailAvailable: true,
+    });
+  }
 });
 
 app.post("/auth/check-vpn", async (req, res) => {
