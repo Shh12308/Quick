@@ -3046,25 +3046,6 @@ app.patch('/api/settings/privacy', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// AUTHENTICATION MIDDLEWARE (Reuse)
-// ==========================================
-// If you already added this from the previous prompt, you can skip this.
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) return res.status(401).json({ error: true, msg: "Access token required" });
-
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.userId = decoded.id;
-    next();
-  } catch (err) {
-    return res.status(403).json({ error: true, msg: "Invalid or expired token" });
-  }
-};
-
-// ==========================================
 // VIDEO & CONTENT ROUTES
 // ==========================================
 
