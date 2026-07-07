@@ -3581,54 +3581,66 @@ app.get("/users/me", (req, res) => { res.redirect("/api/users/me"); });
 app.get("/api/check-username", async (req, res) => {
   try {
     const username = (req.query.username || "").trim();
+    const email = (req.query.email || "").trim();
 
-    if (username.length < 3) {
-      return res.json({
-        usernameAvailable: false,
-        suggestions: [],
-      });
+    let usernameAvailable = true;
+    let emailAvailable = true;
+
+    // Check username
+    if (username) {
+      const usernameResult = await pool.query(
+        "SELECT id FROM users WHERE LOWER(username)=LOWER($1)",
+        [username]
+      );
+
+      usernameAvailable = usernameResult.rows.length === 0;
     }
 
-    const result = await pool.query(
-      "SELECT id FROM users WHERE LOWER(username) = LOWER($1)",
-      [username]
-    );
+    // Check email
+    if (email) {
+      const emailResult = await pool.query(
+        "SELECT id FROM users WHERE LOWER(email)=LOWER($1)",
+        [email]
+      );
 
-    const usernameAvailable = result.rows.length === 0;
+      emailAvailable = emailResult.rows.length === 0;
+    }
 
+    // Generate suggestions if username is taken
     let suggestions = [];
 
     if (!usernameAvailable) {
-      const candidates = [
-        `${username}${Math.floor(Math.random() * 1000)}`,
-        `${username}_${Math.floor(Math.random() * 100)}`,
-        `${username}official`,
+      const possible = [
+        `${username}${Math.floor(Math.random() * 999)}`,
+        `${username}_official`,
         `${username}_01`,
         `${username}${new Date().getFullYear()}`,
       ];
 
-      // Remove any suggestions that already exist
-      for (const candidate of candidates) {
+      for (const suggestion of possible) {
         const check = await pool.query(
-          "SELECT id FROM users WHERE LOWER(username) = LOWER($1)",
-          [candidate]
+          "SELECT id FROM users WHERE LOWER(username)=LOWER($1)",
+          [suggestion]
         );
 
         if (check.rows.length === 0) {
-          suggestions.push(candidate);
+          suggestions.push(suggestion);
         }
       }
     }
 
     res.json({
       usernameAvailable,
+      emailAvailable,
       suggestions,
     });
+
   } catch (err) {
-    console.error("Username check failed:", err);
+    console.error("check username error:", err);
 
     res.status(500).json({
-      usernameAvailable: true,
+      usernameAvailable: false,
+      emailAvailable: false,
       suggestions: [],
     });
   }
