@@ -3112,18 +3112,6 @@ const optionalAuth = (req, res, next) => {
 };
 
 // ==========================================
-// MULTER CONFIG (Memory Storage)
-// ==========================================
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 2 * 1024 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    if (['video/mp4', 'video/webm', 'video/quicktime'].includes(file.mimetype)) cb(null, true);
-    else cb(new Error('Invalid file type. Only MP4, WebM, MOV allowed.'), false);
-  }
-});
-
-// ==========================================
 // 1. GET /api/users/me
 // ==========================================
 app.get('/api/users/me', authenticate, async (req, res) => {
