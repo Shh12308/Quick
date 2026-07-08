@@ -2301,10 +2301,10 @@ async function initializeTables() {
     await safeAddColumn('users', 'is_verified', 'BOOLEAN DEFAULT false');
     await safeAddColumn('users', 'status', "VARCHAR(20) DEFAULT 'active'");
     await safeAddColumn('users', 'earnings', 'DECIMAL(10,2) DEFAULT 0');
-    await safeAddColumn('users', 'video_s3_key', 'VARCHAR(500)');
-    await safeAddColumn('users', 'thumbnail_s3_key', 'VARCHAR(500)');
-    await safeAddColumn('users', 'audio_s3_key', 'VARCHAR(500)');
-    await safeAddColumn('users', 'cover_s3_key', 'VARCHAR(500)');
+    await safeAddColumn('video', 'video_s3_key', 'VARCHAR(500)');
+    await safeAddColumn('video', 'thumbnail_s3_key', 'VARCHAR(500)');
+    await safeAddColumn('music', 'audio_s3_key', 'VARCHAR(500)');
+    await safeAddColumn('music', 'cover_s3_key', 'VARCHAR(500)');
     
     // Settings specific columns
     await safeAddColumn('users', 'privacy_settings', "JSONB DEFAULT '{\"profileVisibility\":\"public\",\"allowComments\":true,\"allowDirectMessages\":true,\"allowDownloads\":true,\"privateAccount\":false,\"hideViewHistory\":false}'");
