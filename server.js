@@ -3083,6 +3083,230 @@ app.get('/api/videos', async (req, res) => {
   }
 });
 
+// ==========================================
+// AUTH MIDDLEWARE
+// ==========================================
+const authenticate = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ error: "No token provided" });
+  try {
+    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
+    req.userId = decoded.id;
+    req.username = decoded.username;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+};
+
+const optionalAuth = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    try {
+      const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
+      req.userId = decoded.id;
+      req.username = decoded.username;
+    } catch (err) {}
+  }
+  next();
+};
+
+// ==========================================
+// MULTER CONFIG (Memory Storage)
+// ==========================================
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (['video/mp4', 'video/webm', 'video/quicktime'].includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Invalid file type. Only MP4, WebM, MOV allowed.'), false);
+  }
+});
+
+// ==========================================
+// 1. GET /api/users/me
+// ==========================================
+app.get('/api/users/me', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, username, email, profile_url as avatar, profile_url, role, subscription_plan, balance, channel_points, followers_count, created_at FROM users WHERE id = $1`, [req.userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json({ user: rows[0] });
+  } catch (err) {
+    console.error('Get user error:', err);
+    res.status(500).json({ error: "Failed to fetch user" });
+  }
+});
+
+// ==========================================
+// 2. POST /api/videos (UPLOAD)
+// ==========================================
+app.post('/api/videos', authenticate, upload.single('video'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Video file is required" });
+    const { title, description, category, isShort, isPublic, ageRestriction } = req.body;
+    if (!title?.trim()) return res.status(400).json({ error: "Title is required" });
+
+    let tags = req.body.tags ? (Array.isArray(req.body.tags) ? req.body.tags : [req.body.tags]) : [];
+    const videoId = uuidv4();
+    const ext = path.extname(req.file.originalname) || '.mp4';
+    const videoKey = `videos/${req.userId}/${videoId}${ext}`;
+    const thumbnailKey = `thumbnails/${req.userId}/${videoId}.jpg`;
+
+    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET_NAME, Key: videoKey, Body: req.file.buffer, ContentType: req.file.mimetype }));
+    const videoUrl = `https://${AWS_CLOUDFRONT_DOMAIN}/${videoKey}`;
+
+    let thumbnailUrl = null;
+    try {
+      ffmpeg.setFfmpegPath(ffmpegPath);
+      thumbnailUrl = await new Promise((resolve, reject) => {
+        const tmpPath = path.join(__dirname, `temp_thumb_${videoId}.jpg`);
+        ffmpeg(req.file.buffer).seekInput('00:00:01').frames(1).output(tmpPath).on('end', async () => {
+          try {
+            const buf = fs.readFileSync(tmpPath);
+            const opt = await sharp(buf).resize(1280, 720, { fit: 'cover' }).jpeg({ quality: 80 }).toBuffer();
+            await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET_NAME, Key: thumbnailKey, Body: opt, ContentType: 'image/jpeg' }));
+            fs.unlinkSync(tmpPath);
+            resolve(`https://${AWS_CLOUDFRONT_DOMAIN}/${thumbnailKey}`);
+          } catch (e) { reject(e); }
+        }).on('error', reject).run();
+      });
+    } catch (e) { console.error('Thumbnail failed:', e.message); }
+
+    let duration = 0;
+    try {
+      duration = await new Promise((resolve, reject) => {
+        ffmpeg.ffprobe(req.file.buffer, (err, metadata) => { if(err) reject(err); else resolve(metadata.format?.duration || 0); });
+      });
+    } catch (e) {}
+
+    const { rows } = await pool.query(
+      `INSERT INTO videos (id, user_id, title, description, video_url, thumbnail_url, duration, category, tags, is_short, is_public, age_restriction, status, created_at) 
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'processing',NOW()) RETURNING *`,
+      [videoId, req.userId, title.trim(), description?.trim() || '', videoUrl, thumbnailUrl, Math.round(duration), category || 'general', JSON.stringify(tags), isShort === 'true', isPublic === 'true', ageRestriction || 'none']
+    );
+
+    io.to(`user-${req.userId}`).emit("video-upload-complete", { videoId, status: 'processing' });
+    res.status(201).json({ message: "Video uploaded successfully", video: rows[0] });
+  } catch (err) {
+    console.error('Upload error:', err);
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: "File too large. Max 2GB." });
+    res.status(500).json({ error: "Failed to upload video" });
+  }
+});
+
+// ==========================================
+// 3. GET /api/videos (FEED & SEARCH)
+// ==========================================
+app.get('/api/videos', optionalAuth, async (req, res) => {
+  try {
+    const { filter, q, page = 1, limit = 10 } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    const userId = req.userId;
+
+    if (q && q.trim()) {
+      const { rows } = await pool.query(
+        `SELECT v.id, v.title, v.thumbnail_url, v.duration, v.views, v.created_at, v.category, v.is_short,
+                u.id as "userId", u.username, u.profile_url as avatar, CASE WHEN v.is_live = true THEN true ELSE false END as is_live
+         FROM videos v JOIN users u ON v.user_id = u.id
+         WHERE v.status = 'ready' AND v.is_public = true AND (v.title ILIKE $1 OR v.description ILIKE $1 OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(v.tags) tag WHERE tag ILIKE $2))
+         ORDER BY v.views DESC LIMIT $3 OFFSET $4`,
+        [`%${q.trim()}%`, `%${q.trim()}%`, parseInt(limit), offset]
+      );
+      return res.json({ data: rows });
+    }
+
+    let query = '', params = [], orderBy = 'v.created_at DESC';
+    if (filter === 'Shorts') { query = `WHERE v.status = 'ready' AND v.is_public = true AND v.is_short = true`; orderBy = 'v.views DESC'; }
+    else if (filter === 'Live') { query = `WHERE v.is_live = true AND v.is_public = true`; orderBy = 'v.viewers DESC NULLS LAST'; }
+    else if (['Gaming','Music','News','Sports','Podcasts','Education','Tech','Shopping'].includes(filter)) {
+      query = `WHERE v.status = 'ready' AND v.is_public = true AND v.category ILIKE $1`; params.push(filter);
+    } else if (filter === 'All') { query = `WHERE v.status = 'ready' AND v.is_public = true`; }
+    else { // Recommended
+      if (userId) {
+        query = `WHERE v.status = 'ready' AND v.is_public = true AND v.user_id != $1 AND NOT EXISTS (SELECT 1 FROM hidden_videos hv WHERE hv.video_id = v.id AND hv.user_id = $1) AND NOT EXISTS (SELECT 1 FROM blocks bu WHERE (bu.blocker_id = $1 AND bu.blocked_id = v.user_id) OR (bu.blocker_id = v.user_id AND bu.blocked_id = $1))`;
+        params.push(userId);
+        orderBy = `EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.following_id = v.user_id) DESC, (v.views + COALESCE(v.likes, 0) * 2) * POWER(0.95, EXTRACT(EPOCH FROM (NOW() - v.created_at)) / 3600) DESC`;
+      } else {
+        query = `WHERE v.status = 'ready' AND v.is_public = true`;
+        orderBy = `(v.views + COALESCE(v.likes, 0) * 2) * POWER(0.95, EXTRACT(EPOCH FROM (NOW() - v.created_at)) / 3600) DESC`;
+      }
+    }
+
+    params.push(userId || null, parseInt(limit), offset);
+    const { rows } = await pool.query(
+      `SELECT v.id, v.title, v.thumbnail_url, v.duration, v.views, v.created_at, v.category, v.is_short, v.likes,
+              u.id as "userId", u.username, u.profile_url as avatar, CASE WHEN v.is_live = true THEN true ELSE false END as is_live
+       FROM videos v JOIN users u ON v.user_id = u.id ${query} ORDER BY ${orderBy} LIMIT $${params.length - 1} OFFSET $${params.length}`, params
+    );
+    res.json({ data: rows });
+  } catch (err) {
+    console.error('Get videos error:', err);
+    res.status(500).json({ error: "Failed to fetch videos", data: [] });
+  }
+});
+
+// ==========================================
+// 4. GET /api/search (USERS)
+// ==========================================
+app.get('/api/search', async (req, res) => {
+  try {
+    if (!req.query.q?.trim()) return res.json({ users: [] });
+    const q = req.query.q.trim();
+    const { rows } = await pool.query(`SELECT id, username, profile_url as avatar, CONCAT('@', username) as handle FROM users WHERE username ILIKE $1 OR display_name ILIKE $1 ORDER BY followers_count DESC LIMIT 20`, [`%${q}%`]);
+    res.json({ users: rows });
+  } catch (err) {
+    res.status(500).json({ error: "Search failed", users: [] });
+  }
+});
+
+// ==========================================
+// 5. POST /api/videos/:videoId/hide
+// ==========================================
+app.post('/api/videos/:videoId/hide', authenticate, async (req, res) => {
+  try {
+    await pool.query(`INSERT INTO hidden_videos (user_id, video_id, created_at) VALUES ($1, $2, NOW()) ON CONFLICT (user_id, video_id) DO NOTHING`, [req.userId, req.params.videoId]);
+    res.json({ message: "Video hidden" });
+  } catch (err) { res.status(500).json({ error: "Failed to hide video" }); }
+});
+
+// ==========================================
+// 6. POST /users/:userId/block
+// ==========================================
+app.post('/users/:userId/block', authenticate, async (req, res) => {
+  try {
+    if (parseInt(req.params.userId) === req.userId) return res.status(400).json({ error: "Cannot block yourself" });
+    await pool.query(`INSERT INTO blocks (blocker_id, blocked_id, created_at) VALUES ($1, $2, NOW()) ON CONFLICT (blocker_id, blocked_id) DO NOTHING`, [req.userId, req.params.userId]);
+    await pool.query(`DELETE FROM follows WHERE (follower_id = $1 AND following_id = $2) OR (follower_id = $2 AND following_id = $1)`, [req.userId, req.params.userId]);
+    res.json({ message: "User blocked" });
+  } catch (err) { res.status(500).json({ error: "Failed to block user" }); }
+});
+
+// ==========================================
+// 7. GET /api/notifications
+// ==========================================
+app.get('/api/notifications', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT n.id, n.type, n.message as text, n.created_at as time, n.is_read, n.video_id as "videoId", n.link, u.username as user, u.profile_url as avatar
+       FROM notifications n JOIN users u ON n.actor_id = u.id WHERE n.user_id = $1 ORDER BY n.created_at DESC LIMIT 20`, [req.userId]
+    );
+    const { rows: c } = await pool.query(`SELECT COUNT(*) as count FROM notifications WHERE user_id = $1 AND is_read = false`, [req.userId]);
+    res.json({ notifications: rows, unreadCount: parseInt(c[0]?.count || 0) });
+  } catch (err) { res.status(500).json({ error: "Failed to fetch notifications", notifications: [] }); }
+});
+
+// ==========================================
+// 8. POST /api/notifications/read-all
+// ==========================================
+app.post('/api/notifications/read-all', authenticate, async (req, res) => {
+  try {
+    await pool.query("UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false", [req.userId]);
+    res.json({ message: "All read" });
+  } catch (err) { res.status(500).json({ error: "Failed" }); }
+});
+
 // 2. GET /api/livestreams/active - List active streams
 app.get('/api/livestreams/active', async (req, res) => {
   try {
