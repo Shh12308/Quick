@@ -3826,29 +3826,282 @@ app.get('/api/videos/:id/comments', async (req, res) => {
 app.get("/api/users/:username", async (req, res) => {
   try {
     const { username } = req.params;
+    
+    // Get viewer ID from auth if available
+    const viewerId = req.user?.id || null;
 
+    // Fetch user (exclude sensitive fields)
     const result = await pool.query(
-      `SELECT *
+      `SELECT 
+         id, username, display_name, profile_url, cover_url,
+         bio, location, website, role, 
+         is_content_creator, is_musician,
+         verified, banned, is_private,
+         created_at
        FROM users
-       WHERE username = $1
-          OR id::text = $1
+       WHERE username = $1 OR id::text = $1
        LIMIT 1`,
       [username]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({
-        error: "User not found"
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const u = result.rows[0];
+
+    // Check banned
+    if (u.banned) {
+      return res.json({
+        user: { id: u.id, banned: true },
+        stories: [],
+        highlights: [],
+        videos: [],
+        shorts: [],
+        music: [],
+        reposts: [],
+        likes: []
       });
     }
 
-    res.json(result.rows[0]);
+    // Check blocks (only if viewer is logged in and not the owner)
+    let blockedByViewer = false;
+    let viewerBlockedUser = false;
+
+    if (viewerId && viewerId !== u.id) {
+      const blockResult = await pool.query(
+        `SELECT blocker_id 
+         FROM blocks 
+         WHERE (blocker_id = $1 AND blocked_id = $2)
+            OR (blocker_id = $2 AND blocked_id = $1)
+         LIMIT 1`,
+        [viewerId, u.id]
+      );
+
+      if (blockResult.rows.length > 0) {
+        blockedByViewer = blockResult.rows[0].blocker_id === viewerId;
+        viewerBlockedUser = blockResult.rows[0].blocker_id === u.id;
+      }
+    }
+
+    if (viewerBlockedUser) {
+      return res.json({
+        user: { id: u.id, viewerBlockedUser: true },
+        stories: [],
+        highlights: [],
+        videos: [],
+        shorts: [],
+        music: [],
+        reposts: [],
+        likes: []
+      });
+    }
+
+    // Check if viewer follows this user
+    let isFollowing = false;
+    if (viewerId && viewerId !== u.id) {
+      const followResult = await pool.query(
+        `SELECT 1 FROM follows 
+         WHERE follower_id = $1 AND following_id = $2
+         LIMIT 1`,
+        [viewerId, u.id]
+      );
+      isFollowing = followResult.rows.length > 0;
+    }
+
+    // Get follower/following counts
+    const countResult = await pool.query(
+      `SELECT 
+         (SELECT COUNT(*) FROM follows WHERE following_id = $1) AS followers_count,
+         (SELECT COUNT(*) FROM follows WHERE follower_id = $1) AS following_count`,
+      [u.id]
+    );
+    const counts = countResult.rows[0];
+
+    // Build user object (camelCase, matching frontend expectations)
+    const userProfile = {
+      id: u.id,
+      username: u.username,
+      displayName: u.display_name,
+      profilePicture: u.profile_url,
+      coverPhoto: u.cover_url,
+      bio: u.bio,
+      location: u.location,
+      website: u.website,
+      verified: u.verified || false,
+      isContentCreator: u.is_content_creator || false,
+      isMusician: u.is_musician || false,
+      banned: u.banned || false,
+      isPrivate: u.is_private || false,
+      blockedByViewer,
+      viewerBlockedUser,
+      isFollowing,
+      followersCount: parseInt(counts.followers_count) || 0,
+      followingCount: parseInt(counts.following_count) || 0,
+      createdAt: u.created_at
+    };
+
+    // Determine if viewer can see content
+    const canViewContent = 
+      !u.is_private || 
+      viewerId === u.id || 
+      isFollowing;
+
+    const response = {
+      user: userProfile,
+      stories: [],
+      highlights: [],
+      videos: [],
+      shorts: [],
+      music: [],
+      reposts: [],
+      likes: []
+    };
+
+    // Only fetch content if viewer has permission
+    if (canViewContent) {
+
+      // --- STORIES (last 24 hours, not expired) ---
+      const storiesResult = await pool.query(
+        `SELECT id, media_url, thumbnail, created_at
+         FROM stories
+         WHERE user_id = $1 
+           AND expired = false
+           AND created_at > NOW() - INTERVAL '24 hours'
+         ORDER BY created_at ASC`,
+        [u.id]
+      );
+      response.stories = storiesResult.rows.map(s => ({
+        id: s.id,
+        media: s.media_url,
+        mediaUrl: s.media_url,
+        thumbnail: s.thumbnail,
+        createdAt: s.created_at,
+        reactions: []
+      }));
+
+      // --- HIGHLIGHTS ---
+      const highlightsResult = await pool.query(
+        `SELECT id, title, cover
+         FROM highlights
+         WHERE user_id = $1
+         ORDER BY created_at DESC`,
+        [u.id]
+      );
+      response.highlights = highlightsResult.rows.map(h => ({
+        id: h.id,
+        title: h.title,
+        cover: h.cover
+      }));
+
+      // --- VIDEOS (not shorts) ---
+      const videosResult = await pool.query(
+        `SELECT id, title, thumbnail, duration, views, created_at
+         FROM videos
+         WHERE user_id = $1 AND (type IS NULL OR type != 'short')
+         ORDER BY created_at DESC`,
+        [u.id]
+      );
+      response.videos = videosResult.rows.map(v => ({
+        id: v.id,
+        title: v.title,
+        thumbnail: v.thumbnail,
+        duration: v.duration || "0:00",
+        views: parseInt(v.views) || 0,
+        type: v.type || "video",
+        createdAt: v.created_at
+      }));
+
+      // --- SHORTS ---
+      const shortsResult = await pool.query(
+        `SELECT id, title, thumbnail, duration, views, created_at
+         FROM videos
+         WHERE user_id = $1 AND type = 'short'
+         ORDER BY created_at DESC`,
+        [u.id]
+      );
+      response.shorts = shortsResult.rows.map(v => ({
+        id: v.id,
+        title: v.title,
+        thumbnail: v.thumbnail,
+        duration: v.duration || "0:00",
+        views: parseInt(v.views) || 0,
+        type: "short",
+        createdAt: v.created_at
+      }));
+
+      // --- MUSIC ---
+      const musicResult = await pool.query(
+        `SELECT id, title, thumbnail, duration, plays as views, created_at
+         FROM music
+         WHERE user_id = $1
+         ORDER BY created_at DESC`,
+        [u.id]
+      );
+      response.music = musicResult.rows.map(m => ({
+        id: m.id,
+        title: m.title,
+        thumbnail: m.thumbnail,
+        duration: m.duration || "0:00",
+        views: parseInt(m.views) || 0,
+        type: "music",
+        createdAt: m.created_at
+      }));
+
+      // --- REPOSTS ---
+      const repostsResult = await pool.query(
+        `SELECT r.id, r.video_id, r.pinned, r.created_at,
+                v.title, v.thumbnail, v.duration, v.views, v.type
+         FROM reposts r
+         JOIN videos v ON v.id = r.video_id
+         WHERE r.user_id = $1
+         ORDER BY r.pinned DESC, r.created_at DESC`,
+        [u.id]
+      );
+      response.reposts = repostsResult.map(r => ({
+        id: r.id,
+        pinned: r.pinned,
+        createdAt: r.created_at,
+        originalVideo: {
+          id: r.video_id,
+          title: r.title,
+          thumbnail: r.thumbnail,
+          duration: r.duration || "0:00",
+          views: parseInt(r.views) || 0,
+          type: r.type || "video",
+          createdAt: r.created_at
+        }
+      }));
+
+      // --- LIKED VIDEOS (only for profile owner) ---
+      if (viewerId === u.id) {
+        const likesResult = await pool.query(
+          `SELECT v.id, v.title, v.thumbnail, v.duration, v.views, v.type, v.created_at
+           FROM video_likes l
+           JOIN videos v ON v.id = l.video_id
+           WHERE l.user_id = $1
+           ORDER BY l.created_at DESC
+           LIMIT 100`,
+          [u.id]
+        );
+        response.likes = likesResult.rows.map(v => ({
+          id: v.id,
+          title: v.title,
+          thumbnail: v.thumbnail,
+          duration: v.duration || "0:00",
+          views: parseInt(v.views) || 0,
+          type: v.type || "video",
+          createdAt: v.created_at
+        }));
+      }
+    }
+
+    // ✅ THIS is what fixes the spinner — wrapped in { user: ... }
+    return res.json(response);
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      error: "Failed to fetch profile"
-    });
+    console.error("Profile fetch error:", err);
+    return res.status(500).json({ error: "Failed to fetch profile" });
   }
 });
 
