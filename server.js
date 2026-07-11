@@ -3823,6 +3823,64 @@ app.get('/api/videos/:id/comments', async (req, res) => {
   }
 });
 
+app.get("/api/users/:username", async (req, res) => {
+
+  try {
+
+    const { username } = req.params;
+
+    const user = await User.findOne({
+
+      username: username
+
+    }).select("-password");
+
+    if (!user) {
+
+      return res.status(404).json({
+
+        message: "User not found"
+
+      });
+
+    }
+
+    res.json({
+
+      user,
+
+      // add your real queries later
+
+      videos: [],
+
+      shorts: [],
+
+      music: [],
+
+      reposts: [],
+
+      likes: [],
+
+      stories: [],
+
+      highlights: []
+
+    });
+
+  } catch (error) {
+
+    console.error("Profile error:", error);
+
+    res.status(500).json({
+
+      message: "Server error"
+
+    });
+
+  }
+
+});
+
 // 5. POST /api/videos/:id/comments - Post a comment
 app.post('/api/videos/:id/comments', authenticateToken, async (req, res) => {
   const { id } = req.params;
