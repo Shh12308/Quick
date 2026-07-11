@@ -3824,61 +3824,32 @@ app.get('/api/videos/:id/comments', async (req, res) => {
 });
 
 app.get("/api/users/:username", async (req, res) => {
-
   try {
-
     const { username } = req.params;
 
-    const user = await User.findOne({
+    const result = await pool.query(
+      `SELECT *
+       FROM users
+       WHERE username = $1
+          OR id::text = $1
+       LIMIT 1`,
+      [username]
+    );
 
-      username: username
-
-    }).select("-password");
-
-    if (!user) {
-
+    if (result.rows.length === 0) {
       return res.status(404).json({
-
-        message: "User not found"
-
+        error: "User not found"
       });
-
     }
 
-    res.json({
+    res.json(result.rows[0]);
 
-      user,
-
-      // add your real queries later
-
-      videos: [],
-
-      shorts: [],
-
-      music: [],
-
-      reposts: [],
-
-      likes: [],
-
-      stories: [],
-
-      highlights: []
-
-    });
-
-  } catch (error) {
-
-    console.error("Profile error:", error);
-
+  } catch (err) {
+    console.error(err);
     res.status(500).json({
-
-      message: "Server error"
-
+      error: "Failed to fetch profile"
     });
-
   }
-
 });
 
 // 5. POST /api/videos/:id/comments - Post a comment
