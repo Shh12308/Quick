@@ -3128,6 +3128,468 @@ app.get('/api/users/me', authenticate, async (req, res) => {
 });
 
 // ==========================================
+// DEDICATED UPLOAD ENDPOINTS
+// Add these to your server.js/index.js
+// ==========================================
+
+// --- Multer Configs (add near your other multer setups) ---
+const musicStorage = multer.memoryStorage();
+const musicUpload = multer({
+  storage: musicStorage,
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
+  fileFilter: (req, file, cb) => {
+    if (file.fieldname === "audio" && !file.mimetype.startsWith("audio/")) {
+      return cb(new Error("Invalid audio file type."), false);
+    }
+    if (file.fieldname === "cover" && !file.mimetype.startsWith("image/")) {
+      return cb(new Error("Invalid image file type."), false);
+    }
+    cb(null, true);
+  },
+});
+
+const shortsStorage = multer.memoryStorage();
+const shortsUpload = multer({
+  storage: shortsStorage,
+  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB
+  fileFilter: (req, file, cb) => {
+    if (file.fieldname === "video" && !file.mimetype.startsWith("video/")) {
+      return cb(new Error("Invalid video file type."), false);
+    }
+    cb(null, true);
+  },
+});
+
+// --- Auth Middleware (reuse or import) ---
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Authentication required." });
+  }
+  const token = authHeader.split(" ")[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.id;
+    req.username = decoded.username || null;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid or expired token." });
+  }
+};
+
+// ==========================================
+// /api/uploadv — LONG-FORM VIDEO UPLOAD
+// ==========================================
+// Expects JSON body (after client uploads to S3 via presigned URL):
+// {
+//   title: string,
+//   description?: string,
+//   tags?: string[],
+//   category?: string,
+//   s3Key: string,
+//   fileUrl: string,
+//   thumbnailUrl?: string,
+//   thumbnailKey?: string,
+//   isPublic?: boolean,
+//   ageRestriction?: string
+// }
+app.post("/api/uploadv", authenticateToken, async (req, res) => {
+  const userId = req.userId;
+
+  const {
+    title,
+    description = "",
+    tags = [],
+    category = "general",
+    s3Key,
+    fileUrl,
+    thumbnailUrl = null,
+    thumbnailKey = null,
+    isPublic = true,
+    ageRestriction = "none",
+  } = req.body;
+
+  // --- Validation ---
+  if (!title || !title.trim()) {
+    return res.status(400).json({ error: "Title is required." });
+  }
+  if (!s3Key || !fileUrl) {
+    return res.status(400).json({ error: "Missing video file data (s3Key, fileUrl)." });
+  }
+  if (!Array.isArray(tags) || tags.length > 15) {
+    return res.status(400).json({ error: "Tags must be an array with max 15 items." });
+  }
+  if (tags.some((t) => typeof t !== "string" || t.trim().length === 0)) {
+    return res.status(400).json({ error: "Each tag must be a non-empty string." });
+  }
+  const validCategories = ["general", "gaming", "music", "education", "sports", "entertainment", "comedy"];
+  if (!validCategories.includes(category)) {
+    return res.status(400).json({ error: `Invalid category. Must be one of: ${validCategories.join(", ")}` });
+  }
+  const validRestrictions = ["none", "moderate", "strict"];
+  if (!validRestrictions.includes(ageRestriction)) {
+    return res.status(400).json({ error: `Invalid ageRestriction. Must be one of: ${validRestrictions.join(", ")}` });
+  }
+
+  try {
+    // Verify user exists
+    const { rows: userRows } = await pool.query(
+      "SELECT id, username FROM users WHERE id = $1",
+      [userId]
+    );
+    if (!userRows.length) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    // Insert video record
+    const { rows } = await pool.query(
+      `INSERT INTO videos (
+        user_id, title, description, tags, category,
+        s3_key, file_url, thumbnail_url, thumbnail_key,
+        is_short, is_public, age_restriction, status, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+      RETURNING id, title, created_at`,
+      [
+        userId,
+        title.trim(),
+        description.trim(),
+        JSON.stringify(tags.map((t) => t.trim().toLowerCase())),
+        category,
+        s3Key,
+        fileUrl,
+        thumbnailUrl,
+        thumbnailKey,
+        false, // is_short
+        isPublic === true || isPublic === "true",
+        ageRestriction,
+        "processing", // status — will be updated by processing worker
+      ]
+    );
+
+    // Clear any user video cache
+    cache.del(`user-videos:${userId}`);
+
+    res.status(201).json({
+      success: true,
+      video: {
+        id: rows[0].id,
+        title: rows[0].title,
+        status: "processing",
+        created_at: rows[0].created_at,
+      },
+    });
+  } catch (err) {
+    console.error("[/api/uploadv] Error:", err);
+    res.status(500).json({ error: "Failed to save video. Please try again." });
+  }
+});
+
+
+// ==========================================
+// /api/uploads — SHORTS UPLOAD
+// ==========================================
+// Expects multipart/form-data:
+//   video: File (required, video/*, max 500MB)
+//   title: string (required)
+//   description?: string
+//   category?: string
+//   isShort?: "true"
+//   isPublic?: "true"
+//   ageRestriction?: string
+app.post("/api/uploads", authenticateToken, shortsUpload.single("video"), async (req, res) => {
+  const userId = req.userId;
+
+  const {
+    title,
+    description = "",
+    category = "general",
+    isShort = "true",
+    isPublic = "true",
+    ageRestriction = "none",
+  } = req.body;
+
+  const videoFile = req.file;
+
+  // --- Validation ---
+  if (!videoFile) {
+    return res.status(400).json({ error: "Video file is required." });
+  }
+  if (!title || !title.trim()) {
+    return res.status(400).json({ error: "Title is required." });
+  }
+
+  const validCategories = ["general", "gaming", "music", "comedy", "education"];
+  if (!validCategories.includes(category)) {
+    return res.status(400).json({ error: `Invalid category. Must be one of: ${validCategories.join(", ")}` });
+  }
+  const validRestrictions = ["none", "moderate", "strict"];
+  if (!validRestrictions.includes(ageRestriction)) {
+    return res.status(400).json({ error: `Invalid ageRestriction. Must be one of: ${validRestrictions.join(", ")}` });
+  }
+
+  try {
+    // Verify user exists
+    const { rows: userRows } = await pool.query(
+      "SELECT id, username FROM users WHERE id = $1",
+      [userId]
+    );
+    if (!userRows.length) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    // --- Upload to S3 ---
+    if (!s3) {
+      return res.status(503).json({ error: "Cloud storage is not configured." });
+    }
+
+    const ext = videoFile.originalname?.split(".").pop() || "mp4";
+    const s3Key = `shorts/${userId}/${Date.now()}-${uuidv4()}.${ext}`;
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET_NAME,
+        Key: s3Key,
+        Body: videoFile.buffer,
+        ContentType: videoFile.mimetype,
+      })
+    );
+
+    const fileUrl = AWS_CLOUDFRONT_DOMAIN
+      ? `https://${AWS_CLOUDFRONT_DOMAIN}/${s3Key}`
+      : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`;
+
+    // --- Insert into database ---
+    const { rows } = await pool.query(
+      `INSERT INTO videos (
+        user_id, title, description, category,
+        s3_key, file_url,
+        is_short, is_public, age_restriction, status, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+      RETURNING id, title, created_at`,
+      [
+        userId,
+        title.trim(),
+        description.trim(),
+        category,
+        s3Key,
+        fileUrl,
+        isShort === "true",
+        isPublic === "true",
+        ageRestriction,
+        "processing",
+      ]
+    );
+
+    // Clear cache
+    cache.del(`user-videos:${userId}`);
+    cache.del(`shorts-feed`);
+
+    res.status(201).json({
+      success: true,
+      video: {
+        id: rows[0].id,
+        title: rows[0].title,
+        fileUrl,
+        status: "processing",
+        created_at: rows[0].created_at,
+      },
+    });
+  } catch (err) {
+    console.error("[/api/uploads] Error:", err);
+    res.status(500).json({ error: "Failed to upload short. Please try again." });
+  }
+});
+
+
+// ==========================================
+// /api/uploadm — MUSIC UPLOAD
+// ==========================================
+// Expects multipart/form-data:
+//   audio: File (required, audio/*, max 100MB)
+//   cover?: File (optional, image/*)
+//   title: string (required)
+//   artist: string (required)
+//   album?: string
+//   genre?: string
+//   explicit?: "true" | "false"
+//   tags?: string (JSON array)
+app.post("/api/uploadm", authenticateToken, musicUpload.fields([
+  { name: "audio", maxCount: 1 },
+  { name: "cover", maxCount: 1 },
+]), async (req, res) => {
+  const userId = req.userId;
+
+  const {
+    title,
+    artist,
+    album = "",
+    genre = "",
+    explicit = "false",
+    tags = "[]",
+  } = req.body;
+
+  const audioFile = req.files?.["audio"]?.[0];
+  const coverFile = req.files?.["cover"]?.[0];
+
+  // --- Validation ---
+  if (!audioFile) {
+    return res.status(400).json({ error: "Audio file is required." });
+  }
+  if (!title || !title.trim()) {
+    return res.status(400).json({ error: "Title is required." });
+  }
+  if (!artist || !artist.trim()) {
+    return res.status(400).json({ error: "Artist name is required." });
+  }
+
+  let parsedTags;
+  try {
+    parsedTags = JSON.parse(tags);
+    if (!Array.isArray(parsedTags)) throw new Error();
+  } catch {
+    parsedTags = [];
+  }
+  if (parsedTags.length > 15) {
+    return res.status(400).json({ error: "Maximum 15 tags allowed." });
+  }
+
+  const validGenres = ["pop", "hip-hop", "rock", "electronic", "r&b", "country", "classical", "jazz", "other", ""];
+  if (genre && !validGenres.includes(genre.toLowerCase())) {
+    return res.status(400).json({ error: "Invalid genre." });
+  }
+
+  try {
+    // Verify user exists
+    const { rows: userRows } = await pool.query(
+      "SELECT id, username FROM users WHERE id = $1",
+      [userId]
+    );
+    if (!userRows.length) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    if (!s3) {
+      return res.status(503).json({ error: "Cloud storage is not configured." });
+    }
+
+    // --- Upload audio to S3 ---
+    const audioExt = audioFile.originalname?.split(".").pop() || "mp3";
+    const audioKey = `music/${userId}/${Date.now()}-${uuidv4()}.${audioExt}`;
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET_NAME,
+        Key: audioKey,
+        Body: audioFile.buffer,
+        ContentType: audioFile.mimetype,
+      })
+    );
+
+    const audioUrl = AWS_CLOUDFRONT_DOMAIN
+      ? `https://${AWS_CLOUDFRONT_DOMAIN}/${audioKey}`
+      : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${audioKey}`;
+
+    // --- Upload cover to S3 (if provided) ---
+    let coverUrl = null;
+    let coverKey = null;
+
+    if (coverFile) {
+      coverKey = `music-covers/${userId}/${Date.now()}-${uuidv4()}.jpg`;
+
+      // Optimize cover image with sharp
+      let coverBuffer = coverFile.buffer;
+      try {
+        coverBuffer = await sharp(coverFile.buffer)
+          .resize(1000, 1000, { fit: "inside", withoutEnlargement: true })
+          .jpeg({ quality: 90 })
+          .toBuffer();
+      } catch (sharpErr) {
+        console.warn("[/api/uploadm] Sharp optimization failed, using original:", sharpErr.message);
+        coverBuffer = coverFile.buffer;
+      }
+
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: S3_BUCKET_NAME,
+          Key: coverKey,
+          Body: coverBuffer,
+          ContentType: "image/jpeg",
+        })
+      );
+
+      coverUrl = AWS_CLOUDFRONT_DOMAIN
+        ? `https://${AWS_CLOUDFRONT_DOMAIN}/${coverKey}`
+        : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${coverKey}`;
+    }
+
+    // --- Insert into database ---
+    const { rows } = await pool.query(
+      `INSERT INTO music (
+        user_id, title, artist, album, genre,
+        s3_key, file_url, cover_url, cover_key,
+        explicit, tags, duration, status, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+      RETURNING id, title, artist, created_at`,
+      [
+        userId,
+        title.trim(),
+        artist.trim(),
+        album.trim(),
+        genre.toLowerCase(),
+        audioKey,
+        audioUrl,
+        coverUrl,
+        coverKey,
+        explicit === "true",
+        JSON.stringify(parsedTags.map((t) => t.trim().toLowerCase())),
+        0, // duration — will be updated by processing worker
+        "processing",
+      ]
+    );
+
+    // Clear cache
+    cache.del(`user-music:${userId}`);
+
+    res.status(201).json({
+      success: true,
+      track: {
+        id: rows[0].id,
+        title: rows[0].title,
+        artist: rows[0].artist,
+        audioUrl,
+        coverUrl,
+        status: "processing",
+        created_at: rows[0].created_at,
+      },
+    });
+  } catch (err) {
+    console.error("[/api/uploadm] Error:", err);
+    res.status(500).json({ error: "Failed to upload track. Please try again." });
+  }
+});
+
+// --- Multer error handler for upload endpoints ---
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({ error: "File too large." });
+    }
+    if (err.code === "LIMIT_UNEXPECTED_FILE") {
+      return res.status(400).json({ error: `Unexpected field: ${err.field}` });
+    }
+    return res.status(400).json({ error: `Upload error: ${err.message}` });
+  }
+  if (err.message && (
+    err.message.includes("Invalid audio") ||
+    err.message.includes("Invalid video") ||
+    err.message.includes("Invalid image")
+  )) {
+    return res.status(400).json({ error: err.message });
+  }
+  next(err);
+});
+
+// ==========================================
 // 2. POST /api/videos (UPLOAD)
 // ==========================================
 app.post('/api/videos', authenticate, upload.single('video'), async (req, res) => {
