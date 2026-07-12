@@ -3828,11 +3828,11 @@ app.get("/api/users/:username", async (req, res) => {
     const { username } = req.params;
     const viewerId = req.user?.id || null;
 
-    // 1. Fetch user (exclude sensitive fields)
+    // 1. Fetch user — NO created_at (doesn't exist), use updated_at instead
     const result = await pool.query(
       `SELECT id, username, display_name, profile_url, cover_url, bio, 
               location, website, is_verified, is_musician, is_creator, 
-              status, role, followers_count, privacy_settings, created_at
+              status, role, followers_count, privacy_settings, updated_at
        FROM users 
        WHERE username = $1 OR id::text = $1 
        LIMIT 1`,
@@ -3852,7 +3852,6 @@ app.get("/api/users/:username", async (req, res) => {
     const isPrivate = privacy.privateAccount === true;
     const isBanned = u.status === 'banned' || u.status === 'suspended';
 
-    // Build user object — map YOUR column names to FRONTEND expectations
     const userProfile = {
       id: u.id,
       username: u.username,
@@ -3872,7 +3871,7 @@ app.get("/api/users/:username", async (req, res) => {
       isFollowing: false,
       followersCount: u.followers_count || 0,
       followingCount: 0,
-      createdAt: u.created_at
+      createdAt: u.updated_at  // mapped to what exists
     };
 
     const response = {
@@ -3886,7 +3885,7 @@ app.get("/api/users/:username", async (req, res) => {
       likes: []
     };
 
-    // 2. Check blocked (table: blocked_users, columns: blocker_id, blocked_id)
+    // 2. Check blocked
     if (viewerId && viewerId !== u.id) {
       try {
         const blockResult = await pool.query(
@@ -3909,9 +3908,7 @@ app.get("/api/users/:username", async (req, res) => {
       return res.json(response);
     }
 
-    // 3. Check following status
-    // NOTE: follows.follower_id is UUID but users.id is integer — this will
-    // likely return empty. You may need to fix the follows table schema.
+    // 3. Check following
     if (viewerId && viewerId !== u.id) {
       try {
         const followResult = await pool.query(
@@ -3926,7 +3923,6 @@ app.get("/api/users/:username", async (req, res) => {
         console.log("follows error:", e.message);
       }
 
-      // Try to get following count (same type mismatch issue)
       try {
         const countResult = await pool.query(
           `SELECT COUNT(*) as count FROM follows 
@@ -3945,7 +3941,7 @@ app.get("/api/users/:username", async (req, res) => {
       return res.json(response);
     }
 
-    // Helper: convert seconds integer to "m:ss" string
+    // Helper
     const fmtDuration = (secs) => {
       if (!secs) return "0:00";
       const m = Math.floor(secs / 60);
@@ -3953,7 +3949,7 @@ app.get("/api/users/:username", async (req, res) => {
       return `${m}:${s.toString().padStart(2, '0')}`;
     };
 
-    // 5. Stories (is_active, expires_at, media_url)
+    // 5. Stories
     try {
       const storiesResult = await pool.query(
         `SELECT id, media_url, media_type, duration, created_at
@@ -3976,7 +3972,7 @@ app.get("/api/users/:username", async (req, res) => {
       console.log("stories error:", e.message);
     }
 
-    // 6. Highlights (cover_url)
+    // 6. Highlights
     try {
       const highlightsResult = await pool.query(
         `SELECT id, title, cover_url FROM highlights 
@@ -3993,7 +3989,7 @@ app.get("/api/users/:username", async (req, res) => {
       console.log("highlights error:", e.message);
     }
 
-    // 7. Videos (thumbnail_url, duration is integer, no type column for shorts)
+    // 7. Videos
     try {
       const videosResult = await pool.query(
         `SELECT id, title, thumbnail_url, duration, views, created_at
@@ -4015,7 +4011,7 @@ app.get("/api/users/:username", async (req, res) => {
       console.log("videos error:", e.message);
     }
 
-    // 8. Music (cover_url, listens, duration is integer)
+    // 8. Music
     try {
       const musicResult = await pool.query(
         `SELECT id, title, cover_url, duration, listens, created_at
@@ -4037,8 +4033,7 @@ app.get("/api/users/:username", async (req, res) => {
       console.log("music error:", e.message);
     }
 
-    // 9. Liked videos (likes table with content_type, owner only)
-    // NOTE: likes.content_id is integer but videos.id is UUID — casting to text
+    // 9. Liked videos (owner only)
     if (viewerId === u.id) {
       try {
         const likesResult = await pool.query(
@@ -4063,9 +4058,6 @@ app.get("/api/users/:username", async (req, res) => {
         console.log("likes error:", e.message);
       }
     }
-
-    // reposts stays empty — no reposts table in your schema
-    // shorts stays empty — no type column on videos to differentiate
 
     return res.json(response);
 
