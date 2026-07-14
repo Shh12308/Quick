@@ -3617,58 +3617,242 @@ app.use((err, req, res, next) => {
 // ==========================================
 // 2. POST /api/videos (UPLOAD)
 // ==========================================
-app.post('/api/videos', authenticate, upload.single('video'), async (req, res) => {
+app.get("/api/uploadv", authenticate, async (req, res) => {
+
   try {
-    if (!req.file) return res.status(400).json({ error: "Video file is required" });
-    const { title, description, category, isShort, isPublic, ageRestriction } = req.body;
-    if (!title?.trim()) return res.status(400).json({ error: "Title is required" });
 
-    let tags = req.body.tags ? (Array.isArray(req.body.tags) ? req.body.tags : [req.body.tags]) : [];
+    const { filename, contentType, type } = req.query;
+
+    if (!filename || !contentType) {
+
+      return res.status(400).json({
+
+        error: "filename and contentType are required",
+
+      });
+
+    }
+
+    const id = uuidv4();
+
+    let key;
+
+    if (type === "thumbnail") {
+
+      key = `thumbnails/${req.userId}/${id}.jpg`;
+
+    } else {
+
+      const ext = path.extname(filename) || ".mp4";
+
+      key = `videos/${req.userId}/${id}${ext}`;
+
+    }
+
+    const command = new PutObjectCommand({
+
+      Bucket: S3_BUCKET_NAME,
+
+      Key: key,
+
+      ContentType: contentType,
+
+    });
+
+    const uploadUrl = await getSignedUrl(s3, command, {
+
+      expiresIn: 60 * 10, // 10 minutes
+
+    });
+
+    res.json({
+
+      uploadUrl,
+
+      key,
+
+      fileUrl: `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`,
+
+    });
+
+  } catch (err) {
+
+    console.error("Presigned URL error:", err);
+
+    res.status(500).json({
+
+      error: "Failed to generate upload URL",
+
+    });
+
+  }
+
+});
+
+// POST /api/uploadv
+
+// Saves metadata after files have already been uploaded to S3
+
+app.post("/api/uploadv", authenticate, async (req, res) => {
+
+  try {
+
+    const {
+
+      title,
+
+      description,
+
+      tags = [],
+
+      category,
+
+      s3Key,
+
+      fileUrl,
+
+      thumbnailKey,
+
+      thumbnailUrl,
+
+      isShort,
+
+      isPublic,
+
+      ageRestriction,
+
+    } = req.body;
+
+    if (!title?.trim()) {
+
+      return res.status(400).json({
+
+        error: "Title is required",
+
+      });
+
+    }
+
+    if (!fileUrl || !s3Key) {
+
+      return res.status(400).json({
+
+        error: "Video URL is required",
+
+      });
+
+    }
+
     const videoId = uuidv4();
-    const ext = path.extname(req.file.originalname) || '.mp4';
-    const videoKey = `videos/${req.userId}/${videoId}${ext}`;
-    const thumbnailKey = `thumbnails/${req.userId}/${videoId}.jpg`;
-
-    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET_NAME, Key: videoKey, Body: req.file.buffer, ContentType: req.file.mimetype }));
-    const videoUrl = `https://${AWS_CLOUDFRONT_DOMAIN}/${videoKey}`;
-
-    let thumbnailUrl = null;
-    try {
-      ffmpeg.setFfmpegPath(ffmpegPath);
-      thumbnailUrl = await new Promise((resolve, reject) => {
-        const tmpPath = path.join(__dirname, `temp_thumb_${videoId}.jpg`);
-        ffmpeg(req.file.buffer).seekInput('00:00:01').frames(1).output(tmpPath).on('end', async () => {
-          try {
-            const buf = fs.readFileSync(tmpPath);
-            const opt = await sharp(buf).resize(1280, 720, { fit: 'cover' }).jpeg({ quality: 80 }).toBuffer();
-            await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET_NAME, Key: thumbnailKey, Body: opt, ContentType: 'image/jpeg' }));
-            fs.unlinkSync(tmpPath);
-            resolve(`https://${AWS_CLOUDFRONT_DOMAIN}/${thumbnailKey}`);
-          } catch (e) { reject(e); }
-        }).on('error', reject).run();
-      });
-    } catch (e) { console.error('Thumbnail failed:', e.message); }
-
-    let duration = 0;
-    try {
-      duration = await new Promise((resolve, reject) => {
-        ffmpeg.ffprobe(req.file.buffer, (err, metadata) => { if(err) reject(err); else resolve(metadata.format?.duration || 0); });
-      });
-    } catch (e) {}
 
     const { rows } = await pool.query(
-      `INSERT INTO videos (id, user_id, title, description, video_url, thumbnail_url, duration, category, tags, is_short, is_public, age_restriction, status, created_at) 
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'processing',NOW()) RETURNING *`,
-      [videoId, req.userId, title.trim(), description?.trim() || '', videoUrl, thumbnailUrl, Math.round(duration), category || 'general', JSON.stringify(tags), isShort === 'true', isPublic === 'true', ageRestriction || 'none']
+
+      `
+
+      INSERT INTO videos (
+
+        id,
+
+        user_id,
+
+        title,
+
+        description,
+
+        video_url,
+
+        thumbnail_url,
+
+        s3_key,
+
+        thumbnail_key,
+
+        category,
+
+        tags,
+
+        is_short,
+
+        is_public,
+
+        age_restriction,
+
+        status,
+
+        created_at
+
+      )
+
+      VALUES (
+
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'processing',NOW()
+
+      )
+
+      RETURNING *
+
+      `,
+
+      [
+
+        videoId,
+
+        req.userId,
+
+        title.trim(),
+
+        description?.trim() || "",
+
+        fileUrl,
+
+        thumbnailUrl || null,
+
+        s3Key,
+
+        thumbnailKey || null,
+
+        category || "general",
+
+        JSON.stringify(tags),
+
+        !!isShort,
+
+        isPublic !== false,
+
+        ageRestriction || "none",
+
+      ]
+
     );
 
-    io.to(`user-${req.userId}`).emit("video-upload-complete", { videoId, status: 'processing' });
-    res.status(201).json({ message: "Video uploaded successfully", video: rows[0] });
+    io.to(`user-${req.userId}`).emit("video-upload-complete", {
+
+      videoId,
+
+      status: "processing",
+
+    });
+
+    res.status(201).json({
+
+      success: true,
+
+      video: rows[0],
+
+    });
+
   } catch (err) {
-    console.error('Upload error:', err);
-    if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: "File too large. Max 2GB." });
-    res.status(500).json({ error: "Failed to upload video" });
+
+    console.error("Save video error:", err);
+
+    res.status(500).json({
+
+      error: "Failed to save video",
+
+    });
+
   }
+
 });
 
 // ==========================================
