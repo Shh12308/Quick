@@ -4878,6 +4878,63 @@ app.post("/api/channel-rewards", authMiddleware, async (req, res) => {
   }
 });
 
+// ==========================================
+// MUSIC ADS ENDPOINTS
+// ==========================================
+
+// GET /api/ads/music — Return active ads for the music player
+app.get("/api/ads/music", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, title, description, image_url as "imageUrl", cta_text as "ctaText", 
+             cta_link as "ctaLink", advertiser, ad_type as "adType"
+      FROM ads 
+      WHERE placement = 'music_player' 
+        AND is_active = true 
+        AND (starts_at IS NULL OR starts_at <= NOW()) 
+        AND (ends_at IS NULL OR ends_at >= NOW())
+      ORDER BY priority DESC, RANDOM()
+      LIMIT 10
+    `);
+    res.json({ ads: rows });
+  } catch (err) {
+    console.error("Fetch ads error:", err);
+    res.status(500).json({ error: "Failed to fetch ads" });
+  }
+});
+
+// POST /api/ads/impression — Track ad view
+app.post("/api/ads/impression", authMiddleware, async (req, res) => {
+  try {
+    const { adId, placement, trackId } = req.body;
+    await pool.query(`
+      INSERT INTO ad_impressions (ad_id, user_id, placement, track_id, created_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT DO NOTHING
+    `, [adId, req.user.id, placement, trackId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Ad impression error:", err);
+    res.status(500).json({ error: "Failed to record impression" });
+  }
+});
+
+// POST /api/ads/click — Track ad click
+app.post("/api/ads/click", authMiddleware, async (req, res) => {
+  try {
+    const { adId, placement, trackId } = req.body;
+    await pool.query(`
+      INSERT INTO ad_clicks (ad_id, user_id, placement, track_id, created_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT DO NOTHING
+    `, [adId, req.user.id, placement, trackId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Ad click error:", err);
+    res.status(500).json({ error: "Failed to record click" });
+  }
+});
+
 // Get stream rewards
 app.get("/api/channel-rewards/:streamId", async (req, res) => {
   try {
