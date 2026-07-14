@@ -3703,9 +3703,7 @@ app.post("/api/uploadv", authenticate, async (req, res) => {
 
       description,
 
-      tags = [],
-
-      category,
+      
 
       s3Key,
 
@@ -3754,8 +3752,7 @@ INSERT INTO videos (
  description,
  video_url,
  thumbnail_url,
- category,
- tags,
+ 
  is_short,
  is_public,
  age_restriction,
@@ -3774,7 +3771,7 @@ RETURNING *
  description?.trim() || "",
  fileUrl,
  thumbnailUrl || null,
- category || "general",
+ 
  JSON.stringify(tags),
  !!isShort,
  isPublic !== false,
