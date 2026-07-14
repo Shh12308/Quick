@@ -4124,6 +4124,159 @@ app.get("/api/users/:username", async (req, res) => {
   }
 });
 
+
+// ==========================================
+// WALLET / COIN PURCHASE ENDPOINTS
+// ==========================================
+
+// GET /api/wallet/balance — Return user's coin balance
+app.get("/api/wallet/balance", async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) return res.status(401).json({ error: "Not authenticated" });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const userId = decoded.id;
+
+    const { rows } = await pool.query(
+      "SELECT balance, earnings FROM users WHERE id = $1",
+      [userId]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+
+    res.json({
+      balance: parseFloat(rows[0].balance) || 0,
+      earnings: parseFloat(rows[0].earnings) || 0,
+    });
+  } catch (err) {
+    if (err.name === "JsonWebTokenError") {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+    console.error("Wallet balance error:", err);
+    res.status(500).json({ error: "Failed to fetch balance" });
+  }
+});
+
+// POST /api/wallet/purchase-coins — Create Stripe Checkout Session
+app.post("/api/wallet/purchase-coins", async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) return res.status(401).json({ error: "Not authenticated" });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const userId = decoded.id;
+    const { amount, price, currency = "usd" } = req.body;
+
+    // Validate input
+    if (!amount || !price || amount < 1 || price < 0.5) {
+      return res.status(400).json({ error: "Invalid package" });
+    }
+
+    // Valid coin packages (prevent tampering)
+    const VALID_PACKAGES = {
+      100: 0.99,
+      500: 4.99,
+      1000: 9.99,
+      5000: 39.99,
+    };
+
+    // Check if price matches expected price for the amount
+    const expectedPrice = VALID_PACKAGES[amount];
+    if (!expectedPrice || Math.abs(expectedPrice - price) > 0.01) {
+      return res.status(400).json({ error: "Invalid package pricing" });
+    }
+
+    // Calculate bonus
+    const BONUSES = { 100: 0, 500: 50, 1000: 150, 5000: 1000 };
+    const bonus = BONUSES[amount] || 0;
+    const totalCoins = amount + bonus;
+
+    if (!stripe) {
+      return res.status(500).json({ error: "Payments not configured" });
+    }
+
+    // Create Stripe Checkout Session
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency,
+            product_data: {
+              name: `${totalCoins.toLocaleString()} Coins${bonus > 0 ? ` (+${bonus} Bonus)` : ""}`,
+              description: `Mint virtual coins for tipping, super chats, and gifts.`,
+              images: [
+                "https://images.unsplash.com/photo-1614680376593-902f74cf0d41?w=200&q=80"
+              ],
+            },
+            // Stripe expects cents
+            unit_amount: Math.round(price * 100),
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        userId: userId.toString(),
+        coinAmount: amount.toString(),
+        coinBonus: bonus.toString(),
+        totalCoins: totalCoins.toString(),
+        purchaseType: "coins",
+      },
+      success_url: `${FRONTEND_URL || "https://mint-za.vercel.app"}/shop?success=true&coins=${totalCoins}`,
+      cancel_url: `${FRONTEND_URL || "https://mint-za.vercel.app"}/shop?cancelled=true`,
+    });
+
+    // Record pending purchase
+    await pool.query(
+      `INSERT INTO coin_purchases (user_id, stripe_session_id, coins_requested, coins_bonus, total_coins, price, currency, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW())`,
+      [userId, session.id, amount, bonus, totalCoins, price, currency]
+    );
+
+    res.json({
+      success: true,
+      url: session.url,
+      sessionId: session.id,
+    });
+  } catch (err) {
+    if (err.name === "JsonWebTokenError") {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+    console.error("Purchase coins error:", err);
+    res.status(500).json({ error: "Failed to create checkout session" });
+  }
+});
+
+// GET /api/wallet/purchases — Get user's purchase history
+app.get("/api/wallet/purchases", async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) return res.status(401).json({ error: "Not authenticated" });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const userId = decoded.id;
+
+    const { rows } = await pool.query(
+      `SELECT id, coins_requested, coins_bonus, total_coins, price, currency, status, created_at
+       FROM coin_purchases
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [userId]
+    );
+
+    res.json({ purchases: rows });
+  } catch (err) {
+    if (err.name === "JsonWebTokenError") {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+    console.error("Purchase history error:", err);
+    res.status(500).json({ error: "Failed to fetch purchase history" });
+  }
+});
+
 // 5. POST /api/videos/:id/comments - Post a comment
 app.post('/api/videos/:id/comments', authenticateToken, async (req, res) => {
   const { id } = req.params;
