@@ -3368,6 +3368,63 @@ app.post("/api/uploads", authenticateToken, shortsUpload.single("video"), async 
   }
 });
 
+app.post("/api/chats/dm", authenticateToken, async (req, res) => {
+  try {
+    const { targetUsername } = req.body;
+    if (!targetUsername) return res.status(400).json({ error: "targetUsername required" });
+
+    // Get target user
+    const { rows: targetRows } = await pool.query(
+      "SELECT id, username, display_name, profile_url FROM users WHERE username = $1",
+      [targetUsername]
+    );
+    if (!targetRows.length) return res.status(404).json({ error: "User not found" });
+    const target = targetRows[0];
+
+    // Check for existing DM
+    const { rows: existing } = await pool.query(
+      `SELECT c.* FROM chats c
+       JOIN chat_participants cp1 ON cp1.chat_id = c.id AND cp1.user_id = $1
+       JOIN chat_participants cp2 ON cp2.chat_id = c.id AND cp2.user_id = $2
+       WHERE c.type = 'private'`,
+      [req.userId, target.id]
+    );
+
+    if (existing.length) {
+      return res.json({
+        chat: {
+          id: existing[0].id,
+          name: target.display_name || target.username,
+          avatar: target.profile_url,
+          type: "private",
+        }
+      });
+    }
+
+    // Create new DM
+    const { rows: newChat } = await pool.query(
+      `INSERT INTO chats (type, name, created_at) VALUES ('private', $1, NOW()) RETURNING *`,
+      [target.display_name || target.username]
+    );
+    const chatId = newChat[0].id;
+
+    await pool.query("INSERT INTO chat_participants (chat_id, user_id) VALUES ($1, $2), ($1, $3)",
+      [chatId, req.userId, target.id]
+    );
+
+    return res.status(201).json({
+      chat: {
+        id: chatId,
+        name: target.display_name || target.username,
+        avatar: target.profile_url,
+        type: "private",
+      }
+    });
+  } catch (err) {
+    console.error("DM create error:", err);
+    return res.status(500).json({ error: "Failed to create conversation" });
+  }
+});
 
 // ==========================================
 // /api/uploadm — MUSIC UPLOAD
