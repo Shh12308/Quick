@@ -3746,84 +3746,41 @@ app.post("/api/uploadv", authenticate, async (req, res) => {
     const videoId = uuidv4();
 
     const { rows } = await pool.query(
-
-      `
-
-      INSERT INTO videos (
-
-        id,
-
-        user_id,
-
-        title,
-
-        description,
-
-        video_url,
-
-        thumbnail_url,
-
-        s3_key,
-
-        thumbnail_key,
-
-        category,
-
-        tags,
-
-        is_short,
-
-        is_public,
-
-        age_restriction,
-
-        status,
-
-        created_at
-
-      )
-
-      VALUES (
-
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'processing',NOW()
-
-      )
-
-      RETURNING *
-
-      `,
-
-      [
-
-        videoId,
-
-        req.userId,
-
-        title.trim(),
-
-        description?.trim() || "",
-
-        fileUrl,
-
-        thumbnailUrl || null,
-
-        s3Key,
-
-        thumbnailKey || null,
-
-        category || "general",
-
-        JSON.stringify(tags),
-
-        !!isShort,
-
-        isPublic !== false,
-
-        ageRestriction || "none",
-
-      ]
-
-    );
+`
+INSERT INTO videos (
+ id,
+ user_id,
+ title,
+ description,
+ video_url,
+ thumbnail_url,
+ category,
+ tags,
+ is_short,
+ is_public,
+ age_restriction,
+ status,
+ created_at
+)
+VALUES (
+ $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'processing',NOW()
+)
+RETURNING *
+`,
+[
+ videoId,
+ req.userId,
+ title.trim(),
+ description?.trim() || "",
+ fileUrl,
+ thumbnailUrl || null,
+ category || "general",
+ JSON.stringify(tags),
+ !!isShort,
+ isPublic !== false,
+ ageRestriction || "none"
+]
+);
 
     io.to(`user-${req.userId}`).emit("video-upload-complete", {
 
