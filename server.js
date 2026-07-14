@@ -4402,6 +4402,167 @@ app.post('/api/videos/:id/react', authenticateToken, async (req, res) => {
   }
 });
 
+// ==========================================
+// REST AUTH MIDDLEWARE
+// ==========================================
+const authenticateREST = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : authHeader;
+    if (!token) return res.status(401).json({ error: "Not authenticated" });
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: "Invalid or expired token" });
+  }
+};
+
+// ==========================================
+// DM & MESSAGES ENDPOINTS
+// ==========================================
+
+// GET /api/chats/:identifier/messages
+// If identifier is a number -> treat as userId, find/create DM
+// If identifier is a UUID -> treat as chatId, fetch messages
+app.get("/api/chats/:identifier/messages", authenticateREST, async (req, res) => {
+  try {
+    const myId = req.user.id;
+    const identifier = req.params.identifier;
+    let chatId;
+
+    const isUserId = !isNaN(parseInt(identifier)) && identifier.length < 15;
+
+    if (isUserId) {
+      const targetId = parseInt(identifier);
+
+      const targetUser = await pool.query(
+        "SELECT id, username, profile_url FROM users WHERE id = $1", [targetId]
+      );
+      if (targetUser.rows.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+      if (targetId === myId) {
+        return res.status(400).json({ error: "Cannot chat with yourself" });
+      }
+
+      // Check for existing DM
+      const existingChat = await pool.query(
+        `SELECT id FROM chats 
+         WHERE type = 'private' AND $1 = ANY(participants) AND $2 = ANY(participants) 
+         LIMIT 1`,
+        [myId, targetId]
+      );
+
+      if (existingChat.rows.length > 0) {
+        chatId = existingChat.rows[0].id;
+      } else {
+        // Create new DM
+        const newChat = await pool.query(
+          `INSERT INTO chats (participants, type, created_at) 
+           VALUES (ARRAY[$1::int, $2::int], 'private', NOW()) 
+           RETURNING id`,
+          [myId, targetId]
+        );
+        chatId = newChat.rows[0].id;
+        console.log(`✅ Created DM ${chatId} between ${myId} and ${targetId}`);
+      }
+    } else {
+      // It's a real Chat ID (UUID)
+      chatId = identifier;
+      const chatCheck = await pool.query(
+        "SELECT id FROM chats WHERE id = $1 AND $2 = ANY(participants)", [chatId, myId]
+      );
+      if (chatCheck.rows.length === 0) {
+        return res.status(403).json({ error: "Not in this chat" });
+      }
+    }
+
+    const messagesRes = await pool.query(
+      `SELECT m.*, u.username AS sender_name, u.profile_url AS sender_avatar
+       FROM messages m
+       LEFT JOIN users u ON m.sender_id = u.id
+       WHERE m.chat_id = $1
+       ORDER BY m.timestamp ASC`,
+      [chatId]
+    );
+
+    res.json({ chatId: chatId, messages: messagesRes.rows });
+
+  } catch (err) {
+    console.error("DM Fetch Error:", err.message, err.stack);
+    res.status(500).json({ error: `Failed to load messages: ${err.message}` });
+  }
+});
+
+// POST /api/chats/:chatId/messages
+app.post("/api/chats/:chatId/messages", authenticateREST, async (req, res) => {
+  try {
+    const myId = req.user.id;
+    const { chatId } = req.params;
+    const { content, type, media_url } = req.body;
+
+    if (!content && !media_url) {
+      return res.status(400).json({ error: "Message cannot be empty" });
+    }
+
+    const chatCheck = await pool.query(
+      "SELECT id FROM chats WHERE id = $1 AND $2 = ANY(participants)", [chatId, myId]
+    );
+    if (chatCheck.rows.length === 0) {
+      return res.status(403).json({ error: "Not authorized in this chat" });
+    }
+
+    const msgRes = await pool.query(
+      `INSERT INTO messages (chat_id, sender_id, content, type, media_url, timestamp)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING *`,
+      [chatId, myId, content || "", type || "text", media_url || null]
+    );
+
+    const message = msgRes.rows[0];
+
+    // Get sender info for socket broadcast
+    const { rows: userRows } = await pool.query(
+      "SELECT username, profile_url FROM users WHERE id = $1", [myId]
+    );
+
+    // Broadcast to everyone in the chat room via socket
+    io.to(`chat-${chatId}`).emit("new-message", {
+      ...message,
+      sender_name: userRows[0]?.username,
+      sender_avatar: userRows[0]?.profile_url
+    });
+
+    // Update last_message on the chat
+    await pool.query(
+      `UPDATE chats SET last_message = $1, last_message_at = NOW() WHERE id = $2`,
+      [content || "[Media]", chatId]
+    );
+
+    res.json({ success: true, message });
+
+  } catch (err) {
+    console.error("Send Message Error:", err.message);
+    res.status(500).json({ error: `Failed to send message: ${err.message}` });
+  }
+});
+
+// GET /api/users/me (if you don't already have this exact route)
+app.get("/api/users/me", authenticateREST, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT id, username, name, email, profile_url, role, status, dob, subscription_plan, subscription_expires, balance, earnings FROM users WHERE id = $1",
+      [req.user.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ user: rows[0] });
+  } catch (err) {
+    console.error("Fetch me error:", err.message);
+    res.status(500).json({ error: "Failed to fetch user" });
+  }
+});
+
 // 4. Update Preferences
 app.patch('/api/settings/preferences', authenticateToken, async (req, res) => {
   try {
