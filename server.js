@@ -159,15 +159,21 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // POSTGRESQL POOL
 // ==========================================
 const { Pool } = pg;
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: DATABASE_URL?.includes('localhost') || DATABASE_URL?.includes('127.0.0.1') ? false : { rejectUnauthorized: false },
-  max: 20,
+
+  max: 10,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
 });
 
-pool.on('error', (err) => { console.error('PostgreSQL Pool Error:', err.message); });
+pool.on("error", (err) => {
+  console.error("PostgreSQL Pool Error:", err);
+});
 
 // ==========================================
 // REDIS & SESSION (SAFE INITIALIZATION)
