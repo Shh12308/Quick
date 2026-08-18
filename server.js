@@ -3949,6 +3949,62 @@ app.get('/api/livestreams/active', async (req, res) => {
   }
 });
 
+// ✅ Video proxy - bypasses CloudFront CORS issues
+app.get('/api/video-proxy', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'Missing url' });
+
+  // Only allow proxying from your own S3 bucket
+  const allowed = [
+    'cdn.mintza.xyz',
+    process.env.S3_BUCKET_NAME ? `${process.env.S3_BUCKET_NAME}.s3.amazonaws.com` : null,
+    process.env.AWS_CLOUDFRONT_DOMAIN
+  ].filter(Boolean);
+
+  const isAllowed = allowed.some(domain => url.includes(domain));
+  if (!isAllowed) return res.status(403).json({ error: 'URL not allowed' });
+
+  try {
+    const response = await fetch(url);
+    
+    if (!response.ok) {
+      return res.status(response.status).json({ error: 'Video fetch failed' });
+    }
+
+    const contentType = response.headers.get('Content-Type') || 'video/mp4';
+    const contentLength = response.headers.get('Content-Length');
+    const contentRange = response.headers.get('Content-Range');
+    const acceptRanges = response.headers.get('Accept-Ranges');
+
+    const headers = {
+      'Content-Type': contentType,
+      'Access-Control-Allow-Origin': req.headers.origin || '*',
+      'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+      'Access-Control-Allow-Headers': 'Range',
+      'Access-Control-Expose-Headers': 'Content-Length, Content-Range',
+    };
+
+    if (contentLength) headers['Content-Length'] = contentLength;
+    if (contentRange) headers['Content-Range'] = contentRange;
+    if (acceptRanges) headers['Accept-Ranges'] = acceptRanges;
+
+    res.writeHead(response.status, headers);
+    response.body.pipe(res);
+  } catch (err) {
+    console.error('Proxy error:', err);
+    res.status(500).json({ error: 'Proxy failed' });
+  }
+});
+
+// Handle CORS preflight for proxy
+app.options('/api/video-proxy', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Range');
+  res.set('Access-Control-Max-Age', '86400');
+  res.status(204).send();
+});
+
 // 3. GET /api/videos/:id - Get single video details (Increment View)
 app.get('/api/videos/:id', async (req, res) => {
   const { id } = req.params;
