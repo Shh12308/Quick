@@ -3954,13 +3954,18 @@ app.get('/api/videos/:id', async (req, res) => {
   const { id } = req.params;
   
   try {
-    // Increment view count (Simple logic - normally you'd track unique views via IP/Session)
+    // Increment view count
     await pool.query("UPDATE videos SET views = views + 1 WHERE id = $1", [id]);
 
     const query = `
       SELECT 
-        v.id, v.title, v.description, v.video_url, v.thumbnail_url, 
+        v.id, v.title, v.description, 
+        COALESCE(v.video_url, v.file_url) as video_url,
+        v.file_url,
+        v.thumbnail_url, 
         v.duration, v.views, v.likes, v.dislikes, v.created_at,
+        v.processing_status, v.status,
+        v.auto_captions, v.custom_captions,
         u.id as user_id, u.username, u.profile_url,
         (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as subscriber_count
       FROM videos v
@@ -3976,11 +3981,13 @@ app.get('/api/videos/:id', async (req, res) => {
 
     const video = {
       ...rows[0],
-      src: rows[0].video_url,
+      // ✅ src falls back to file_url if video_url is null
+      src: rows[0].video_url || rows[0].file_url,
       thumbnail: rows[0].thumbnail_url,
       channelName: rows[0].username,
       channelAvatar: rows[0].profile_url,
       channelSubscribers: parseInt(rows[0].subscriber_count),
+      subtitles: rows[0].auto_captions || rows[0].custom_captions || [],
     };
 
     res.json({ video });
@@ -3989,7 +3996,6 @@ app.get('/api/videos/:id', async (req, res) => {
     res.status(500).json({ error: true, msg: "Server error" });
   }
 });
-
 // ==========================================
 // COMMENTS ROUTES
 // ==========================================
