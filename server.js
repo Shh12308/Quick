@@ -26,15 +26,6 @@ import { createAdapter } from "@socket.io/redis-adapter";
 import OpenAI from "openai";
 import NodeCache from "node-cache";
 import sharp from "sharp";
-// Near the top, after all your requires:
-// Dynamic import instead (works on all Node versions including Railway Node 18)
-const loadModule = (mod) => {
-  try { return require(mod); } catch { return null; }
-};
-
-
-const userRoutes = loadModule('./routes/userRoutes')(pool, s3, AWS_CLOUDFRONT_DOMAIN, S3_BUCKET_NAME, AWS_REGION);
-
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import OneSignal from "@onesignal/node-onesignal";
@@ -5295,9 +5286,6 @@ const authenticateREST = async (req, res, next) => {
 // ==========================================
 // DM & MESSAGES ENDPOINTS
 // ==========================================
-
-// Then later in your app.use() or route definitions, mount the router:
-app.use('/api/users', userRoutes);
 
 // GET /api/chats/:identifier/messages
 // If identifier is a number -> treat as userId, find/create DM
