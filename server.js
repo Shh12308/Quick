@@ -5413,6 +5413,86 @@ app.post("/api/chats/:chatId/messages", authenticateREST, async (req, res) => {
   }
 });
 
+// ==========================================
+// STRIPE SUBSCRIPTION CHECKOUT
+// ==========================================
+app.post('/api/subscriptions/checkout', async (req, res) => {
+  if (!stripe) return res.status(500).json({ error: "Stripe not configured" });
+
+  try {
+    // --- Auth check ---
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: "No token provided" });
+    }
+    const token = authHeader.split(' ')[1];
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+
+    const userId = decoded.id;
+    const { tierId } = req.body;
+
+    if (!tierId || ![1, 2, 3].includes(Number(tierId))) {
+      return res.status(400).json({ error: "Invalid tier" });
+    }
+
+    // --- Look up the Stripe Price ID for this tier ---
+    // You need a mapping of tier IDs to Stripe Price IDs.
+    // These should match what you created in your Stripe Dashboard.
+    const priceMap = {
+      1: process.env.STRIPE_PRICE_MONTHLY,   // e.g. "price_1ABC..."
+      2: process.env.STRIPE_PRICE_YEARLY,    // e.g. "price_1DEF..."
+      3: process.env.STRIPE_PRICE_ELITE,     // e.g. "price_1GHI..."
+    };
+
+    const priceId = priceMap[tierId];
+    if (!priceId) {
+      return res.status(400).json({ error: "No price configured for this tier" });
+    }
+
+    // --- Check if user already has an active subscription ---
+    const { rows: existingSub } = await pool.query(
+      "SELECT * FROM user_subscriptions WHERE user_id = $1 AND status = 'active'",
+      [userId]
+    );
+
+    if (existingSub.length > 0) {
+      return res.status(409).json({ error: "Already subscribed. Manage your subscription in settings." });
+    }
+
+    // --- Create Stripe Checkout Session ---
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${FRONTEND_URL}/premium?success=true`,
+      cancel_url: `${FRONTEND_URL}/premium?canceled=true`,
+      metadata: {
+        userId: userId.toString(),
+        tierId: tierId.toString()
+      },
+      subscription_data: {
+        metadata: {
+          userId: userId.toString(),
+          tierId: tierId.toString()
+        }
+      },
+      // Allow promo codes if you want
+      allow_promotion_codes: true,
+    });
+
+    res.json({ sessionId: session.id });
+
+  } catch (err) {
+    console.error("Checkout error:", err);
+    res.status(500).json({ error: "Failed to create checkout session" });
+  }
+});
+
 // GET /api/users/me (if you don't already have this exact route)
 app.get("/api/users/me", authenticateREST, async (req, res) => {
   try {
