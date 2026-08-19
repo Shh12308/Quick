@@ -32,8 +32,6 @@ const loadModule = (mod) => {
   try { return require(mod); } catch { return null; }
 };
 
-const jwt = loadModule('jsonwebtoken');
-const sharp = loadModule('sharp');
 
 const userRoutes = loadModule('./routes/userRoutes')(pool, s3, AWS_CLOUDFRONT_DOMAIN, S3_BUCKET_NAME, AWS_REGION);
 
