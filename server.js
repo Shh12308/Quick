@@ -6326,6 +6326,110 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
   } catch (err) { console.error("GET /api/auth/me error:", err); res.status(500).json({ error: "Failed to fetch user" }); }
 });
 
+// ==========================================
+// FOLLOW / UNFOLLOW — MUST be BEFORE the catch-all user route
+// ==========================================
+
+app.post('/api/users/:username/follow', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Not authenticated' });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    const { rows: targetRows } = await pool.query(
+      'SELECT id FROM users WHERE username = $1',
+      [req.params.username]
+    );
+
+    if (!targetRows.length) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const followingId = targetRows[0].id;
+
+    if (decoded.id === followingId) {
+      return res.status(400).json({ error: 'Cannot follow yourself' });
+    }
+
+    const { rows: existing } = await pool.query(
+      'SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2',
+      [decoded.id, followingId]
+    );
+
+    if (existing.length > 0) {
+      return res.status(409).json({ error: 'Already following' });
+    }
+
+    await pool.query(
+      'INSERT INTO follows (follower_id, following_id, created_at) VALUES ($1, $2, NOW())',
+      [decoded.id, followingId]
+    );
+
+    await pool.query(
+      'UPDATE users SET subscribers_count = subscribers_count + 1 WHERE id = $1',
+      [followingId]
+    );
+
+    await pool.query(
+      'UPDATE users SET following_count = COALESCE(following_count, 0) + 1 WHERE id = $1',
+      [decoded.id]
+    );
+
+    res.json({ success: true, following: true });
+  } catch (err) {
+    console.error('Follow error:', err);
+    res.status(500).json({ error: 'Failed to follow' });
+  }
+});
+
+app.post('/api/users/:username/unfollow', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Not authenticated' });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    const { rows: targetRows } = await pool.query(
+      'SELECT id FROM users WHERE username = $1',
+      [req.params.username]
+    );
+
+    if (!targetRows.length) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const followingId = targetRows[0].id;
+
+    const { rowCount } = await pool.query(
+      'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2',
+      [decoded.id, followingId]
+    );
+
+    if (rowCount === 0) {
+      return res.status(409).json({ error: 'Not following' });
+    }
+
+    await pool.query(
+      'UPDATE users SET subscribers_count = GREATEST(subscribers_count - 1, 0) WHERE id = $1',
+      [followingId]
+    );
+
+    await pool.query(
+      'UPDATE users SET following_count = GREATEST(COALESCE(following_count, 0) - 1, 0) WHERE id = $1',
+      [decoded.id]
+    );
+
+    res.json({ success: true, following: false });
+  } catch (err) {
+    console.error('Unfollow error:', err);
+    res.status(500).json({ error: 'Failed to unfollow' });
+  }
+});
+
+// THIS MUST COME BEFORE THE CATCH-ALL:
+// app.get('/api/users/:username', async (req, res) => { ... });
+
 app.post("/api/forgot-password", async (req, res) => {
   try {
     const { email } = req.body;
