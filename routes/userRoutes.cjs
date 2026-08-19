@@ -1,5 +1,10 @@
 // routes/userRoutes.js
 // Add this near the top of server.js: require('./routes/userRoutes');
+let jwt, sharp;
+
+try { jwt = require('jsonwebtoken'); } catch {}
+try { sharp = require('sharp'); } catch {}
+
 
 const router = require('express').Router();
 
