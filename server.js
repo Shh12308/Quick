@@ -5414,6 +5414,345 @@ app.post("/api/chats/:chatId/messages", authenticateREST, async (req, res) => {
 });
 
 // ==========================================
+// USER PROFILE & "MY CONTENT" ROUTES
+// ==========================================
+
+// Get current user's profile
+app.get('/api/users/profile', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Not authenticated' });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    const { rows } = await pool.query(
+      `SELECT 
+        id, username, email, display_name, bio, location, website,
+        profile_url, cover_url, is_verified, role,
+        subscribers_count, total_views, following_count,
+        is_private, created_at,
+        (SELECT COUNT(*) FROM videos WHERE user_id = users.id AND is_short = false AND is_public = true) as video_count,
+        (SELECT COUNT(*) FROM videos WHERE user_id = users.id AND is_short = true AND is_public = true) as short_count
+       FROM users 
+       WHERE id = $1`,
+      [decoded.id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = rows[0];
+
+    res.json({
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      display_name: user.display_name,
+      bio: user.bio,
+      location: user.location,
+      website: user.website,
+      profile_url: user.profile_url,
+      cover_url: user.cover_url,
+      is_verified: user.is_verified,
+      role: user.role,
+      subscribers_count: user.subscribers_count || 0,
+      total_views: user.total_views || 0,
+      following_count: user.following_count || 0,
+      is_private: user.is_private || false,
+      video_count: user.video_count || 0,
+      short_count: user.short_count || 0,
+      created_at: user.created_at,
+    });
+  } catch (err) {
+    console.error('Get profile error:', err);
+    res.status(500).json({ error: 'Failed to fetch profile' });
+  }
+});
+
+// Update current user's profile
+app.put('/api/users/profile', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Not authenticated' });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const { display_name, bio, location, website } = req.body;
+
+    const updates = [];
+    const params = [];
+    let paramIndex = 1;
+
+    if (display_name !== undefined) {
+      updates.push(`display_name = $${paramIndex++}`);
+      params.push(display_name);
+    }
+    if (bio !== undefined) {
+      updates.push(`bio = $${paramIndex++}`);
+      params.push(bio);
+    }
+    if (location !== undefined) {
+      updates.push(`location = $${paramIndex++}`);
+      params.push(location);
+    }
+    if (website !== undefined) {
+      updates.push(`website = $${paramIndex++}`);
+      params.push(website);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'Nothing to update' });
+    }
+
+    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
+    const { rows } = await pool.query(query, [...params, decoded.id]);
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      display_name: rows[0].display_name,
+      bio: rows[0].bio,
+      location: rows[0].location,
+      website: rows[0].website,
+    });
+  } catch (err) {
+    console.error('Update profile error:', err);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// Get current user's videos
+app.get('/api/users/my/videos', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Not authenticated' });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit) || 20);
+    const offset = (page - 1) * limit;
+
+    const { rows } = await pool.query(
+      `SELECT * FROM videos 
+       WHERE user_id = $1 AND is_short = false AND is_public = true 
+       ORDER BY created_at DESC 
+       LIMIT $2 OFFSET $3`,
+      [decoded.id, limit, offset]
+    );
+
+    res.json({ data: rows, page, limit });
+  } catch (err) {
+    console.error('Get my videos error:', err);
+    res.status(500).json({ error: 'Failed to fetch videos' });
+  }
+});
+
+// Get current user's shorts
+app.get('/api/users/my/shorts', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Not authenticated' });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit) || 20);
+    const offset = (page - 1) * limit;
+
+    const { rows } = await pool.query(
+      `SELECT * FROM videos 
+       WHERE user_id = $1 AND is_short = true AND is_public = true 
+       ORDER BY created_at DESC 
+       LIMIT $2 OFFSET $3`,
+      [decoded.id, limit, offset]
+    );
+
+    res.json({ data: rows, page, limit });
+  } catch (err) {
+    console.error('Get my shorts error:', err);
+    res.status(500).json({ error: 'Failed to fetch shorts' });
+  }
+});
+
+// Upload profile picture
+app.post('/api/users/profile/pic', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Not authenticated' });
+    if (!s3) return res.status(500).json({ error: 'S3 not configured' });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const key = `profile-pics/${decoded.id}/${Date.now()}-${req.file.originalname}`;
+    const buffer = await sharp(req.file.buffer).resize(400, 400, { fit: 'cover' }).png().toBuffer();
+
+    await s3.send(new PutObjectCommand({
+      Bucket: S3_BUCKET_NAME,
+      Key: key,
+      Body: buffer,
+      ContentType: 'image/png',
+    }));
+
+    const url = `https://${AWS_CLOUDFRONT_DOMAIN || `s3.${AWS_REGION}.amazonaws.com`}/${S3_BUCKET_NAME}/${key}`;
+
+    await pool.query(
+      'UPDATE users SET profile_url = $1 WHERE id = $2',
+      [url, decoded.id]
+    );
+
+    res.json({ success: true, profile_url: url });
+  } catch (err) {
+    console.error('Upload profile pic error:', err);
+    res.status(500).json({ error: 'Failed to upload profile picture' });
+  }
+});
+
+// Upload cover photo
+app.post('/api/users/cover', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Not authenticated' });
+    if (!s3) return res.status(500).json({ error: 'S3 not configured' });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const key = `cover-photos/${decoded.id}/${Date.now()}-${req.file.originalname}`;
+    const buffer = await sharp(req.file.buffer).resize(1500, 500, { fit: 'cover' }).png().toBuffer();
+
+    await s3.send(new PutObjectCommand({
+      Bucket: S3_BUCKET_NAME,
+      Key: key,
+      Body: buffer,
+      ContentType: 'image/png',
+    }));
+
+    const url = `https://${AWS_CLOUDFRONT_DOMAIN || `s3.${AWS_REGION}.amazonaws.com`}/${S3_BUCKET_NAME}/${key}`;
+
+    await pool.query(
+      'UPDATE users SET cover_url = $1 WHERE id = $2',
+      [url, decoded.id]
+    );
+
+    res.json({ success: true, cover_url: url });
+  } catch (err) {
+    console.error('Upload cover error:', err);
+    res.status(500).json({ error: 'Failed to upload cover photo' });
+  }
+});
+
+// ==========================================
+// MUSIC TRACKS
+// ==========================================
+
+app.get('/api/music/tracks', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit) || 20);
+    const offset = (page - 1) * limit;
+
+    let query = 'SELECT * FROM music_tracks WHERE is_public = true ORDER BY created_at DESC';
+    const params = [limit, offset];
+
+    // Filter by category if provided
+    const category = req.query.category;
+    if (category && category !== 'all') {
+      query = 'SELECT * FROM music_tracks WHERE is_public = true AND category = $3 ORDER BY created_at DESC LIMIT $1 OFFSET $2';
+      params.push(category);
+    }
+
+    const { rows } = await pool.query(query, params);
+
+    res.json({ data: rows, page, limit });
+  } catch (err) {
+    console.error('Get music tracks error:', err);
+    res.status(500).json({ error: 'Failed to fetch music tracks' });
+  }
+});
+
+// ==========================================
+// VIDEO PROXY — Fixed version
+// ==========================================
+
+app.get('/api/video-proxy', async (req, res) => {
+  try {
+    const url = req.query.url;
+    if (!url) return res.status(400).json({ error: 'URL parameter required' });
+
+    // Validate the URL is from your allowed domains
+    const parsed = new URL(url);
+    const allowedHosts = [
+      S3_BUCKET_NAME ? `${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com` : null,
+      AWS_CLOUDFRONT_DOMAIN,
+      // Add any other CDN domains you actually use:
+    ].filter(Boolean);
+
+    const isAllowed = allowedHosts.some(h => parsed.hostname === h || parsed.hostname.endsWith(`.${h}`));
+
+    if (!isAllowed) {
+      console.error(`[Proxy] Blocked domain: ${parsed.hostname}`);
+      return res.status(403).json({ error: 'Domain not allowed' });
+    }
+
+    const upstream = await fetch(url, {
+      headers: {
+        'Accept': '*/*',
+        'Range': req.headers.range || '',
+      },
+    });
+
+    if (!upstream.ok) {
+      return res.status(upstream.status).send('Upstream error');
+    }
+
+    // Forward response headers
+    const ct = upstream.headers.get('content-type');
+    const cl = upstream.headers.get('content-length');
+    const cr = upstream.headers.get('content-range');
+    const ca = upstream.headers.get('accept-ranges');
+
+    if (ct) res.setHeader('Content-Type', ct);
+    if (cl) res.setHeader('Content-Length', cl);
+    if (cr) res.setHeader('Content-Range', cr);
+    if (ca) res.setHeader('Accept-Ranges', ca);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', 'Range');
+
+    // Handle range requests for video seeking
+    if (req.headers.range && ca) {
+      const rangeRes = await fetch(url, {
+        headers: { Range: req.headers.range },
+      });
+      if (rangeRes.ok || rangeRes.status === 206) {
+        res.status = rangeRes.status;
+        const rcr = rangeRes.headers.get('content-range');
+        const rcl = rangeRes.headers.get('content-length');
+        if (rcr) res.setHeader('Content-Range', rcr);
+        if (rcl) res.setHeader('Content-Length', rcl);
+        return rangeRes.body.pipe(res);
+      }
+    }
+
+    upstream.body.pipe(res);
+  } catch (err) {
+    console.error('[Proxy] Error:', err.message);
+    res.status(502).json({ error: 'Proxy failed' });
+  }
+});
+
+// ==========================================
 // STRIPE SUBSCRIPTION CHECKOUT
 // ==========================================
 app.post('/api/subscriptions/checkout', async (req, res) => {
