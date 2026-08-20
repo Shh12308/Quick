@@ -5752,6 +5752,54 @@ app.get('/api/video-proxy', async (req, res) => {
   }
 });
 
+// Backend - Add these if missing
+app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT balance FROM users WHERE id = $1",
+      [req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json({ balance: rows[0].balance || 0 });
+  } catch (err) {
+    console.error("Balance error:", err);
+    res.status(500).json({ error: "Failed to get balance" });
+  }
+});
+
+app.post('/api/wallet/purchase-coins', authenticateToken, async (req, res) => {
+  try {
+    const { amount, price, currency } = req.body;
+    
+    // Create Stripe checkout session
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: currency || 'usd',
+          product_data: {
+            name: `${amount} Coins`,
+          },
+          unit_amount: Math.round(price * 100),
+        },
+        quantity: 1,
+      }],
+      success_url: `${FRONTEND_URL}/shop?success=true&coins=${amount}`,
+      cancel_url: `${FRONTEND_URL}/shop?cancelled=true`,
+      metadata: {
+        userId: req.user.id,
+        coinAmount: amount,
+      },
+    });
+
+    res.json({ success: true, url: session.url });
+  } catch (err) {
+    console.error("Purchase error:", err);
+    res.status(500).json({ error: "Failed to create checkout" });
+  }
+});
+
 // ==========================================
 // STRIPE SUBSCRIPTION CHECKOUT
 // ==========================================
