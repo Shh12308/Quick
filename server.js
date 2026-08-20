@@ -5955,6 +5955,93 @@ app.get('/api/settings/login-activity', authenticateToken, async (req, res) => {
   }
 });
 
+
+app.post('/api/faith/prayers', authenticateToken, async (req, res) => {
+  try {
+    const { title, content, category, is_private } = req.body;
+    const userId = req.user.id;
+
+    if (!title || !content) {
+      return res.status(400).json({ error: "Title and content required" });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO prayers (user_id, title, content, category, is_private, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING *`,
+      [userId, title, content, category || 'other', is_private !== false]
+    );
+
+    res.json({ data: rows[0] });
+  } catch (err) {
+    console.error("Create prayer error:", err);
+    res.status(500).json({ error: "Failed to create prayer" });
+  }
+});
+
+// Get user's prayers
+app.get('/api/faith/prayers', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM prayers WHERE user_id = $1 ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error("Get prayers error:", err);
+    res.status(500).json({ error: "Failed to get prayers" });
+  }
+});
+
+// Update prayer
+app.put('/api/faith/prayers/:id', authenticateToken, async (req, res) => {
+  try {
+    const { title, content, category, is_private } = req.body;
+    const { rows } = await pool.query(
+      `UPDATE prayers SET title = $1, content = $2, category = $3, is_private = $4, updated_at = NOW()
+       WHERE id = $5 AND user_id = $6 RETURNING *`,
+      [title, content, category, is_private, req.params.id, req.user.id]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: "Prayer not found" });
+    res.json({ data: rows[0] });
+  } catch (err) {
+    console.error("Update prayer error:", err);
+    res.status(500).json({ error: "Failed to update prayer" });
+  }
+});
+
+// Toggle answered
+app.patch('/api/faith/prayers/:id', authenticateToken, async (req, res) => {
+  try {
+    const { answered } = req.body;
+    const { rows } = await pool.query(
+      `UPDATE prayers SET answered = $1, answered_at = CASE WHEN $1 = true THEN NOW() ELSE NULL END
+       WHERE id = $2 AND user_id = $3 RETURNING *`,
+      [answered, req.params.id, req.user.id]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: "Prayer not found" });
+    res.json({ data: rows[0] });
+  } catch (err) {
+    console.error("Toggle prayer error:", err);
+    res.status(500).json({ error: "Failed to update prayer" });
+  }
+});
+
+// Delete prayer
+app.delete('/api/faith/prayers/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      "DELETE FROM prayers WHERE id = $1 AND user_id = $2",
+      [req.params.id, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete prayer error:", err);
+    res.status(500).json({ error: "Failed to delete prayer" });
+  }
+});
+
 // 7. Revoke Session
 app.delete('/api/settings/login-activity/:id', authenticateToken, async (req, res) => {
   const sessionId = req.params.id;
