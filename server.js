@@ -6328,6 +6328,24 @@ app.post('/api/support/feedback', authenticateToken, async (req, res) => {
   }
 });
 
+// Add this anywhere before server.listen()
+app.get("/api/hls-proxy", async (req, res) => {
+  try {
+    const url = req.query.url;
+    if (!url) return res.status(400).send("No URL");
+    
+    const response = await axios({ url, responseType: 'stream', timeout: 10000 });
+    
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream');
+    if (response.headers['content-length']) res.setHeader('Content-Length', response.headers['content-length']);
+    
+    response.data.pipe(res);
+  } catch (err) {
+    res.status(500).send("Failed");
+  }
+});
+
 app.post('/api/support/report', async (req, res) => {
   const { category, description, email } = req.body;
   // Report can be sent anonymously (no authenticateToken middleware)
