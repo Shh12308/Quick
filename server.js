@@ -6366,7 +6366,6 @@ app.post('/api/support/feedback', authenticateToken, async (req, res) => {
   }
 });
 
-// Add this anywhere before server.listen()
 // ==========================================
 // HLS PROXY - Fixed version
 // ==========================================
