@@ -915,6 +915,128 @@ io.on("connection", (socket) => {
     }
   });
 
+    // ============================================================
+  // CHAT EVENTS (DM Chat)
+  // ============================================================
+  
+  socket.on("join-chat", async (chatId) => {
+    try {
+      // Try new table structure first, fallback to old
+      let isParticipant = false;
+      
+      const { rows: newCheck } = await pool.query(
+        "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
+        [chatId, socket.userId]
+      ).catch(() => ({ rows: [] }));
+      
+      if (newCheck.length > 0) {
+        isParticipant = true;
+      } else {
+        // Fallback to old array-based structure
+        const { rows: oldCheck } = await pool.query(
+          "SELECT 1 FROM chats WHERE id = $1 AND $2 = ANY(participants)",
+          [chatId, socket.userId]
+        ).catch(() => ({ rows: [] }));
+        isParticipant = oldCheck.length > 0;
+      }
+      
+      if (isParticipant) {
+        socket.join(`chat-${chatId}`);
+        console.log(`User ${socket.userId} joined chat ${chatId}`);
+      } else {
+        console.warn(`Unauthorized join attempt by ${socket.userId} for chat ${chatId}`);
+        socket.emit("error", { message: "Unauthorized to join this chat" });
+      }
+    } catch (err) {
+      console.error("Join chat error:", err);
+    }
+  });
+
+  socket.on("leave-chat", (chatId) => {
+    socket.leave(`chat-${chatId}`);
+    console.log(`User ${socket.userId} left chat ${chatId}`);
+  });
+
+  socket.on("send-message", async (data) => {
+    try {
+      const { chatId, content, type, media_url, replyTo, poll, tempId } = data;
+      
+      if (!chatId || (!content && !media_url)) return;
+      
+      // Verify participant (try both table structures)
+      let isParticipant = false;
+      
+      const { rows: newCheck } = await pool.query(
+        "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
+        [chatId, socket.userId]
+      ).catch(() => ({ rows: [] }));
+      
+      if (newCheck.length > 0) {
+        isParticipant = true;
+      } else {
+        const { rows: oldCheck } = await pool.query(
+          "SELECT 1 FROM chats WHERE id = $1 AND $2 = ANY(participants)",
+          [chatId, socket.userId]
+        ).catch(() => ({ rows: [] }));
+        isParticipant = oldCheck.length > 0;
+      }
+      
+      if (!isParticipant) {
+        socket.emit("error", { message: "Not a participant" });
+        return;
+      }
+      
+      // Get user info
+      const { rows: userRows } = await pool.query(
+        "SELECT username, profile_url FROM users WHERE id = $1",
+        [socket.userId]
+      ).catch(() => ({ rows: [] }));
+      
+      const messageData = {
+        id: tempId,
+        chat_id: chatId,
+        sender_id: socket.userId,
+        sender: userRows[0] ? { 
+          id: socket.userId, 
+          username: userRows[0].username, 
+          profile_url: userRows[0].profile_url 
+        } : { id: socket.userId, username: socket.username },
+        content,
+        type: type || "text",
+        media_url,
+        replyTo,
+        poll,
+        timestamp: new Date().toISOString(),
+        status: "sent",
+      };
+      
+      // Broadcast to everyone in the chat room except sender
+      socket.to(`chat-${chatId}`).emit("new-message", messageData);
+      
+      // Update chat last message
+      await pool.query(
+        `UPDATE chats SET last_message = $1, last_message_at = NOW(), updated_at = NOW() WHERE id = $2`,
+        [content?.substring(0, 100) || "[Media]", chatId]
+      ).catch(() => {});
+      
+    } catch (err) {
+      console.error("Socket send message error:", err);
+    }
+  });
+
+  socket.on("typing-start", (data) => {
+    socket.to(`chat-${data.chatId}`).emit("user-typing", { 
+      userId: socket.userId,
+      username: socket.username 
+    });
+  });
+
+  socket.on("typing-stop", (data) => {
+    socket.to(`chat-${data.chatId}`).emit("user-stopped-typing", { 
+      userId: socket.userId 
+    });
+  });
+
   // ============================================================
   // MODERATION EVENTS
   // ============================================================
@@ -5992,305 +6114,6 @@ app.get('/api/faith/prayers', authenticateToken, async (req, res) => {
   }
 });
 
-// ==========================================
-// CHAT API ENDPOINTS
-// ==========================================
-
-// Get or create a chat between users
-app.post("/api/chats/find-or-create", authenticateToken, async (req, res) => {
-  try {
-    const { participantIds, type = "private" } = req.body;
-    
-    if (!participantIds || participantIds.length < 2) {
-      return res.status(400).json({ error: "Need at least 2 participants" });
-    }
-    
-    if (!participantIds.includes(req.user.id)) {
-      return res.status(403).json({ error: "You must be a participant" });
-    }
-    
-    // Check if chat already exists
-    const { rows: existingChats } = await pool.query(
-      `SELECT c.*, 
-        json_agg(json_build_object('id', u.id, 'username', u.username, 'profile_url', u.profile_url)) as participants_info
-       FROM chats c
-       JOIN chat_participants cp ON c.id = cp.chat_id
-       JOIN users u ON cp.user_id = u.id
-       WHERE c.type = $1 AND c.id IN (
-         SELECT chat_id FROM chat_participants WHERE user_id = ANY($2)
-       )
-       GROUP BY c.id
-       HAVING COUNT(DISTINCT cp.user_id) = $3`,
-      [type, participantIds, participantIds.length]
-    );
-    
-    if (existingChats.length > 0) {
-      return res.json({ chat: existingChats[0] });
-    }
-    
-    // Create new chat
-    const { rows: newChat } = await pool.query(
-      `INSERT INTO chats (type, created_at, updated_at) VALUES ($1, NOW(), NOW()) RETURNING *`,
-      [type]
-    );
-    
-    const chatId = newChat[0].id;
-    
-    // Add participants
-    for (const userId of participantIds) {
-      await pool.query(
-        `INSERT INTO chat_participants (chat_id, user_id, joined_at) VALUES ($1, $2, NOW())`,
-        [chatId, userId]
-      );
-    }
-    
-    // Get full chat with participants
-    const { rows: fullChat } = await pool.query(
-      `SELECT c.*, 
-        json_agg(json_build_object('id', u.id, 'username', u.username, 'profile_url', u.profile_url)) as participants_info
-       FROM chats c
-       JOIN chat_participants cp ON c.id = cp.chat_id
-       JOIN users u ON cp.user_id = u.id
-       WHERE c.id = $1
-       GROUP BY c.id`,
-      [chatId]
-    );
-    
-    res.status(201).json({ chat: fullChat[0] });
-    
-  } catch (err) {
-    console.error("Find or create chat error:", err);
-    res.status(500).json({ error: "Failed to create chat" });
-  }
-});
-
-// Get messages for a chat
-app.get("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    const { before, after, limit = 50 } = req.query;
-    
-    // Verify user is participant
-    const { rows: participant } = await pool.query(
-      "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
-      [chatId, req.user.id]
-    );
-    
-    if (participant.length === 0) {
-      return res.status(403).json({ error: "Not a participant" });
-    }
-    
-    let query = `
-      SELECT m.*, 
-        json_build_object('id', u.id, 'username', u.username, 'profile_url', u.profile_url) as sender
-      FROM messages m
-      JOIN users u ON m.sender_id = u.id
-      WHERE m.chat_id = $1
-    `;
-    
-    const params = [chatId];
-    let paramIndex = 2;
-    
-    if (before) {
-      query += ` AND m.created_at < $${paramIndex}`;
-      params.push(before);
-      paramIndex++;
-    }
-    
-    if (after) {
-      query += ` AND m.created_at > $${paramIndex}`;
-      params.push(after);
-      paramIndex++;
-    }
-    
-    query += ` ORDER BY m.created_at DESC LIMIT $${paramIndex}`;
-    params.push(parseInt(limit));
-    
-    const { rows: messages } = await pool.query(query, params);
-    
-    // Reverse to get chronological order
-    res.json({ messages: messages.reverse() });
-    
-  } catch (err) {
-    console.error("Get messages error:", err);
-    res.status(500).json({ error: "Failed to get messages" });
-  }
-});
-
-// Send a message
-app.post("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    const { content, type = "text", media_url, replyTo, poll } = req.body;
-    
-    if (!content && !media_url) {
-      return res.status(400).json({ error: "Message content required" });
-    }
-    
-    // Verify user is participant
-    const { rows: participant } = await pool.query(
-      "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
-      [chatId, req.user.id]
-    );
-    
-    if (participant.length === 0) {
-      return res.status(403).json({ error: "Not a participant" });
-    }
-    
-    // Create message
-    const { rows: message } = await pool.query(
-      `INSERT INTO messages (chat_id, sender_id, content, type, media_url, reply_to, poll_data, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       RETURNING *`,
-      [chatId, req.user.id, content, type, media_url, replyTo ? JSON.stringify(replyTo) : null, poll ? JSON.stringify(poll) : null]
-    );
-    
-    const newMessage = {
-      ...message[0],
-      sender: {
-        id: req.user.id,
-        username: req.user.username,
-        profile_url: req.user.profile_url,
-      }
-    };
-    
-    // Emit to other participants in the chat
-    const { rows: participants } = await pool.query(
-      "SELECT user_id FROM chat_participants WHERE chat_id = $1 AND user_id != $2",
-      [chatId, req.user.id]
-    );
-    
-    for (const p of participants) {
-      io.to(`user-${p.user_id}`).emit("new-message", newMessage);
-    }
-    
-    // Update chat's last message
-    await pool.query(
-      `UPDATE chats SET last_message = $1, last_message_at = NOW(), updated_at = NOW() WHERE id = $2`,
-      [content?.substring(0, 100) || "[Media]", chatId]
-    );
-    
-    res.status(201).json(newMessage);
-    
-  } catch (err) {
-    console.error("Send message error:", err);
-    res.status(500).json({ error: "Failed to send message" });
-  }
-});
-
-// Mark chat as read
-app.post("/api/chats/:chatId/read", authenticateToken, async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    
-    await pool.query(
-      `INSERT INTO chat_read_states (chat_id, user_id, last_read_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (chat_id, user_id) DO UPDATE SET last_read_at = NOW()`,
-      [chatId, req.user.id]
-    );
-    
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Mark read error:", err);
-    res.status(500).json({ error: "Failed to mark as read" });
-  }
-});
-
-// Add Socket.io event handlers for chat
-io.on("connection", (socket) => {
-  // ... existing code ...
-  
-  // Join chat room
-  socket.on("join-chat", async (chatId) => {
-    try {
-      const { rows } = await pool.query(
-        "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
-        [chatId, socket.userId]
-      );
-      
-      if (rows.length > 0) {
-        socket.join(`chat-${chatId}`);
-        console.log(`User ${socket.userId} joined chat ${chatId}`);
-      } else {
-        socket.emit("error", { message: "Not authorized to join this chat" });
-      }
-    } catch (err) {
-      console.error("Join chat error:", err);
-    }
-  });
-  
-  // Leave chat room
-  socket.on("leave-chat", (chatId) => {
-    socket.leave(`chat-${chatId}`);
-    console.log(`User ${socket.userId} left chat ${chatId}`);
-  });
-  
-  // Send message via socket (for real-time delivery)
-  socket.on("send-message", async (data) => {
-    try {
-      const { chatId, content, type, media_url, replyTo, poll, tempId } = data;
-      
-      // Verify participant
-      const { rows: participant } = await pool.query(
-        "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
-        [chatId, socket.userId]
-      );
-      
-      if (participant.length === 0) return;
-      
-      // Broadcast to other users in the chat room
-      socket.to(`chat-${chatId}`).emit("new-message", {
-        id: tempId,
-        chat_id: chatId,
-        sender_id: socket.userId,
-        sender: { id: socket.userId, username: socket.username },
-        content,
-        type,
-        media_url,
-        replyTo,
-        poll,
-        timestamp: new Date().toISOString(),
-      });
-      
-    } catch (err) {
-      console.error("Socket send message error:", err);
-    }
-  });
-  
-  // Typing indicators
-  socket.on("typing-start", (data) => {
-    socket.to(`chat-${data.chatId}`).emit("user-typing", { 
-      userId: socket.userId,
-      username: socket.username 
-    });
-  });
-  
-  socket.on("typing-stop", (data) => {
-    socket.to(`chat-${data.chatId}`).emit("user-stopped-typing", { 
-      userId: socket.userId 
-    });
-  });
-});
-
-// Authentication middleware
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.split(" ")[1];
-  
-  if (!token) {
-    return res.status(401).json({ error: "No token provided" });
-  }
-  
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch (err) {
-    return res.status(403).json({ error: "Invalid token" });
-  }
-}
-
 // Update prayer
 app.put('/api/faith/prayers/:id', authenticateToken, async (req, res) => {
   try {
@@ -7387,6 +7210,435 @@ app.delete("/api/settings/login-activity/:id", authMiddleware, async (req, res) 
   } catch (err) {
     console.error("DELETE /api/settings/login-activity error:", err);
     res.status(500).json({ error: "Failed to revoke session" });
+  }
+});
+
+// ==========================================
+// CHAT MESSAGING API ENDPOINTS
+// ==========================================
+
+// Ensure chat tables exist
+async function ensureChatTables() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chats (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        type VARCHAR(20) NOT NULL DEFAULT 'private',
+        name VARCHAR(255),
+        avatar TEXT,
+        participants INTEGER[],
+        last_message TEXT,
+        last_message_at TIMESTAMP,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+      );
+      
+      CREATE TABLE IF NOT EXISTS chat_participants (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        chat_id UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role VARCHAR(20) DEFAULT 'member',
+        joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        last_read_at TIMESTAMP,
+        UNIQUE(chat_id, user_id)
+      );
+      
+      CREATE TABLE IF NOT EXISTS messages (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        chat_id UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        sender_id INTEGER NOT NULL REFERENCES users(id),
+        content TEXT,
+        type VARCHAR(20) NOT NULL DEFAULT 'text',
+        media_url TEXT,
+        reply_to JSONB,
+        poll_data JSONB,
+        reactions JSONB DEFAULT '{}',
+        status VARCHAR(20) DEFAULT 'sent',
+        is_deleted BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
+      CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_chat_participants_user_id ON chat_participants(user_id);
+      CREATE INDEX IF NOT EXISTS idx_chat_participants_chat_id ON chat_participants(chat_id);
+    `);
+    console.log("✅ Chat tables ready");
+  } catch (err) {
+    console.error("Failed to create chat tables:", err.message);
+  }
+}
+
+// Run table creation on startup
+ensureChatTables();
+
+// Get or create a chat between users
+app.post("/api/chats/find-or-create", authenticateToken, async (req, res) => {
+  try {
+    const { participantIds, type = "private" } = req.body;
+    
+    if (!participantIds || participantIds.length < 2) {
+      return res.status(400).json({ error: "Need at least 2 participants" });
+    }
+    
+    if (!participantIds.includes(req.user.id)) {
+      return res.status(403).json({ error: "You must be a participant" });
+    }
+
+    // Check if chat already exists (check both structures)
+    const { rows: existingNew } = await pool.query(
+      `SELECT c.* FROM chats c
+       JOIN chat_participants cp1 ON c.id = cp1.chat_id AND cp1.user_id = $1
+       JOIN chat_participants cp2 ON c.id = cp2.chat_id AND cp2.user_id = $2
+       WHERE c.type = $3`,
+      [participantIds[0], participantIds[1], type]
+    ).catch(() => ({ rows: [] }));
+    
+    if (existingNew.length > 0) {
+      return res.json({ chat: existingNew[0] });
+    }
+    
+    // Check old structure
+    const { rows: existingOld } = await pool.query(
+      `SELECT * FROM chats WHERE type = $1 AND $2 = ANY(participants) AND $3 = ANY(participants)`,
+      [type, participantIds[0], participantIds[1]]
+    ).catch(() => ({ rows: [] }));
+    
+    if (existingOld.length > 0) {
+      return res.json({ chat: existingOld[0] });
+    }
+    
+    // Create new chat
+    const { rows: newChat } = await pool.query(
+      `INSERT INTO chats (type, participants, created_at, updated_at) 
+       VALUES ($1, $2, NOW(), NOW()) RETURNING *`,
+      [type, participantIds]
+    );
+    
+    const chatId = newChat[0].id;
+    
+    // Add to new participants table
+    for (const userId of participantIds) {
+      await pool.query(
+        `INSERT INTO chat_participants (chat_id, user_id, joined_at) 
+         VALUES ($1, $2, NOW()) ON CONFLICT DO NOTHING`,
+        [chatId, userId]
+      ).catch(() => {});
+    }
+    
+    res.status(201).json({ chat: newChat[0] });
+    
+  } catch (err) {
+    console.error("Find or create chat error:", err);
+    res.status(500).json({ error: "Failed to create chat" });
+  }
+});
+
+// Get all chats for current user
+app.get("/api/chats", authenticateToken, async (req, res) => {
+  try {
+    // Get chats from participants table
+    const { rows: chats } = await pool.query(
+      `SELECT c.*, 
+              cp.last_read_at,
+              cp.role,
+              (SELECT COUNT(*) FROM messages m 
+               WHERE m.chat_id = c.id 
+               AND m.created_at > COALESCE(cp.last_read_at, '1970-01-01') 
+               AND m.sender_id != $1) as unread_count
+       FROM chats c
+       JOIN chat_participants cp ON c.id = cp.chat_id
+       WHERE cp.user_id = $1
+       ORDER BY COALESCE(c.last_message_at, c.created_at) DESC`,
+      [req.user.id]
+    ).catch(() => ({ rows: [] }));
+    
+    // Also get old-style chats
+    const { rows: oldChats } = await pool.query(
+      `SELECT *, 0 as unread_count FROM chats WHERE $1 = ANY(participants) AND id NOT IN (SELECT chat_id FROM chat_participants WHERE user_id = $1)
+       ORDER BY COALESCE(last_message_at, created_at) DESC`,
+      [req.user.id]
+    ).catch(() => ({ rows: [] }));
+    
+    const allChats = [...chats, ...oldChats];
+    
+    // Get other user info for private chats
+    const enrichedChats = await Promise.all(allChats.map(async (chat) => {
+      let otherUserId = null;
+      
+      if (chat.participants && Array.isArray(chat.participants)) {
+        otherUserId = chat.participants.find(id => id !== req.user.id);
+      } else {
+        const { rows: partRows } = await pool.query(
+          "SELECT user_id FROM chat_participants WHERE chat_id = $1 AND user_id != $2 LIMIT 1",
+          [chat.id, req.user.id]
+        ).catch(() => ({ rows: [] }));
+        otherUserId = partRows[0]?.user_id;
+      }
+      
+      let otherUser = null;
+      if (otherUserId) {
+        const { rows: userRows } = await pool.query(
+          "SELECT id, username, profile_url FROM users WHERE id = $1",
+          [otherUserId]
+        ).catch(() => ({ rows: [] }));
+        otherUser = userRows[0];
+      }
+      
+      return {
+        id: chat.id,
+        name: chat.name || otherUser?.username || "Chat",
+        avatar: chat.avatar || otherUser?.profile_url || `https://ui-avatars.com/api/?name=${encodeURIComponent(otherUser?.username || 'Chat')}`,
+        type: chat.type,
+        lastMessage: chat.last_message ? { text: chat.last_message, timestamp: chat.last_message_at } : null,
+        unread: chat.unread_count > 0,
+        unreadCount: chat.unread_count || 0,
+        otherUserId: otherUserId,
+        createdAt: chat.created_at,
+        updatedAt: chat.updated_at,
+      };
+    }));
+    
+    res.json(enrichedChats);
+    
+  } catch (err) {
+    console.error("Get chats error:", err);
+    res.status(500).json({ error: "Failed to get chats" });
+  }
+});
+
+// Get messages for a chat
+app.get("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { before, after, limit = 50 } = req.query;
+    
+    // Verify user is participant (check both structures)
+    let isParticipant = false;
+    
+    const { rows: newCheck } = await pool.query(
+      "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
+      [chatId, req.user.id]
+    ).catch(() => ({ rows: [] }));
+    isParticipant = newCheck.length > 0;
+    
+    if (!isParticipant) {
+      const { rows: oldCheck } = await pool.query(
+        "SELECT 1 FROM chats WHERE id = $1 AND $2 = ANY(participants)",
+        [chatId, req.user.id]
+      ).catch(() => ({ rows: [] }));
+      isParticipant = oldCheck.length > 0;
+    }
+    
+    if (!isParticipant) {
+      return res.status(403).json({ error: "Not a participant" });
+    }
+    
+    let query = `
+      SELECT m.*,
+        json_build_object('id', u.id, 'username', u.username, 'profile_url', u.profile_url) as sender
+      FROM messages m
+      LEFT JOIN users u ON m.sender_id = u.id
+      WHERE m.chat_id = $1 AND m.is_deleted = false
+    `;
+    
+    const params = [chatId];
+    let paramIndex = 2;
+    
+    if (before) {
+      query += ` AND m.created_at < $${paramIndex}`;
+      params.push(before);
+      paramIndex++;
+    }
+    
+    if (after) {
+      query += ` AND m.created_at > $${paramIndex}`;
+      params.push(after);
+      paramIndex++;
+    }
+    
+    query += ` ORDER BY m.created_at ASC LIMIT $${paramIndex}`;
+    params.push(parseInt(limit));
+    
+    const { rows: messages } = await pool.query(query, params);
+    
+    res.json({ messages });
+    
+  } catch (err) {
+    console.error("Get messages error:", err);
+    res.status(500).json({ error: "Failed to get messages" });
+  }
+});
+
+// Send a message
+app.post("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { content, type = "text", media_url, replyTo, poll, sender_id } = req.body;
+    
+    if (!content && !media_url) {
+      return res.status(400).json({ error: "Message content required" });
+    }
+    
+    // Verify participant
+    let isParticipant = false;
+    
+    const { rows: newCheck } = await pool.query(
+      "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
+      [chatId, req.user.id]
+    ).catch(() => ({ rows: [] }));
+    isParticipant = newCheck.length > 0;
+    
+    if (!isParticipant) {
+      const { rows: oldCheck } = await pool.query(
+        "SELECT 1 FROM chats WHERE id = $1 AND $2 = ANY(participants)",
+        [chatId, req.user.id]
+      ).catch(() => ({ rows: [] }));
+      isParticipant = oldCheck.length > 0;
+    }
+    
+    if (!isParticipant) {
+      return res.status(403).json({ error: "Not a participant" });
+    }
+    
+    // Create message
+    const { rows: message } = await pool.query(
+      `INSERT INTO messages (chat_id, sender_id, content, type, media_url, reply_to, poll_data, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       RETURNING *`,
+      [
+        chatId, 
+        req.user.id, 
+        content, 
+        type, 
+        media_url, 
+        replyTo ? JSON.stringify(replyTo) : null, 
+        poll ? JSON.stringify(poll) : null
+      ]
+    );
+    
+    const newMessage = {
+      ...message[0],
+      sender: {
+        id: req.user.id,
+        username: req.user.username,
+        profile_url: req.user.profile_url,
+      }
+    };
+    
+    // Emit to chat room
+    io.to(`chat-${chatId}`).emit("new-message", newMessage);
+    
+    // Also emit to other participants' personal rooms
+    const { rows: participants } = await pool.query(
+      "SELECT user_id FROM chat_participants WHERE chat_id = $1 AND user_id != $2",
+      [chatId, req.user.id]
+    ).catch(() => ({ rows: [] }));
+    
+    for (const p of participants) {
+      io.to(`user-${p.user_id}`).emit("new-message", newMessage);
+    }
+    
+    // Fallback: check old participants array
+    const { rows: chat } = await pool.query(
+      "SELECT participants FROM chats WHERE id = $1",
+      [chatId]
+    ).catch(() => ({ rows: [] }));
+    
+    if (chat[0]?.participants) {
+      for (const uid of chat[0].participants) {
+        if (uid !== req.user.id) {
+          io.to(`user-${uid}`).emit("new-message", newMessage);
+        }
+      }
+    }
+    
+    // Update chat's last message
+    await pool.query(
+      `UPDATE chats SET last_message = $1, last_message_at = NOW(), updated_at = NOW() WHERE id = $2`,
+      [content?.substring(0, 100) || "[Media]", chatId]
+    ).catch(() => {});
+    
+    res.status(201).json(newMessage);
+    
+  } catch (err) {
+    console.error("Send message error:", err);
+    res.status(500).json({ error: "Failed to send message" });
+  }
+});
+
+// Mark chat as read
+app.post("/api/chats/:chatId/read", authenticateToken, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    
+    await pool.query(
+      `INSERT INTO chat_read_states (chat_id, user_id, last_read_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (chat_id, user_id) DO UPDATE SET last_read_at = NOW()`,
+      [chatId, req.user.id]
+    ).catch(() => {});
+    
+    await pool.query(
+      `UPDATE chat_participants SET last_read_at = NOW() WHERE chat_id = $1 AND user_id = $2`,
+      [chatId, req.user.id]
+    ).catch(() => {});
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Mark read error:", err);
+    res.status(500).json({ error: "Failed to mark as read" });
+  }
+});
+
+// Upload endpoint for chat media
+const chatUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'audio/webm', 'audio/mpeg'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type'), false);
+    }
+  }
+});
+
+app.post("/api/upload", authenticateToken, chatUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+    
+    const file = req.file;
+    const ext = file.originalname.split('.').pop();
+    const filename = `${req.user.id}-${Date.now()}.${ext}`;
+    
+    let url;
+    
+    if (s3) {
+      const uploadParams = {
+        Bucket: S3_BUCKET_NAME,
+        Key: `uploads/chat/${filename}`,
+        Body: file.buffer,
+        ContentType: file.mimetype,
+      };
+      
+      await s3.send(new PutObjectCommand(uploadParams));
+      url = AWS_CLOUDFRONT_DOMAIN 
+        ? `https://${AWS_CLOUDFRONT_DOMAIN}/uploads/chat/${filename}`
+        : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/uploads/chat/${filename}`;
+    } else {
+      // Fallback: base64 (not recommended for production)
+      url = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
+    }
+    
+    res.json({ url, filename });
+  } catch (err) {
+    console.error("Upload error:", err);
+    res.status(500).json({ error: "Upload failed" });
   }
 });
 
