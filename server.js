@@ -5992,6 +5992,305 @@ app.get('/api/faith/prayers', authenticateToken, async (req, res) => {
   }
 });
 
+// ==========================================
+// CHAT API ENDPOINTS
+// ==========================================
+
+// Get or create a chat between users
+app.post("/api/chats/find-or-create", authenticateToken, async (req, res) => {
+  try {
+    const { participantIds, type = "private" } = req.body;
+    
+    if (!participantIds || participantIds.length < 2) {
+      return res.status(400).json({ error: "Need at least 2 participants" });
+    }
+    
+    if (!participantIds.includes(req.user.id)) {
+      return res.status(403).json({ error: "You must be a participant" });
+    }
+    
+    // Check if chat already exists
+    const { rows: existingChats } = await pool.query(
+      `SELECT c.*, 
+        json_agg(json_build_object('id', u.id, 'username', u.username, 'profile_url', u.profile_url)) as participants_info
+       FROM chats c
+       JOIN chat_participants cp ON c.id = cp.chat_id
+       JOIN users u ON cp.user_id = u.id
+       WHERE c.type = $1 AND c.id IN (
+         SELECT chat_id FROM chat_participants WHERE user_id = ANY($2)
+       )
+       GROUP BY c.id
+       HAVING COUNT(DISTINCT cp.user_id) = $3`,
+      [type, participantIds, participantIds.length]
+    );
+    
+    if (existingChats.length > 0) {
+      return res.json({ chat: existingChats[0] });
+    }
+    
+    // Create new chat
+    const { rows: newChat } = await pool.query(
+      `INSERT INTO chats (type, created_at, updated_at) VALUES ($1, NOW(), NOW()) RETURNING *`,
+      [type]
+    );
+    
+    const chatId = newChat[0].id;
+    
+    // Add participants
+    for (const userId of participantIds) {
+      await pool.query(
+        `INSERT INTO chat_participants (chat_id, user_id, joined_at) VALUES ($1, $2, NOW())`,
+        [chatId, userId]
+      );
+    }
+    
+    // Get full chat with participants
+    const { rows: fullChat } = await pool.query(
+      `SELECT c.*, 
+        json_agg(json_build_object('id', u.id, 'username', u.username, 'profile_url', u.profile_url)) as participants_info
+       FROM chats c
+       JOIN chat_participants cp ON c.id = cp.chat_id
+       JOIN users u ON cp.user_id = u.id
+       WHERE c.id = $1
+       GROUP BY c.id`,
+      [chatId]
+    );
+    
+    res.status(201).json({ chat: fullChat[0] });
+    
+  } catch (err) {
+    console.error("Find or create chat error:", err);
+    res.status(500).json({ error: "Failed to create chat" });
+  }
+});
+
+// Get messages for a chat
+app.get("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { before, after, limit = 50 } = req.query;
+    
+    // Verify user is participant
+    const { rows: participant } = await pool.query(
+      "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
+      [chatId, req.user.id]
+    );
+    
+    if (participant.length === 0) {
+      return res.status(403).json({ error: "Not a participant" });
+    }
+    
+    let query = `
+      SELECT m.*, 
+        json_build_object('id', u.id, 'username', u.username, 'profile_url', u.profile_url) as sender
+      FROM messages m
+      JOIN users u ON m.sender_id = u.id
+      WHERE m.chat_id = $1
+    `;
+    
+    const params = [chatId];
+    let paramIndex = 2;
+    
+    if (before) {
+      query += ` AND m.created_at < $${paramIndex}`;
+      params.push(before);
+      paramIndex++;
+    }
+    
+    if (after) {
+      query += ` AND m.created_at > $${paramIndex}`;
+      params.push(after);
+      paramIndex++;
+    }
+    
+    query += ` ORDER BY m.created_at DESC LIMIT $${paramIndex}`;
+    params.push(parseInt(limit));
+    
+    const { rows: messages } = await pool.query(query, params);
+    
+    // Reverse to get chronological order
+    res.json({ messages: messages.reverse() });
+    
+  } catch (err) {
+    console.error("Get messages error:", err);
+    res.status(500).json({ error: "Failed to get messages" });
+  }
+});
+
+// Send a message
+app.post("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { content, type = "text", media_url, replyTo, poll } = req.body;
+    
+    if (!content && !media_url) {
+      return res.status(400).json({ error: "Message content required" });
+    }
+    
+    // Verify user is participant
+    const { rows: participant } = await pool.query(
+      "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
+      [chatId, req.user.id]
+    );
+    
+    if (participant.length === 0) {
+      return res.status(403).json({ error: "Not a participant" });
+    }
+    
+    // Create message
+    const { rows: message } = await pool.query(
+      `INSERT INTO messages (chat_id, sender_id, content, type, media_url, reply_to, poll_data, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       RETURNING *`,
+      [chatId, req.user.id, content, type, media_url, replyTo ? JSON.stringify(replyTo) : null, poll ? JSON.stringify(poll) : null]
+    );
+    
+    const newMessage = {
+      ...message[0],
+      sender: {
+        id: req.user.id,
+        username: req.user.username,
+        profile_url: req.user.profile_url,
+      }
+    };
+    
+    // Emit to other participants in the chat
+    const { rows: participants } = await pool.query(
+      "SELECT user_id FROM chat_participants WHERE chat_id = $1 AND user_id != $2",
+      [chatId, req.user.id]
+    );
+    
+    for (const p of participants) {
+      io.to(`user-${p.user_id}`).emit("new-message", newMessage);
+    }
+    
+    // Update chat's last message
+    await pool.query(
+      `UPDATE chats SET last_message = $1, last_message_at = NOW(), updated_at = NOW() WHERE id = $2`,
+      [content?.substring(0, 100) || "[Media]", chatId]
+    );
+    
+    res.status(201).json(newMessage);
+    
+  } catch (err) {
+    console.error("Send message error:", err);
+    res.status(500).json({ error: "Failed to send message" });
+  }
+});
+
+// Mark chat as read
+app.post("/api/chats/:chatId/read", authenticateToken, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    
+    await pool.query(
+      `INSERT INTO chat_read_states (chat_id, user_id, last_read_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (chat_id, user_id) DO UPDATE SET last_read_at = NOW()`,
+      [chatId, req.user.id]
+    );
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Mark read error:", err);
+    res.status(500).json({ error: "Failed to mark as read" });
+  }
+});
+
+// Add Socket.io event handlers for chat
+io.on("connection", (socket) => {
+  // ... existing code ...
+  
+  // Join chat room
+  socket.on("join-chat", async (chatId) => {
+    try {
+      const { rows } = await pool.query(
+        "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
+        [chatId, socket.userId]
+      );
+      
+      if (rows.length > 0) {
+        socket.join(`chat-${chatId}`);
+        console.log(`User ${socket.userId} joined chat ${chatId}`);
+      } else {
+        socket.emit("error", { message: "Not authorized to join this chat" });
+      }
+    } catch (err) {
+      console.error("Join chat error:", err);
+    }
+  });
+  
+  // Leave chat room
+  socket.on("leave-chat", (chatId) => {
+    socket.leave(`chat-${chatId}`);
+    console.log(`User ${socket.userId} left chat ${chatId}`);
+  });
+  
+  // Send message via socket (for real-time delivery)
+  socket.on("send-message", async (data) => {
+    try {
+      const { chatId, content, type, media_url, replyTo, poll, tempId } = data;
+      
+      // Verify participant
+      const { rows: participant } = await pool.query(
+        "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
+        [chatId, socket.userId]
+      );
+      
+      if (participant.length === 0) return;
+      
+      // Broadcast to other users in the chat room
+      socket.to(`chat-${chatId}`).emit("new-message", {
+        id: tempId,
+        chat_id: chatId,
+        sender_id: socket.userId,
+        sender: { id: socket.userId, username: socket.username },
+        content,
+        type,
+        media_url,
+        replyTo,
+        poll,
+        timestamp: new Date().toISOString(),
+      });
+      
+    } catch (err) {
+      console.error("Socket send message error:", err);
+    }
+  });
+  
+  // Typing indicators
+  socket.on("typing-start", (data) => {
+    socket.to(`chat-${data.chatId}`).emit("user-typing", { 
+      userId: socket.userId,
+      username: socket.username 
+    });
+  });
+  
+  socket.on("typing-stop", (data) => {
+    socket.to(`chat-${data.chatId}`).emit("user-stopped-typing", { 
+      userId: socket.userId 
+    });
+  });
+});
+
+// Authentication middleware
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(" ")[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: "No token provided" });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: "Invalid token" });
+  }
+}
+
 // Update prayer
 app.put('/api/faith/prayers/:id', authenticateToken, async (req, res) => {
   try {
