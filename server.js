@@ -6329,21 +6329,103 @@ app.post('/api/support/feedback', authenticateToken, async (req, res) => {
 });
 
 // Add this anywhere before server.listen()
+// ==========================================
+// HLS PROXY - Fixed version
+// ==========================================
 app.get("/api/hls-proxy", async (req, res) => {
   try {
     const url = req.query.url;
-    if (!url) return res.status(400).send("No URL");
     
-    const response = await axios({ url, responseType: 'stream', timeout: 10000 });
+    if (!url) {
+      console.log('[HLS Proxy] No URL provided');
+      return res.status(400).send("No URL provided");
+    }
     
+    // Validate URL format
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch (e) {
+      console.log('[HLS Proxy] Invalid URL:', url);
+      return res.status(400).send("Invalid URL format");
+    }
+    
+    // Only allow http/https
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      console.log('[HLS Proxy] Invalid protocol:', parsedUrl.protocol);
+      return res.status(400).send("Only http/https allowed");
+    }
+    
+    console.log('[HLS Proxy] Fetching:', url.substring(0, 100) + '...');
+    
+    const response = await axios({
+      method: 'get',
+      url: url,
+      responseType: 'stream',
+      timeout: 15000,
+      maxRedirects: 5,
+      validateStatus: (status) => status < 500, // Accept 4xx but not 5xx
+    });
+    
+    // Set CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream');
-    if (response.headers['content-length']) res.setHeader('Content-Length', response.headers['content-length']);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Range, Origin, Accept, Content-Type');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length');
     
+    // Set content type
+    const contentType = response.headers['content-type'] || 'application/octet-stream';
+    res.setHeader('Content-Type', contentType);
+    
+    // Set content length if available
+    if (response.headers['content-length']) {
+      res.setHeader('Content-Length', response.headers['content-length']);
+    }
+    
+    // Handle errors from upstream
+    if (response.status >= 400) {
+      console.log('[HLS Proxy] Upstream error:', response.status);
+      return res.status(response.status).send('Upstream error');
+    }
+    
+    // Pipe the response
     response.data.pipe(res);
+    
+    response.data.on('error', (err) => {
+      console.error('[HLS Proxy] Stream error:', err.message);
+      if (!res.headersSent) {
+        res.status(502).send('Stream error');
+      } else {
+        res.end();
+      }
+    });
+    
+    res.on('close', () => {
+      response.data.destroy();
+    });
+    
   } catch (err) {
-    res.status(500).send("Failed");
+    console.error('[HLS Proxy] Error:', err.message);
+    
+    if (!res.headersSent) {
+      if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+        res.status(504).send('Request timeout');
+      } else if (err.code === 'ENOTFOUND') {
+        res.status(404).send('URL not found');
+      } else {
+        res.status(500).send('Proxy error: ' + err.message);
+      }
+    }
   }
+});
+
+// Also add OPTIONS handler for the proxy
+app.options("/api/hls-proxy", (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Origin, Accept, Content-Type');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  res.status(204).end();
 });
 
 app.post('/api/support/report', async (req, res) => {
