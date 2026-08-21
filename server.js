@@ -5874,6 +5874,44 @@ app.get('/api/video-proxy', async (req, res) => {
   }
 });
 
+// Add this endpoint to your Express server
+app.get('/api/hls-proxy', async (req, res) => {
+  try {
+    const url = req.query.url;
+    if (!url) return res.status(400).json({ error: 'URL required' });
+    
+    // Validate URL is from allowed domains
+    const allowedDomains = [
+      'cdn.mintza.xyz',
+      process.env.AWS_CLOUDFRONT_DOMAIN?.replace('https://', '').replace('http://', ''),
+      // Add other allowed domains
+    ].filter(Boolean);
+    
+    const urlObj = new URL(url);
+    if (!allowedDomains.some(d => urlObj.hostname.includes(d))) {
+      return res.status(403).json({ error: 'Domain not allowed' });
+    }
+    
+    const response = await axios({
+      method: 'get',
+      url,
+      responseType: 'stream',
+      timeout: 30000,
+    });
+    
+    // Forward content-type
+    res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    
+    response.data.pipe(res);
+    
+  } catch (err) {
+    console.error('HLS Proxy Error:', err.message);
+    res.status(500).json({ error: 'Proxy failed' });
+  }
+});
+
 // Backend - Add these if missing
 app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
   try {
