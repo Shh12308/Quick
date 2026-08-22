@@ -5878,45 +5878,6 @@ app.get('/api/video-proxy', async (req, res) => {
 // LIVESTREAM CREATE ROUTE
 // ==========================================
 
-// Auth middleware (add this if you don't have it)
-const authenticateToken = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({ error: "No token provided" });
-    }
-
-    const token = authHeader.split(" ")[1];
-
-    if (!token) {
-      return res.status(401).json({ error: "No token provided" });
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-    
-    const { rows } = await pool.query(
-      "SELECT id, username, email, role, profile_url, balance, earnings FROM users WHERE id = $1",
-      [decoded.id]
-    );
-
-    if (rows.length === 0) {
-      return res.status(401).json({ error: "User not found" });
-    }
-
-    req.user = rows[0];
-    req.userId = decoded.id;
-    next();
-
-  } catch (err) {
-    if (err.name === "TokenExpiredError") {
-      return res.status(401).json({ error: "Token expired" });
-    }
-    console.error("Auth middleware error:", err);
-    return res.status(401).json({ error: "Invalid token" });
-  }
-};
-
 // CREATE LIVESTREAM ROUTE
 app.post("/api/livestreams/create", authenticateToken, async (req, res) => {
   try {
