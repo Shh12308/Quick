@@ -5873,36 +5873,52 @@ app.get('/api/video-proxy', async (req, res) => {
     res.status(502).json({ error: 'Proxy failed' });
   }
 });
-
-// ==========================================
-// LIVESTREAM CREATE ROUTE
-// ==========================================
-
 // CREATE LIVESTREAM ROUTE
+// ==========================================
+// DEBUG VERSION - Replace your current route with this
+// ==========================================
+
 app.post("/api/livestreams/create", authenticateToken, async (req, res) => {
+  console.log("🔵 CREATE STREAM HIT");
+  console.log("🔵 req.userId:", req.userId);
+  console.log("🔵 req.body:", JSON.stringify(req.body, null, 2));
+
   try {
     const userId = req.userId;
+
+    if (!userId) {
+      console.log("🔴 No userId");
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
     const { title, category, tags, privacy, delay, autoRecord, thumbnail } = req.body;
+
+    console.log("🔵 Parsed body:", { title, category, tags, privacy, delay, autoRecord, thumbnail });
 
     // Validate title
     if (!title || title.trim().length < 3) {
+      console.log("🔴 Invalid title");
       return res.status(400).json({ error: "Title must be at least 3 characters" });
     }
 
     // Check if user already has a live stream
+    console.log("🔵 Checking existing streams...");
     const { rows: existingStream } = await pool.query(
       "SELECT id FROM livestreams WHERE user_id = $1 AND is_live = true",
       [userId]
     );
 
     if (existingStream.length > 0) {
+      console.log("🔴 User already has live stream:", existingStream[0].id);
       return res.status(400).json({ error: "You already have a live stream" });
     }
 
     // Generate unique stream key
     const streamKey = `live_${uuidv4().replace(/-/g, "")}`;
+    console.log("🔵 Generated stream key:", streamKey);
 
     // Insert into database
+    console.log("🔵 Inserting into database...");
     const { rows } = await pool.query(
       `INSERT INTO livestreams 
        (user_id, title, category, tags, privacy, stream_delay, auto_record, thumbnail, stream_key, is_live, viewers, peak_viewers, earnings, created_at)
@@ -5922,10 +5938,12 @@ app.post("/api/livestreams/create", authenticateToken, async (req, res) => {
     );
 
     if (rows.length === 0) {
+      console.log("🔴 No rows returned");
       return res.status(500).json({ error: "Failed to create stream" });
     }
 
     const stream = rows[0];
+    console.log("✅ Stream created:", stream.id);
 
     // Return stream data
     res.status(201).json({
@@ -5940,14 +5958,33 @@ app.post("/api/livestreams/create", authenticateToken, async (req, res) => {
     });
 
   } catch (err) {
-    console.error("Create livestream error:", err);
+    console.error("🔴 CREATE STREAM ERROR:", err);
+    console.error("🔴 Error code:", err.code);
+    console.error("🔴 Error message:", err.message);
+    console.error("🔴 Error detail:", err.detail);
+    console.error("🔴 Error table:", err.table);
+    console.error("LError column:", err.column);
     
     // Handle missing table
     if (err.code === "42P01") {
-      return res.status(500).json({ error: "Livestreams table does not exist. Please run the migration." });
+      return res.status(500).json({ 
+        error: "Database table 'livestreams' does not exist. Run this SQL:\n\nCREATE TABLE livestreams (\n  id SERIAL PRIMARY KEY,\n  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,\n  title VARCHAR(200) NOT NULL,\n  category VARCHAR(50) DEFAULT 'general',\n  tags JSONB DEFAULT '[]',\n  privacy VARCHAR(20) DEFAULT 'public',\n  stream_key VARCHAR(100) UNIQUE NOT NULL,\n  stream_delay INTEGER DEFAULT 0,\n  auto_record BOOLEAN DEFAULT true,\n  thumbnail TEXT DEFAULT '',\n  is_live BOOLEAN DEFAULT false,\n  viewers INTEGER DEFAULT 0,\n  peak_viewers INTEGER DEFAULT 0,\n  earnings DECIMAL(10,2) DEFAULT 0,\n  duration INTEGER DEFAULT 0,\n  ended_at TIMESTAMP,\n  created_at TIMESTAMP DEFAULT NOW()\n);"
+      });
     }
     
-    res.status(500).json({ error: "Failed to create livestream" });
+    // Handle missing column
+    if (err.code === "42703") {
+      return res.status(500).json({ 
+        error: `Missing column '${err.column}' in livestreams table`,
+        detail: err.detail
+      });
+    }
+    
+    res.status(500).json({ 
+      error: "Failed to create livestream",
+      detail: err.message,
+      code: err.code
+    });
   }
 });
 
