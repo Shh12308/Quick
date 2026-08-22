@@ -5874,6 +5874,201 @@ app.get('/api/video-proxy', async (req, res) => {
   }
 });
 
+// ==========================================
+// LIVESTREAM CREATE ROUTE
+// ==========================================
+
+// Auth middleware (add this if you don't have it)
+const authenticateToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "No token provided" });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    if (!token) {
+      return res.status(401).json({ error: "No token provided" });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    const { rows } = await pool.query(
+      "SELECT id, username, email, role, profile_url, balance, earnings FROM users WHERE id = $1",
+      [decoded.id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(401).json({ error: "User not found" });
+    }
+
+    req.user = rows[0];
+    req.userId = decoded.id;
+    next();
+
+  } catch (err) {
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({ error: "Token expired" });
+    }
+    console.error("Auth middleware error:", err);
+    return res.status(401).json({ error: "Invalid token" });
+  }
+};
+
+// CREATE LIVESTREAM ROUTE
+app.post("/api/livestreams/create", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { title, category, tags, privacy, delay, autoRecord, thumbnail } = req.body;
+
+    // Validate title
+    if (!title || title.trim().length < 3) {
+      return res.status(400).json({ error: "Title must be at least 3 characters" });
+    }
+
+    // Check if user already has a live stream
+    const { rows: existingStream } = await pool.query(
+      "SELECT id FROM livestreams WHERE user_id = $1 AND is_live = true",
+      [userId]
+    );
+
+    if (existingStream.length > 0) {
+      return res.status(400).json({ error: "You already have a live stream" });
+    }
+
+    // Generate unique stream key
+    const streamKey = `live_${uuidv4().replace(/-/g, "")}`;
+
+    // Insert into database
+    const { rows } = await pool.query(
+      `INSERT INTO livestreams 
+       (user_id, title, category, tags, privacy, stream_delay, auto_record, thumbnail, stream_key, is_live, viewers, peak_viewers, earnings, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, 0, 0, 0, NOW())
+       RETURNING *`,
+      [
+        userId,
+        title.trim(),
+        category || "general",
+        JSON.stringify(tags || []),
+        privacy || "public",
+        delay || 0,
+        autoRecord !== false,
+        thumbnail || "",
+        streamKey
+      ]
+    );
+
+    if (rows.length === 0) {
+      return res.status(500).json({ error: "Failed to create stream" });
+    }
+
+    const stream = rows[0];
+
+    // Return stream data
+    res.status(201).json({
+      stream_id: stream.id,
+      stream_key: stream.stream_key,
+      title: stream.title,
+      category: stream.category,
+      tags: stream.tags,
+      privacy: stream.privacy,
+      thumbnail: stream.thumbnail,
+      created_at: stream.created_at
+    });
+
+  } catch (err) {
+    console.error("Create livestream error:", err);
+    
+    // Handle missing table
+    if (err.code === "42P01") {
+      return res.status(500).json({ error: "Livestreams table does not exist. Please run the migration." });
+    }
+    
+    res.status(500).json({ error: "Failed to create livestream" });
+  }
+});
+
+// END LIVESTREAM ROUTE
+app.post("/api/livestreams/end/:streamId", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { streamId } = req.params;
+
+    const { rows: stream } = await pool.query(
+      "SELECT * FROM livestreams WHERE id = $1 AND user_id = $2",
+      [streamId, userId]
+    );
+
+    if (stream.length === 0) {
+      return res.status(404).json({ error: "Stream not found" });
+    }
+
+    await pool.query(
+      `UPDATE livestreams 
+       SET is_live = false, 
+           ended_at = NOW(), 
+           duration = EXTRACT(EPOCH FROM (NOW() - created_at))
+       WHERE id = $1`,
+      [streamId]
+    );
+
+    // Notify all viewers
+    io.to(`stream-${streamId}`).emit("stream-ended", {
+      streamId,
+      reason: "streamer_ended"
+    });
+
+    res.json({ success: true, message: "Stream ended" });
+
+  } catch (err) {
+    console.error("End livestream error:", err);
+    res.status(500).json({ error: "Failed to end stream" });
+  }
+});
+
+// AGORA TOKEN ROUTE
+app.post("/api/agora/token", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { channelName } = req.body;
+
+    if (!channelName) {
+      return res.status(400).json({ error: "Channel name is required" });
+    }
+
+    if (!AGORA_APP_ID || !AGORA_APP_CERTIFICATE) {
+      return res.status(500).json({ error: "Agora not configured" });
+    }
+
+    const expirationTimeInSeconds = 86400;
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      AGORA_APP_ID,
+      AGORA_APP_CERTIFICATE,
+      channelName.toString(),
+      userId,
+      RtcRole.PUBLISHER,
+      privilegeExpiredTs
+    );
+
+    res.json({
+      appId: AGORA_APP_ID,
+      token,
+      uid: userId,
+      channelName,
+      expiresIn: expirationTimeInSeconds
+    });
+
+  } catch (err) {
+    console.error("Agora token error:", err);
+    res.status(500).json({ error: "Failed to generate Agora token" });
+  }
+});
+
 // Add this endpoint to your Express server
 app.get('/api/hls-proxy', async (req, res) => {
   try {
