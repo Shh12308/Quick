@@ -4,7 +4,7 @@ import argon2 from "argon2";
 import jwt from "jsonwebtoken";
 import os from "os";
 import crypto from "crypto";
-import multer from "multer";
+
 import passport from "passport";
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { Strategy as DiscordStrategy } from "passport-discord";
