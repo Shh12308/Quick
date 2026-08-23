@@ -5805,6 +5805,146 @@ app.get('/api/music/tracks', async (req, res) => {
 });
 
 // ==========================================
+// MUSIC API ROUTES
+// ==========================================
+
+// GET /api/music - Get all music tracks
+app.get("/api/music", async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) {
+      return res.status(401).json({ error: "No token provided" });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    // Get all public tracks or user's tracks
+    const { rows } = await pool.query(`
+      SELECT 
+        m.id,
+        m.title,
+        m.artist,
+        m.album,
+        m.genre,
+        m.year,
+        m.duration,
+        m.cover_url as cover,
+        m.thumbnail_url as thumbnail,
+        m.audio_url,
+        m.play_count,
+        m.created_at as uploadedAt,
+        u.username as uploader_username,
+        u.profile_url as uploader_avatar
+      FROM music m
+      LEFT JOIN users u ON m.user_id = u.id
+      WHERE m.is_public = true OR m.user_id = $1
+      ORDER BY m.created_at DESC
+    `, [decoded.id]);
+
+    res.json(rows);
+  } catch (err) {
+    console.error("Get music error:", err);
+    res.status(500).json({ error: "Failed to fetch music" });
+  }
+});
+
+// GET /api/music/favorites - Get user's favorites
+app.get("/api/music/favorites", async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) {
+      return res.status(401).json({ error: "No token provided" });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    const { rows } = await pool.query(`
+      SELECT track_id 
+      FROM music_favorites 
+      WHERE user_id = $1
+    `, [decoded.id]);
+
+    res.json(rows.map(r => r.track_id));
+  } catch (err) {
+    console.error("Get favorites error:", err);
+    res.status(500).json({ error: "Failed to fetch favorites" });
+  }
+});
+
+// POST /api/music/favorites - Add to favorites
+app.post("/api/music/favorites", async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) {
+      return res.status(401).json({ error: "No token provided" });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const { track_id } = req.body;
+
+    if (!track_id) {
+      return res.status(400).json({ error: "track_id is required" });
+    }
+
+    await pool.query(`
+      INSERT INTO music_favorites (user_id, track_id, created_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (user_id, track_id) DO NOTHING
+    `, [decoded.id, track_id]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Add favorite error:", err);
+    res.status(500).json({ error: "Failed to add favorite" });
+  }
+});
+
+// DELETE /api/music/favorites/:trackId - Remove from favorites
+app.delete("/api/music/favorites/:trackId", async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) {
+      return res.status(401).json({ error: "No token provided" });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    await pool.query(`
+      DELETE FROM music_favorites 
+      WHERE user_id = $1 AND track_id = $2
+    `, [decoded.id, req.params.trackId]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Remove favorite error:", err);
+    res.status(500).json({ error: "Failed to remove favorite" });
+  }
+});
+
+// GET /api/music/:id - Get single track
+app.get("/api/music/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT * FROM music WHERE id = $1
+    `, [req.params.id]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Track not found" });
+    }
+
+    // Increment play count
+    await pool.query(`
+      UPDATE music SET play_count = play_count + 1 WHERE id = $1
+    `, [req.params.id]);
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("Get track error:", err);
+    res.status(500).json({ error: "Failed to fetch track" });
+  }
+});
+
+// ==========================================
 // VIDEO PROXY — Fixed version
 // ==========================================
 
