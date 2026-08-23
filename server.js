@@ -6819,19 +6819,16 @@ app.post("/api/uploadm", musicUpload.fields([
 // ==========================================
 // GET /api/music - Fetch All Music
 // ==========================================
+// GET /api/music - Fetch All Music
 app.get("/api/music", async (req, res) => {
   try {
     let userId = null;
-
-    // Optional auth
     const authHeader = req.headers.authorization;
     if (authHeader?.startsWith("Bearer ")) {
       try {
         const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
         userId = decoded.id;
-      } catch (err) {
-        // Continue as anonymous
-      }
+      } catch (err) {}
     }
 
     const { rows } = await pool.query(`
@@ -6848,17 +6845,13 @@ app.get("/api/music", async (req, res) => {
         m.is_explicit as explicit,
         m.tags,
         m.play_count as plays,
-        m.created_at as createdAt,
-        u.username as uploader_username,
-        u.profile_url as uploader_avatar
+        m.created_at as createdAt
       FROM music m
-      LEFT JOIN users u ON m.user_id = u.id
       WHERE m.is_public = true ${userId ? `OR m.user_id = ${parseInt(userId)}` : ''}
       ORDER BY m.created_at DESC
       LIMIT 500
     `);
 
-    // Format for frontend
     const tracks = rows.map(t => ({
       id: t.id,
       title: t.title,
@@ -6871,7 +6864,7 @@ app.get("/api/music", async (req, res) => {
       audio_url: t.audio_url,
       url: t.audio_url,
       explicit: t.explicit,
-      tags: typeof t.tags === 'string' ? JSON.parse(t.tags || '[]') : (t.tags || []),
+      tags: typeof t.tags === "string" ? JSON.parse(t.tags || "[]") : (t.tags || []),
       plays: parseInt(t.plays) || 0,
       createdAt: t.createdat,
     }));
@@ -6880,8 +6873,13 @@ app.get("/api/music", async (req, res) => {
     res.json(tracks);
 
   } catch (err) {
-    console.error("Fetch music error:", err);
-    res.status(500).json({ error: "Failed to fetch music" });
+    console.error("❌ Fetch music error:", err.message);
+    console.error("❌ Full error:", err);
+    res.status(500).json({ 
+      error: "Failed to fetch music",
+      details: err.message,  // This will tell you exactly what's wrong
+      hint: err.message.includes("relation") ? "Table does not exist - run the SQL migration" : null
+    });
   }
 });
 
