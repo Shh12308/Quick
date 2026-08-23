@@ -6611,31 +6611,6 @@ app.delete('/api/settings/hidden-words/:word', authenticateToken, async (req, re
 });
 
 // ==========================================
-// MUSIC UPLOAD & FETCH ENDPOINTS
-// ==========================================
-
-// Add to imports at top if not present:
-// import os from "os";
-// import crypto from "crypto";
-
-// Multer config for music uploads
-const musicStorage = multer.memoryStorage();
-const musicUpload = multer({
-  storage: musicStorage,
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
-  fileFilter: (req, file, cb) => {
-    const ext = file.originalname.split(".").pop()?.toLowerCase();
-    const allowed = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "oga", "opus", "webm"];
-    
-    if (allowed.includes(ext)) {
-      cb(null, true);
-    } else {
-      cb(new Error("Invalid audio format"), false);
-    }
-  },
-});
-
-// ==========================================
 // POST /api/uploadm - Upload Music
 // ==========================================
 app.post("/api/uploadm", musicUpload.fields([
