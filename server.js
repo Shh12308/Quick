@@ -6610,6 +6610,443 @@ app.delete('/api/settings/hidden-words/:word', authenticateToken, async (req, re
   }
 });
 
+// ==========================================
+// MUSIC UPLOAD & FETCH ENDPOINTS
+// ==========================================
+
+// Add to imports at top if not present:
+// import os from "os";
+// import crypto from "crypto";
+
+// Multer config for music uploads
+const musicStorage = multer.memoryStorage();
+const musicUpload = multer({
+  storage: musicStorage,
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
+  fileFilter: (req, file, cb) => {
+    const ext = file.originalname.split(".").pop()?.toLowerCase();
+    const allowed = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "oga", "opus", "webm"];
+    
+    if (allowed.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error("Invalid audio format"), false);
+    }
+  },
+});
+
+// ==========================================
+// POST /api/uploadm - Upload Music
+// ==========================================
+app.post("/api/uploadm", musicUpload.fields([
+  { name: "audio", maxCount: 1 },
+  { name: "cover", maxCount: 1 }
+]), async (req, res) => {
+  try {
+    // Auth check
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "No token provided" });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
+    } catch (err) {
+      return res.status(401).json({ error: "Invalid or expired token" });
+    }
+
+    // Validate files
+    const audioFile = req.files?.audio?.[0];
+    if (!audioFile) {
+      return res.status(400).json({ error: "Audio file is required" });
+    }
+
+    // Validate fields
+    const { title, artist, album, genre, explicit, tags } = req.body;
+    if (!title?.trim()) {
+      return res.status(400).json({ error: "Title is required" });
+    }
+
+    if (!s3) {
+      return res.status(500).json({ error: "Storage not configured" });
+    }
+
+    console.log(`🎵 Uploading music: "${title}" by ${artist || 'Unknown'}`);
+
+    // ==========================================
+    // Upload audio to S3
+    // ==========================================
+    const audioExt = audioFile.originalname.split(".").pop()?.toLowerCase() || "mp3";
+    const audioKey = `music/${decoded.id}/${Date.now()}-${crypto.randomUUID()}.${audioExt}`;
+
+    await s3.send(new PutObjectCommand({
+      Bucket: S3_BUCKET_NAME,
+      Key: audioKey,
+      Body: audioFile.buffer,
+      ContentType: audioFile.mimetype || "audio/mpeg",
+    }));
+
+    const audioUrl = AWS_CLOUDFRONT_DOMAIN
+      ? `https://${AWS_CLOUDFRONT_DOMAIN}/${audioKey}`
+      : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${audioKey}`;
+
+    // ==========================================
+    // Upload cover to S3 (if provided)
+    // ==========================================
+    let coverUrl = null;
+    let thumbnailUrl = null;
+
+    const coverFile = req.files?.cover?.[0];
+    if (coverFile) {
+      try {
+        // Full-size cover
+        const coverBuffer = await sharp(coverFile.buffer)
+          .resize(1000, 1000, { fit: "cover" })
+          .jpeg({ quality: 85 })
+          .toBuffer();
+
+        const coverKey = `music/covers/${decoded.id}/${Date.now()}-${crypto.randomUUID()}.jpg`;
+
+        await s3.send(new PutObjectCommand({
+          Bucket: S3_BUCKET_NAME,
+          Key: coverKey,
+          Body: coverBuffer,
+          ContentType: "image/jpeg",
+        }));
+
+        coverUrl = AWS_CLOUDFRONT_DOMAIN
+          ? `https://${AWS_CLOUDFRONT_DOMAIN}/${coverKey}`
+          : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${coverKey}`;
+
+        // Thumbnail
+        const thumbBuffer = await sharp(coverFile.buffer)
+          .resize(200, 200, { fit: "cover" })
+          .jpeg({ quality: 70 })
+          .toBuffer();
+
+        const thumbKey = `music/thumbnails/${decoded.id}/${Date.now()}-${crypto.randomUUID()}.jpg`;
+
+        await s3.send(new PutObjectCommand({
+          Bucket: S3_BUCKET_NAME,
+          Key: thumbKey,
+          Body: thumbBuffer,
+          ContentType: "image/jpeg",
+        }));
+
+        thumbnailUrl = AWS_CLOUDFRONT_DOMAIN
+          ? `https://${AWS_CLOUDFRONT_DOMAIN}/${thumbKey}`
+          : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${thumbKey}`;
+      } catch (err) {
+        console.error("Cover upload failed:", err.message);
+        // Don't fail entire upload
+      }
+    }
+
+    // ==========================================
+    // Get audio duration
+    // ==========================================
+    let duration = 0;
+    try {
+      const os = await import("os");
+      const tempPath = path.join(os.tmpdir(), `audio-${Date.now()}.${audioExt}`);
+      fs.writeFileSync(tempPath, audioFile.buffer);
+
+      duration = await new Promise((resolve) => {
+        ffmpeg.ffprobe(tempPath, (err, metadata) => {
+          fs.unlink(tempPath, () => {});
+          resolve(err ? 0 : Math.floor(metadata?.format?.duration || 0));
+        });
+      });
+    } catch (err) {
+      console.error("Duration extraction failed:", err.message);
+    }
+
+    // ==========================================
+    // Parse tags
+    // ==========================================
+    let parsedTags = [];
+    try {
+      if (tags) {
+        parsedTags = typeof tags === "string" ? JSON.parse(tags) : tags;
+        if (!Array.isArray(parsedTags)) parsedTags = [];
+      }
+    } catch (err) {
+      parsedTags = [];
+    }
+
+    // ==========================================
+    // Save to database
+    // ==========================================
+    const { rows } = await pool.query(
+      `INSERT INTO music (
+        user_id, title, artist, album, genre, duration,
+        audio_url, cover_url, thumbnail_url,
+        is_explicit, tags, is_public, play_count,
+        created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
+      RETURNING *`,
+      [
+        decoded.id,
+        title.trim(),
+        artist?.trim() || decoded.username || "Unknown Artist",
+        album?.trim() || null,
+        genre?.trim()?.toLowerCase() || null,
+        duration,
+        audioUrl,
+        coverUrl,
+        thumbnailUrl,
+        explicit === "true" || explicit === true,
+        JSON.stringify(parsedTags),
+        true,
+        0,
+      ]
+    );
+
+    if (!rows.length) {
+      return res.status(500).json({ error: "Failed to save track" });
+    }
+
+    const saved = rows[0];
+
+    console.log(`✅ Music saved: ID=${saved.id}, "${saved.title}" (${duration}s)`);
+
+    // Return formatted track
+    res.status(201).json({
+      success: true,
+      track: {
+        id: saved.id,
+        title: saved.title,
+        artist: saved.artist,
+        album: saved.album,
+        genre: saved.genre,
+        duration: saved.duration,
+        cover: saved.cover_url,
+        thumbnail: saved.thumbnail_url,
+        audio_url: saved.audio_url,
+        url: saved.audio_url,
+        explicit: saved.is_explicit,
+        tags: saved.tags,
+        plays: saved.play_count,
+        createdAt: saved.created_at,
+      },
+    });
+
+  } catch (err) {
+    console.error("Music upload error:", err);
+    res.status(500).json({ error: "Upload failed. Please try again." });
+  }
+});
+
+// ==========================================
+// GET /api/music - Fetch All Music
+// ==========================================
+app.get("/api/music", async (req, res) => {
+  try {
+    let userId = null;
+
+    // Optional auth
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith("Bearer ")) {
+      try {
+        const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
+        userId = decoded.id;
+      } catch (err) {
+        // Continue as anonymous
+      }
+    }
+
+    const { rows } = await pool.query(`
+      SELECT 
+        m.id,
+        m.title,
+        m.artist,
+        m.album,
+        m.genre,
+        m.duration,
+        m.audio_url,
+        m.cover_url as cover,
+        m.thumbnail_url as thumbnail,
+        m.is_explicit as explicit,
+        m.tags,
+        m.play_count as plays,
+        m.created_at as createdAt,
+        u.username as uploader_username,
+        u.profile_url as uploader_avatar
+      FROM music m
+      LEFT JOIN users u ON m.user_id = u.id
+      WHERE m.is_public = true ${userId ? `OR m.user_id = ${parseInt(userId)}` : ''}
+      ORDER BY m.created_at DESC
+      LIMIT 500
+    `);
+
+    // Format for frontend
+    const tracks = rows.map(t => ({
+      id: t.id,
+      title: t.title,
+      artist: t.artist,
+      album: t.album,
+      genre: t.genre,
+      duration: t.duration,
+      cover: t.cover,
+      thumbnail: t.thumbnail,
+      audio_url: t.audio_url,
+      url: t.audio_url,
+      explicit: t.explicit,
+      tags: typeof t.tags === 'string' ? JSON.parse(t.tags || '[]') : (t.tags || []),
+      plays: parseInt(t.plays) || 0,
+      createdAt: t.createdat,
+    }));
+
+    console.log(`🎵 Returning ${tracks.length} tracks`);
+    res.json(tracks);
+
+  } catch (err) {
+    console.error("Fetch music error:", err);
+    res.status(500).json({ error: "Failed to fetch music" });
+  }
+});
+
+// ==========================================
+// GET /api/music/:id - Get Single Track
+// ==========================================
+app.get("/api/music/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT * FROM music WHERE id = $1",
+      [req.params.id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Track not found" });
+    }
+
+    // Increment play count
+    await pool.query(
+      "UPDATE music SET play_count = play_count + 1 WHERE id = $1",
+      [req.params.id]
+    );
+
+    const t = rows[0];
+    res.json({
+      id: t.id,
+      title: t.title,
+      artist: t.artist,
+      album: t.album,
+      genre: t.genre,
+      duration: t.duration,
+      cover: t.cover_url,
+      thumbnail: t.thumbnail_url,
+      audio_url: t.audio_url,
+      url: t.audio_url,
+      explicit: t.is_explicit,
+      tags: typeof t.tags === 'string' ? JSON.parse(t.tags || '[]') : (t.tags || []),
+      plays: t.play_count,
+      createdAt: t.created_at,
+    });
+
+  } catch (err) {
+    console.error("Get track error:", err);
+    res.status(500).json({ error: "Failed to fetch track" });
+  }
+});
+
+// ==========================================
+// MUSIC FAVORITES
+// ==========================================
+app.get("/api/music/favorites", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "No token" });
+    }
+
+    const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
+
+    const { rows } = await pool.query(
+      "SELECT track_id FROM music_favorites WHERE user_id = $1",
+      [decoded.id]
+    );
+
+    res.json(rows.map(r => r.track_id));
+  } catch (err) {
+    console.error("Get favorites error:", err);
+    res.status(500).json({ error: "Failed to fetch favorites" });
+  }
+});
+
+app.post("/api/music/favorites", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "No token" });
+    }
+
+    const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
+    const { track_id } = req.body;
+
+    if (!track_id) {
+      return res.status(400).json({ error: "track_id required" });
+    }
+
+    await pool.query(
+      `INSERT INTO music_favorites (user_id, track_id, created_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id, track_id) DO NOTHING`,
+      [decoded.id, track_id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Add favorite error:", err);
+    res.status(500).json({ error: "Failed to add favorite" });
+  }
+});
+
+app.delete("/api/music/favorites/:trackId", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "No token" });
+    }
+
+    const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
+
+    await pool.query(
+      "DELETE FROM music_favorites WHERE user_id = $1 AND track_id = $2",
+      [decoded.id, req.params.trackId]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Remove favorite error:", err);
+    res.status(500).json({ error: "Failed to remove favorite" });
+  }
+});
+
+// ==========================================
+// DEBUG ENDPOINT (Remove in production)
+// ==========================================
+app.get("/api/music/debug", async (req, res) => {
+  try {
+    const { rows: count } = await pool.query("SELECT COUNT(*) as total FROM music");
+    const { rows: recent } = await pool.query(`
+      SELECT id, title, artist, audio_url, cover_url, created_at 
+      FROM music ORDER BY created_at DESC LIMIT 5
+    `);
+
+    res.json({
+      totalTracks: parseInt(count[0]?.total) || 0,
+      recentTracks: recent,
+      s3Configured: !!s3,
+      bucket: S3_BUCKET_NAME || "not set",
+      cloudfront: AWS_CLOUDFRONT_DOMAIN || "not set",
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, tableExists: false });
+  }
+});
+
 // 13. Download Data (Zip File)
 app.get('/api/settings/download-data', authenticateToken, async (req, res) => {
   try {
