@@ -340,7 +340,29 @@ const upload = multer({ storage, limits: { fileSize: 500 * 1024 * 1024 }, fileFi
 
 const musicUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 }, fileFilter: (req, file, cb) => { if (file.fieldname === "audio" && !file.mimetype.startsWith("audio/")) return cb(new Error("Invalid audio"), false); if (file.fieldname === "cover" && !file.mimetype.startsWith("image/")) return cb(new Error("Invalid image"), false); cb(null, true); } });
 const shortsUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 }, fileFilter: (req, file, cb) => { if (file.fieldname === "video" && !file.mimetype.startsWith("video/")) return cb(new Error("Invalid video"), false); cb(null, true); } });
-const chatUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 }, fileFilter: (req, file, cb) => cb(null, ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'audio/webm', 'audio/mpeg'].includes(file.mimetype) ? true : (cb(new Error('Invalid file type'), false)) });
+const chatUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      'image/jpeg',
+      'image/png',
+      'image/gif',
+      'image/webp',
+      'video/mp4',
+      'audio/webm',
+      'audio/mpeg'
+    ];
+
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type'), false);
+    }
+  }
+});
 
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 500 }));
 
