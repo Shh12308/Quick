@@ -569,8 +569,45 @@ app.post('/api/users/:username/unfollow', authenticateToken, async (req, res) =>
 app.post('/api/users/:userId/block', authenticateToken, async (req, res) => { try { if (parseInt(req.params.userId) === req.user.id) return res.status(400).json({ error: "Can't block yourself" }); await pool.query("INSERT INTO blocked_users (blocker_id, blocked_id, created_at) VALUES ($1, $2, NOW()) ON CONFLICT DO NOTHING", [req.user.id, req.params.userId]); res.json({ message: "Blocked" }); } catch (err) { res.status(500).json({ error: "Failed" }); } });
 
 // Videos
-app.get("/api/uploadv", authenticateToken, async (req, res) => { try { const { filename, contentType, type } = req.query; if (!filename || !contentType) return res.status(400).json({ error: "filename and contentType required" }); const id = uuidv4(); const key = type === "thumbnail" ? `thumbnails/${req.user.id}/${id}.jpg` : `videos/${req.user.id}/${id}${path.extname(filename) || ".mp4"`; const cmd = new PutObjectCommand({ Bucket: S3_BUCKET_NAME, Key: key, ContentType: contentType }); const uploadUrl = await getSignedUrl(s3, cmd, { expiresIn: 600 }); res.json({ uploadUrl, key, fileUrl: `https://${AWS_CLOUDFRONT_DOMAIN}/${key}` }); } catch (err) { res.status(500).json({ error: "Failed", details: err.message }); } });
+app.get("/api/uploadv", authenticateToken, async (req, res) => {
+  try {
+    const { filename, contentType, type } = req.query;
 
+    if (!filename || !contentType) {
+      return res
+        .status(400)
+        .json({ error: "filename and contentType required" });
+    }
+
+    const id = uuidv4();
+
+    const key =
+      type === "thumbnail"
+        ? `thumbnails/${req.user.id}/${id}.jpg`
+        : `videos/${req.user.id}/${id}${path.extname(filename) || ".mp4"}`;
+
+    const cmd = new PutObjectCommand({
+      Bucket: S3_BUCKET_NAME,
+      Key: key,
+      ContentType: contentType
+    });
+
+    const uploadUrl = await getSignedUrl(s3, cmd, {
+      expiresIn: 600
+    });
+
+    res.json({
+      uploadUrl,
+      key,
+      fileUrl: `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: "Failed",
+      details: err.message
+    });
+  }
+});
 app.post("/api/uploadv", authenticateToken, async (req, res) => { try { const { title, description, tags = [], category = "general", s3Key, fileUrl, thumbnailUrl, isShort, isPublic, ageRestriction } = req.body; if (!title?.trim()) return res.status(400).json({ error: "Title required" }); if (!fileUrl || !s3Key) return res.status(400).json({ error: "Video URL required" }); const { rows } = await pool.query("INSERT INTO videos (user_id, title, description, video_url, video_s3_key, thumbnail_url, thumbnail_s3_key, tags, category, is_short, is_public, age_restriction, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'processing', NOW()) RETURNING *", [req.user.id, title.trim(), description?.trim(), fileUrl, s3Key, thumbnailUrl || null, thumbnailUrl ? s3Key.replace('videos/', 'thumbnails/') : null, JSON.stringify(tags), category, !!isShort, isPublic !== false, ageRestriction || "none"]); res.status(201).json({ success: true, video: rows[0] }); } catch (err) { console.error("Save video error:", err); res.status(500).json({ error: "Failed" }); } });
 
 app.post("/api/uploads", authenticateToken, shortsUpload.single("video"), async (req, res) => { try { if (!req.file) return res.status(400).json({ error: "Video required" }); if (!req.body.title?.trim()) return res.status(400).json({ error: "Title required" }); if (!s3) return res.status(503).json({ error: "S3 not configured" }); const ext = req.file.originalname.split(".").pop() || "mp4"; const s3Key = `shorts/${req.user.id}/${Date.now()}-${uuidv4()}.${ext}`; await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET_NAME, Key: s3Key, Body: req.file.buffer, ContentType: req.file.mimetype })); const fileUrl = AWS_CLOUDFRONT_DOMAIN ? `https://${AWS_CLOUDFRONT_DOMAIN}/${s3Key}` : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`; const { rows } = await pool.query("INSERT INTO videos (user_id, title, description, category, video_url, video_s3_key, s3_key, is_short, is_public, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, true, true, 'processing', NOW()) RETURNING *", [req.user.id, req.body.title.trim(), req.body.description?.trim() || "", req.body.category || "general", fileUrl, s3Key, s3Key]); res.status(201).json({ success: true, video: { id: rows[0].id, title: rows[0].title, fileUrl, status: "processing" } }); } catch (err) { console.error("Upload shorts error:", err); res.status(500).json({ error: "Failed" }); } });
