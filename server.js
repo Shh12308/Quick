@@ -5811,45 +5811,6 @@ app.get('/api/music/tracks', async (req, res) => {
 // MUSIC API ROUTES
 // ==========================================
 
-// GET /api/music - Get all music tracks
-app.get("/api/music", async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split(" ")[1];
-    if (!token) {
-      return res.status(401).json({ error: "No token provided" });
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-
-    // Get all public tracks or user's tracks
-    const { rows } = await pool.query(`
-      SELECT 
-        m.id,
-        m.title,
-        m.artist,
-        m.album,
-        m.genre,
-    
-        m.duration,
-        m.cover_url as cover,
-        m.thumbnail_url as thumbnail,
-        m.audio_url,
-        m.play_count,
-        m.created_at as uploadedAt,
-        u.username as uploader_username,
-        u.profile_url as uploader_avatar
-      FROM music m
-      LEFT JOIN users u ON m.user_id = u.id
-      WHERE m.is_public = true OR m.user_id = $1
-      ORDER BY m.created_at DESC
-    `, [decoded.id]);
-
-    res.json(rows);
-  } catch (err) {
-    console.error("Get music error:", err);
-    res.status(500).json({ error: "Failed to fetch music" });
-  }
-});
 
 // GET /api/music/favorites - Get user's favorites
 app.get("/api/music/favorites", async (req, res) => {
@@ -6784,12 +6745,14 @@ app.post("/api/uploadm", musicUpload.fields([
   }
 });
 
-// GET /api/music - Fetch All Music (FIXED FOR YOUR TABLE)
+// ==========================================
+// GET /api/music - Get all music tracks
+// ==========================================
 app.get("/api/music", async (req, res) => {
   try {
     let userId = null;
 
-    // Optional authentication
+    // Authentication is optional for this endpoint
     const authHeader = req.headers.authorization;
 
     if (authHeader?.startsWith("Bearer ")) {
@@ -6798,45 +6761,50 @@ app.get("/api/music", async (req, res) => {
         const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.id;
       } catch (authErr) {
-        console.warn("⚠️ Invalid music auth token:", authErr.message);
+        console.warn(
+          "⚠️ Invalid music token:",
+          authErr.message
+        );
       }
     }
 
     console.log("🎵 GET /api/music");
     console.log("🎵 User:", userId);
 
-    /*
-     * IMPORTANT:
-     * Select the columns that actually exist in your music table.
-     */
     const { rows } = await pool.query(`
       SELECT
-        id,
-        user_id,
-        title,
-        artist,
-        album,
-        genre,
-        duration,
-        file_url,
-        audio_url,
-        cover_url,
-        is_explicit,
-        explicit,
-        tags,
-        plays,
-        status,
-        created_at
-      FROM music
-      ORDER BY created_at DESC
+        m.id,
+        m.user_id,
+        m.title,
+        m.artist,
+        m.album,
+        m.genre,
+        m.duration,
+        m.file_url,
+        m.audio_url,
+        m.cover_url,
+        m.is_explicit,
+        m.explicit,
+        m.tags,
+        m.plays,
+        m.status,
+        m.created_at
+      FROM music m
+      ORDER BY m.created_at DESC
       LIMIT 500
     `);
 
-    console.log(`🎵 Database returned ${rows.length} music rows`);
+    console.log(
+      `🎵 Database returned ${rows.length} tracks`
+    );
 
     const tracks = rows.map((t) => {
-      const audioSrc = t.file_url || t.audio_url || null;
+      const audioSrc =
+        t.file_url ||
+        t.audio_url ||
+        null;
 
+      // Safely parse tags
       let parsedTags = [];
 
       try {
@@ -6847,10 +6815,10 @@ app.get("/api/music", async (req, res) => {
         } else if (t.tags) {
           parsedTags = t.tags;
         }
-      } catch (tagError) {
+      } catch (err) {
         console.warn(
-          `⚠️ Could not parse tags for track ${t.id}:`,
-          tagError.message
+          `⚠️ Failed to parse tags for track ${t.id}:`,
+          err.message
         );
 
         parsedTags = [];
@@ -6860,45 +6828,76 @@ app.get("/api/music", async (req, res) => {
         id: t.id,
         user_id: t.user_id,
 
-        title: t.title || "Untitled Track",
-        artist: t.artist || "Unknown Artist",
-        album: t.album || "",
-        genre: t.genre || "",
+        title:
+          t.title ||
+          "Untitled Track",
 
-        duration: Number(t.duration) || 0,
+        artist:
+          t.artist ||
+          "Unknown Artist",
 
-        cover: t.cover_url || null,
-        thumbnail: t.cover_url || null,
+        album:
+          t.album ||
+          "",
 
-        audio_url: audioSrc,
-        url: audioSrc,
+        genre:
+          t.genre ||
+          "",
 
-        explicit: Boolean(
-          t.is_explicit ?? t.explicit ?? false
-        ),
+        duration:
+          Number(t.duration) ||
+          0,
 
-        tags: parsedTags,
+        cover:
+          t.cover_url ||
+          null,
 
-        plays: Number(t.plays) || 0,
+        thumbnail:
+          t.cover_url ||
+          null,
 
-        status: t.status || "processing",
+        audio_url:
+          audioSrc,
 
-        createdAt: t.created_at,
+        url:
+          audioSrc,
+
+        explicit:
+          Boolean(
+            t.is_explicit ??
+            t.explicit ??
+            false
+          ),
+
+        tags:
+          parsedTags,
+
+        plays:
+          Number(t.plays) ||
+          0,
+
+        status:
+          t.status ||
+          "completed",
+
+        createdAt:
+          t.created_at,
       };
     });
 
-    console.log(`✅ Returning ${tracks.length} tracks`);
+    console.log(
+      `✅ Returning ${tracks.length} tracks`
+    );
 
     return res.status(200).json(tracks);
 
   } catch (err) {
     console.error("❌ GET /api/music FAILED");
-    console.error("❌ Error name:", err.name);
-    console.error("❌ Error message:", err.message);
-    console.error("❌ Error code:", err.code);
-    console.error("❌ Error detail:", err.detail);
-    console.error("❌ Error hint:", err.hint);
-    console.error("❌ Error stack:", err.stack);
+    console.error("Message:", err.message);
+    console.error("Code:", err.code);
+    console.error("Detail:", err.detail);
+    console.error("Hint:", err.hint);
+    console.error("Stack:", err.stack);
 
     return res.status(500).json({
       error: "Failed to fetch music",
