@@ -8334,6 +8334,88 @@ app.post("/api/settings/change-password", authMiddleware, async (req, res) => {
   }
 });
 
+// ==========================================
+// AUDIO PROXY
+// Proxies legacy music URLs through your own backend
+// ==========================================
+app.get("/api/music/:id/audio", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT file_url, audio_url
+       FROM music
+       WHERE id = $1`,
+      [req.params.id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Track not found" });
+    }
+
+    const audioUrl = rows[0].file_url || rows[0].audio_url;
+
+    if (!audioUrl) {
+      return res.status(404).json({ error: "Audio URL not found" });
+    }
+
+    console.log("🎵 Proxying audio:", audioUrl);
+
+    const upstream = await fetch(audioUrl);
+
+    if (!upstream.ok) {
+      console.error(
+        `❌ Audio upstream failed: ${upstream.status} ${upstream.statusText}`
+      );
+
+      return res.status(upstream.status).json({
+        error: "Unable to fetch audio",
+        upstreamStatus: upstream.status,
+      });
+    }
+
+    // Forward useful audio headers
+    const contentType =
+      upstream.headers.get("content-type") || "audio/mpeg";
+
+    const contentLength = upstream.headers.get("content-length");
+    const acceptRanges = upstream.headers.get("accept-ranges");
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "Range");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+
+    if (contentLength) {
+      res.setHeader("Content-Length", contentLength);
+    }
+
+    if (acceptRanges) {
+      res.setHeader("Accept-Ranges", acceptRanges);
+    } else {
+      res.setHeader("Accept-Ranges", "bytes");
+    }
+
+    // Stream audio to client
+    if (upstream.body) {
+      const { Readable } = await import("stream");
+      Readable.fromWeb(upstream.body).pipe(res);
+    } else {
+      const buffer = Buffer.from(await upstream.arrayBuffer());
+      res.end(buffer);
+    }
+
+  } catch (err) {
+    console.error("❌ Audio proxy error:", err);
+
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: "Audio proxy failed",
+        details: err.message,
+      });
+    }
+  }
+});
+
 // GET /api/settings/login-activity
 app.get("/api/settings/login-activity", authMiddleware, async (req, res) => {
   try {
