@@ -8338,78 +8338,211 @@ app.post("/api/settings/change-password", authMiddleware, async (req, res) => {
 // AUDIO PROXY
 // Proxies legacy music URLs through your own backend
 // ==========================================
-app.get("/api/music/:id/audio", async (req, res) => {
+app.get("/api/music/audio/:id", async (req, res) => {
   try {
+    const { id } = req.params;
+
     const { rows } = await pool.query(
-      `SELECT file_url, audio_url
-       FROM music
-       WHERE id = $1`,
-      [req.params.id]
+      `
+      SELECT
+        id,
+        s3_key,
+        audio_s3_key
+      FROM music
+      WHERE id = $1
+      `,
+      [id]
     );
 
     if (!rows.length) {
-      return res.status(404).json({ error: "Track not found" });
-    }
-
-    const audioUrl = rows[0].file_url || rows[0].audio_url;
-
-    if (!audioUrl) {
-      return res.status(404).json({ error: "Audio URL not found" });
-    }
-
-    console.log("🎵 Proxying audio:", audioUrl);
-
-    const upstream = await fetch(audioUrl);
-
-    if (!upstream.ok) {
-      console.error(
-        `❌ Audio upstream failed: ${upstream.status} ${upstream.statusText}`
-      );
-
-      return res.status(upstream.status).json({
-        error: "Unable to fetch audio",
-        upstreamStatus: upstream.status,
+      return res.status(404).json({
+        error: "Track not found",
       });
     }
 
-    // Forward useful audio headers
-    const contentType =
-      upstream.headers.get("content-type") || "audio/mpeg";
+    const track = rows[0];
 
-    const contentLength = upstream.headers.get("content-length");
-    const acceptRanges = upstream.headers.get("accept-ranges");
+    const key =
+      track.audio_s3_key ||
+      track.s3_key;
 
-    res.setHeader("Content-Type", contentType);
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "Range");
-    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
-
-    if (contentLength) {
-      res.setHeader("Content-Length", contentLength);
+    if (!key) {
+      return res.status(404).json({
+        error: "Audio file has no S3 key",
+      });
     }
 
-    if (acceptRanges) {
-      res.setHeader("Accept-Ranges", acceptRanges);
-    } else {
-      res.setHeader("Accept-Ranges", "bytes");
+    /*
+     * First get object metadata.
+     */
+    const headCommand = new HeadObjectCommand({
+      Bucket: S3_BUCKET_NAME,
+      Key: key,
+    });
+
+    const metadata = await s3.send(headCommand);
+
+    const fileSize = Number(metadata.ContentLength || 0);
+
+    if (!fileSize) {
+      return res.status(404).json({
+        error: "Audio file is empty",
+      });
     }
 
-    // Stream audio to client
-    if (upstream.body) {
-      const { Readable } = await import("stream");
-      Readable.fromWeb(upstream.body).pipe(res);
-    } else {
-      const buffer = Buffer.from(await upstream.arrayBuffer());
-      res.end(buffer);
+    const range = req.headers.range;
+
+    /*
+     * No Range header:
+     * return entire file.
+     */
+    if (!range) {
+      const command = new GetObjectCommand({
+        Bucket: S3_BUCKET_NAME,
+        Key: key,
+      });
+
+      const s3Response = await s3.send(command);
+
+      res.status(200);
+
+      res.setHeader(
+        "Content-Type",
+        metadata.ContentType || "audio/mpeg"
+      );
+
+      res.setHeader(
+        "Content-Length",
+        String(fileSize)
+      );
+
+      res.setHeader(
+        "Accept-Ranges",
+        "bytes"
+      );
+
+      res.setHeader(
+        "Cache-Control",
+        "public, max-age=3600"
+      );
+
+      s3Response.Body.pipe(res);
+
+      return;
     }
+
+    /*
+     * Parse Range:
+     *
+     * bytes=START-END
+     */
+    const match = range.match(
+      /bytes=(\d*)-(\d*)/
+    );
+
+    if (!match) {
+      return res.status(416).set({
+        "Content-Range": `bytes */${fileSize}`,
+      }).end();
+    }
+
+    let start = match[1]
+      ? Number(match[1])
+      : 0;
+
+    let end = match[2]
+      ? Number(match[2])
+      : fileSize - 1;
+
+    /*
+     * Handle suffix ranges:
+     * bytes=-500
+     */
+    if (!match[1] && match[2]) {
+      const suffixLength = Number(match[2]);
+
+      start = Math.max(
+        fileSize - suffixLength,
+        0
+      );
+
+      end = fileSize - 1;
+    }
+
+    if (
+      start < 0 ||
+      start >= fileSize ||
+      end < start
+    ) {
+      return res.status(416).set({
+        "Content-Range": `bytes */${fileSize}`,
+      }).end();
+    }
+
+    end = Math.min(
+      end,
+      fileSize - 1
+    );
+
+    const chunkSize =
+      end - start + 1;
+
+    console.log("🎵 Audio range:", {
+      id,
+      key,
+      start,
+      end,
+      chunkSize,
+      fileSize,
+    });
+
+    const command = new GetObjectCommand({
+      Bucket: S3_BUCKET_NAME,
+      Key: key,
+      Range: `bytes=${start}-${end}`,
+    });
+
+    const s3Response =
+      await s3.send(command);
+
+    res.status(206);
+
+    res.setHeader(
+      "Content-Type",
+      metadata.ContentType || "audio/mpeg"
+    );
+
+    res.setHeader(
+      "Content-Length",
+      String(chunkSize)
+    );
+
+    res.setHeader(
+      "Content-Range",
+      `bytes ${start}-${end}/${fileSize}`
+    );
+
+    res.setHeader(
+      "Accept-Ranges",
+      "bytes"
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "public, max-age=3600"
+    );
+
+    s3Response.Body.pipe(res);
 
   } catch (err) {
-    console.error("❌ Audio proxy error:", err);
+    console.error(
+      "❌ Audio proxy error:",
+      err
+    );
 
     if (!res.headersSent) {
       res.status(500).json({
-        error: "Audio proxy failed",
+        error: "Failed to stream audio",
         details: err.message,
       });
     }
