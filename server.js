@@ -6616,12 +6616,12 @@ app.delete('/api/settings/hidden-words/:word', authenticateToken, async (req, re
 // ==========================================
 // POST /api/uploadm - Upload Music
 // ==========================================
+// POST /api/uploadm - Upload Music (FIXED FOR YOUR TABLE)
 app.post("/api/uploadm", musicUpload.fields([
   { name: "audio", maxCount: 1 },
   { name: "cover", maxCount: 1 }
 ]), async (req, res) => {
   try {
-    // Auth check
     const authHeader = req.headers.authorization;
     if (!authHeader?.startsWith("Bearer ")) {
       return res.status(401).json({ error: "No token provided" });
@@ -6634,99 +6634,65 @@ app.post("/api/uploadm", musicUpload.fields([
       return res.status(401).json({ error: "Invalid or expired token" });
     }
 
-    // Validate files
     const audioFile = req.files?.audio?.[0];
     if (!audioFile) {
       return res.status(400).json({ error: "Audio file is required" });
     }
 
-    // Validate fields
     const { title, artist, album, genre, explicit, tags } = req.body;
     if (!title?.trim()) {
       return res.status(400).json({ error: "Title is required" });
     }
 
-    if (!s3) {
-      return res.status(500).json({ error: "Storage not configured" });
-    }
+    console.log(`🎵 Uploading: "${title}" by ${artist || "Unknown"}`);
 
-    console.log(`🎵 Uploading music: "${title}" by ${artist || 'Unknown'}`);
-
-    // ==========================================
     // Upload audio to S3
-    // ==========================================
     const audioExt = audioFile.originalname.split(".").pop()?.toLowerCase() || "mp3";
-    const audioKey = `music/${decoded.id}/${Date.now()}-${crypto.randomUUID()}.${audioExt}`;
+    const audioS3Key = `music/${decoded.id}/${Date.now()}-${crypto.randomUUID()}.${audioExt}`;
 
     await s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET_NAME,
-      Key: audioKey,
+      Key: audioS3Key,
       Body: audioFile.buffer,
       ContentType: audioFile.mimetype || "audio/mpeg",
     }));
 
-    const audioUrl = AWS_CLOUDFRONT_DOMAIN
-      ? `https://${AWS_CLOUDFRONT_DOMAIN}/${audioKey}`
-      : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${audioKey}`;
+    const fileUrl = AWS_CLOUDFRONT_DOMAIN
+      ? `https://${AWS_CLOUDFRONT_DOMAIN}/${audioS3Key}`
+      : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${audioS3Key}`;
 
-    // ==========================================
-    // Upload cover to S3 (if provided)
-    // ==========================================
+    // Upload cover if provided
     let coverUrl = null;
-    let thumbnailUrl = null;
+    let coverS3Key = null;
 
     const coverFile = req.files?.cover?.[0];
     if (coverFile) {
       try {
-        // Full-size cover
         const coverBuffer = await sharp(coverFile.buffer)
           .resize(1000, 1000, { fit: "cover" })
           .jpeg({ quality: 85 })
           .toBuffer();
 
-        const coverKey = `music/covers/${decoded.id}/${Date.now()}-${crypto.randomUUID()}.jpg`;
+        coverS3Key = `music-covers/${decoded.id}/${Date.now()}-${crypto.randomUUID()}.jpg`;
 
         await s3.send(new PutObjectCommand({
           Bucket: S3_BUCKET_NAME,
-          Key: coverKey,
+          Key: coverS3Key,
           Body: coverBuffer,
           ContentType: "image/jpeg",
         }));
 
         coverUrl = AWS_CLOUDFRONT_DOMAIN
-          ? `https://${AWS_CLOUDFRONT_DOMAIN}/${coverKey}`
-          : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${coverKey}`;
-
-        // Thumbnail
-        const thumbBuffer = await sharp(coverFile.buffer)
-          .resize(200, 200, { fit: "cover" })
-          .jpeg({ quality: 70 })
-          .toBuffer();
-
-        const thumbKey = `music/thumbnails/${decoded.id}/${Date.now()}-${crypto.randomUUID()}.jpg`;
-
-        await s3.send(new PutObjectCommand({
-          Bucket: S3_BUCKET_NAME,
-          Key: thumbKey,
-          Body: thumbBuffer,
-          ContentType: "image/jpeg",
-        }));
-
-        thumbnailUrl = AWS_CLOUDFRONT_DOMAIN
-          ? `https://${AWS_CLOUDFRONT_DOMAIN}/${thumbKey}`
-          : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${thumbKey}`;
+          ? `https://${AWS_CLOUDFRONT_DOMAIN}/${coverS3Key}`
+          : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${coverS3Key}`;
       } catch (err) {
         console.error("Cover upload failed:", err.message);
-        // Don't fail entire upload
       }
     }
 
-    // ==========================================
-    // Get audio duration
-    // ==========================================
+    // Get duration
     let duration = 0;
     try {
-      const os = await import("os");
       const tempPath = path.join(os.tmpdir(), `audio-${Date.now()}.${audioExt}`);
       fs.writeFileSync(tempPath, audioFile.buffer);
 
@@ -6737,12 +6703,10 @@ app.post("/api/uploadm", musicUpload.fields([
         });
       });
     } catch (err) {
-      console.error("Duration extraction failed:", err.message);
+      console.error("Duration error:", err.message);
     }
 
-    // ==========================================
     // Parse tags
-    // ==========================================
     let parsedTags = [];
     try {
       if (tags) {
@@ -6753,31 +6717,37 @@ app.post("/api/uploadm", musicUpload.fields([
       parsedTags = [];
     }
 
-    // ==========================================
-    // Save to database
-    // ==========================================
+    // Save to database - MATCHING YOUR EXACT TABLE SCHEMA
     const { rows } = await pool.query(
       `INSERT INTO music (
-        user_id, title, artist, album, genre, duration,
-        audio_url, cover_url, thumbnail_url,
-        is_explicit, tags, is_public, play_count,
-        created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
+        user_id, title, artist, album, genre,
+        is_explicit, explicit,
+        audio_url, file_url, s3_key, audio_s3_key,
+        cover_url, cover_s3_key, cover_key,
+        duration, tags, plays, listens, likes, status, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, NOW())
       RETURNING *`,
       [
         decoded.id,
         title.trim(),
         artist?.trim() || decoded.username || "Unknown Artist",
-        album?.trim() || null,
-        genre?.trim()?.toLowerCase() || null,
-        duration,
-        audioUrl,
-        coverUrl,
-        thumbnailUrl,
+        album?.trim() || "",
+        genre?.trim()?.toLowerCase() || "",
         explicit === "true" || explicit === true,
+        explicit === "true" || explicit === true,
+        null,                           // audio_url (keep null, use file_url)
+        fileUrl,                       // file_url (primary audio URL)
+        audioS3Key,                    // s3_key
+        audioS3Key,                    // audio_s3_key
+        coverUrl,                      // cover_url
+        coverS3Key,                    // cover_s3_key
+        coverS3Key,                    // cover_key
+        duration,
         JSON.stringify(parsedTags),
-        true,
-        0,
+        0,                             // plays
+        0,                             // listens
+        0,                             // likes
+        "completed",                   // status
       ]
     );
 
@@ -6786,10 +6756,8 @@ app.post("/api/uploadm", musicUpload.fields([
     }
 
     const saved = rows[0];
+    console.log(`✅ Saved: ID=${saved.id}, "${saved.title}" (${duration}s)`);
 
-    console.log(`✅ Music saved: ID=${saved.id}, "${saved.title}" (${duration}s)`);
-
-    // Return formatted track
     res.status(201).json({
       success: true,
       track: {
@@ -6800,26 +6768,23 @@ app.post("/api/uploadm", musicUpload.fields([
         genre: saved.genre,
         duration: saved.duration,
         cover: saved.cover_url,
-        thumbnail: saved.thumbnail_url,
-        audio_url: saved.audio_url,
-        url: saved.audio_url,
-        explicit: saved.is_explicit,
+        thumbnail: saved.cover_url,
+        audio_url: saved.file_url || saved.audio_url,
+        url: saved.file_url || saved.audio_url,
+        explicit: saved.is_explicit || saved.explicit,
         tags: saved.tags,
-        plays: saved.play_count,
+        plays: saved.plays,
         createdAt: saved.created_at,
       },
     });
 
   } catch (err) {
     console.error("Music upload error:", err);
-    res.status(500).json({ error: "Upload failed. Please try again." });
+    res.status(500).json({ error: "Upload failed: " + err.message });
   }
 });
 
-// ==========================================
-// GET /api/music - Fetch All Music
-// ==========================================
-// GET /api/music - Fetch All Music
+// GET /api/music - Fetch All Music (FIXED FOR YOUR TABLE)
 app.get("/api/music", async (req, res) => {
   try {
     let userId = null;
@@ -6833,59 +6798,63 @@ app.get("/api/music", async (req, res) => {
 
     const { rows } = await pool.query(`
       SELECT 
-        m.id,
-        m.title,
-        m.artist,
-        m.album,
-        m.genre,
-        m.duration,
-        m.audio_url,
-        m.cover_url as cover,
-        m.thumbnail_url as thumbnail,
-        m.is_explicit as explicit,
-        m.tags,
-        m.play_count as plays,
-        m.created_at as createdAt
-      FROM music m
-      WHERE m.is_public = true ${userId ? `OR m.user_id = ${parseInt(userId)}` : ''}
-      ORDER BY m.created_at DESC
+        id,
+        user_id,
+        title,
+        artist,
+        album,
+        genre,
+        duration,
+        file_url,
+        audio_url,
+        cover_url,
+        is_explicit,
+        explicit,
+        tags,
+        plays,
+        status,
+        created_at
+      FROM music
+      ORDER BY created_at DESC
       LIMIT 500
     `);
 
-    const tracks = rows.map(t => ({
-      id: t.id,
-      title: t.title,
-      artist: t.artist,
-      album: t.album,
-      genre: t.genre,
-      duration: t.duration,
-      cover: t.cover,
-      thumbnail: t.thumbnail,
-      audio_url: t.audio_url,
-      url: t.audio_url,
-      explicit: t.explicit,
-      tags: typeof t.tags === "string" ? JSON.parse(t.tags || "[]") : (t.tags || []),
-      plays: parseInt(t.plays) || 0,
-      createdAt: t.createdat,
-    }));
+    const tracks = rows.map(t => {
+      // Use file_url as primary, fallback to audio_url
+      const audioSrc = t.file_url || t.audio_url;
+      
+      return {
+        id: t.id,
+        title: t.title,
+        artist: t.artist,
+        album: t.album || "",
+        genre: t.genre || "",
+        duration: t.duration || 0,
+        cover: t.cover_url || null,
+        thumbnail: t.cover_url || null,
+        audio_url: audioSrc,
+        url: audioSrc,
+        explicit: t.is_explicit || t.explicit || false,
+        tags: typeof t.tags === "string" ? JSON.parse(t.tags || "[]") : (t.tags || []),
+        plays: parseInt(t.plays) || 0,
+        status: t.status,
+        createdAt: t.created_at,
+      };
+    });
 
     console.log(`🎵 Returning ${tracks.length} tracks`);
     res.json(tracks);
 
   } catch (err) {
     console.error("❌ Fetch music error:", err.message);
-    console.error("❌ Full error:", err);
     res.status(500).json({ 
       error: "Failed to fetch music",
-      details: err.message,  // This will tell you exactly what's wrong
-      hint: err.message.includes("relation") ? "Table does not exist - run the SQL migration" : null
+      details: err.message
     });
   }
 });
 
-// ==========================================
-// GET /api/music/:id - Get Single Track
-// ==========================================
+// GET /api/music/:id - Single Track (FIXED)
 app.get("/api/music/:id", async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -6897,33 +6866,36 @@ app.get("/api/music/:id", async (req, res) => {
       return res.status(404).json({ error: "Track not found" });
     }
 
-    // Increment play count
+    const t = rows[0];
+    const audioSrc = t.file_url || t.audio_url;
+
+    // Increment plays
     await pool.query(
-      "UPDATE music SET play_count = play_count + 1 WHERE id = $1",
+      "UPDATE music SET plays = COALESCE(plays, 0) + 1 WHERE id = $1",
       [req.params.id]
     );
 
-    const t = rows[0];
     res.json({
       id: t.id,
       title: t.title,
       artist: t.artist,
-      album: t.album,
-      genre: t.genre,
-      duration: t.duration,
-      cover: t.cover_url,
-      thumbnail: t.thumbnail_url,
-      audio_url: t.audio_url,
-      url: t.audio_url,
-      explicit: t.is_explicit,
-      tags: typeof t.tags === 'string' ? JSON.parse(t.tags || '[]') : (t.tags || []),
-      plays: t.play_count,
+      album: t.album || "",
+      genre: t.genre || "",
+      duration: t.duration || 0,
+      cover: t.cover_url || null,
+      thumbnail: t.cover_url || null,
+      audio_url: audioSrc,
+      url: audioSrc,
+      explicit: t.is_explicit || t.explicit || false,
+      tags: typeof t.tags === "string" ? JSON.parse(t.tags || "[]") : (t.tags || []),
+      plays: parseInt(t.plays) || 0,
+      status: t.status,
       createdAt: t.created_at,
     });
 
   } catch (err) {
-    console.error("Get track error:", err);
-    res.status(500).json({ error: "Failed to fetch track" });
+    console.error("Get track error:", err.message);
+    res.status(500).json({ error: "Failed to fetch track", details: err.message });
   }
 });
 
