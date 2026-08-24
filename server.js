@@ -7843,27 +7843,7 @@ app.delete("/api/music/favorites/:trackId", async (req, res) => {
   }
 });
 
-// ==========================================
-// MULTER FOR MUSIC UPLOADS
-// ==========================================
 
-const musicUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 100 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const ext = file.originalname.split(".").pop()?.toLowerCase();
-    const allowed = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "oga", "opus", "webm"];
-    if (allowed.includes(ext)) {
-      cb(null, true);
-    } else {
-      cb(new Error("Invalid audio format"));
-    }
-  },
-});
-
-if (ffmpegPath) {
-  ffmpeg.setFfmpegPath(ffmpegPath);
-}
 
 // ==========================================
 // MUSIC UPLOAD - REQUIRES AUTH
