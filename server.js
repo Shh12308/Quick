@@ -6788,16 +6788,29 @@ app.post("/api/uploadm", musicUpload.fields([
 app.get("/api/music", async (req, res) => {
   try {
     let userId = null;
+
+    // Optional authentication
     const authHeader = req.headers.authorization;
+
     if (authHeader?.startsWith("Bearer ")) {
       try {
-        const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.id;
-      } catch (err) {}
+      } catch (authErr) {
+        console.warn("⚠️ Invalid music auth token:", authErr.message);
+      }
     }
 
+    console.log("🎵 GET /api/music");
+    console.log("🎵 User:", userId);
+
+    /*
+     * IMPORTANT:
+     * Select the columns that actually exist in your music table.
+     */
     const { rows } = await pool.query(`
-      SELECT 
+      SELECT
         id,
         user_id,
         title,
@@ -6819,37 +6832,78 @@ app.get("/api/music", async (req, res) => {
       LIMIT 500
     `);
 
-    const tracks = rows.map(t => {
-      // Use file_url as primary, fallback to audio_url
-      const audioSrc = t.file_url || t.audio_url;
-      
+    console.log(`🎵 Database returned ${rows.length} music rows`);
+
+    const tracks = rows.map((t) => {
+      const audioSrc = t.file_url || t.audio_url || null;
+
+      let parsedTags = [];
+
+      try {
+        if (Array.isArray(t.tags)) {
+          parsedTags = t.tags;
+        } else if (typeof t.tags === "string") {
+          parsedTags = JSON.parse(t.tags || "[]");
+        } else if (t.tags) {
+          parsedTags = t.tags;
+        }
+      } catch (tagError) {
+        console.warn(
+          `⚠️ Could not parse tags for track ${t.id}:`,
+          tagError.message
+        );
+
+        parsedTags = [];
+      }
+
       return {
         id: t.id,
-        title: t.title,
-        artist: t.artist,
+        user_id: t.user_id,
+
+        title: t.title || "Untitled Track",
+        artist: t.artist || "Unknown Artist",
         album: t.album || "",
         genre: t.genre || "",
-        duration: t.duration || 0,
+
+        duration: Number(t.duration) || 0,
+
         cover: t.cover_url || null,
         thumbnail: t.cover_url || null,
+
         audio_url: audioSrc,
         url: audioSrc,
-        explicit: t.is_explicit || t.explicit || false,
-        tags: typeof t.tags === "string" ? JSON.parse(t.tags || "[]") : (t.tags || []),
-        plays: parseInt(t.plays) || 0,
-        status: t.status,
+
+        explicit: Boolean(
+          t.is_explicit ?? t.explicit ?? false
+        ),
+
+        tags: parsedTags,
+
+        plays: Number(t.plays) || 0,
+
+        status: t.status || "processing",
+
         createdAt: t.created_at,
       };
     });
 
-    console.log(`🎵 Returning ${tracks.length} tracks`);
-    res.json(tracks);
+    console.log(`✅ Returning ${tracks.length} tracks`);
+
+    return res.status(200).json(tracks);
 
   } catch (err) {
-    console.error("❌ Fetch music error:", err.message);
-    res.status(500).json({ 
+    console.error("❌ GET /api/music FAILED");
+    console.error("❌ Error name:", err.name);
+    console.error("❌ Error message:", err.message);
+    console.error("❌ Error code:", err.code);
+    console.error("❌ Error detail:", err.detail);
+    console.error("❌ Error hint:", err.hint);
+    console.error("❌ Error stack:", err.stack);
+
+    return res.status(500).json({
       error: "Failed to fetch music",
-      details: err.message
+      details: err.message,
+      code: err.code || null,
     });
   }
 });
