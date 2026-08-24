@@ -5829,7 +5829,7 @@ app.get("/api/music", async (req, res) => {
         m.artist,
         m.album,
         m.genre,
-        m.year,
+    
         m.duration,
         m.cover_url as cover,
         m.thumbnail_url as thumbnail,
