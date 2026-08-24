@@ -516,7 +516,7 @@ io.on("connection", (socket) => {
 // Channel points helpers
 async function getUserChannelPoints(userId) { try { const { rows } = await pool.query("SELECT points FROM channel_points WHERE user_id = $1", [userId]); return rows.length ? rows[0].points : 0; } catch (e) { return 0; } }
 async function updateChannelPoints(userId, amount, source = 'other') { try { const { rows } = await pool.query("INSERT INTO channel_points (user_id, points, updated_at) VALUES ($1, GREATEST(0, $2), NOW()) ON CONFLICT (user_id) DO UPDATE SET points = GREATEST(0, channel_points.points + $2), updated_at = NOW() RETURNING points", [userId, amount]); io.to(`user-${userId}`).emit("points-updated", { points: rows[0].points, change: amount, source }); return rows[0].points; } catch (e) { return 0; } }
-async function awardChannelPoints(userId, amount, source = 'watching') { try { const rateLimitKey = `points-ratelimit:${userId}:${source}`; const current = await redisGet(rateLimitKey) || 0; if (current + amount > 100) return; await updateChannelPoints(userId, amount, source); await redisSet(rateLimitKey, current + amount, 600); } catch (e) {} } }
+async function awardChannelPoints(userId, amount, source = 'watching') { try { const rateLimitKey = `points-ratelimit:${userId}:${source}`; const current = await redisGet(rateLimitKey) || 0; if (current + amount > 100) return; await updateChannelPoints(userId, amount, source); await redisSet(rateLimitKey, current + amount, 600); } catch (e) {} } 
 async function checkHypeTrain(streamId, userId, username, amount) { /* same implementation */ }
 
 // Passive points cron
