@@ -352,62 +352,31 @@ io.use(async (socket, next) => {
 // ==========================================
 io.on("connection", (socket) => {
   console.log(`Socket: ${socket.id} (User: ${socket.userId})`);
-  
-  // Join personal room
+
+  // Personal room
   socket.join(`user-${socket.userId}`);
-  
-  // Track active calls for this user (in memory state for busy check)
+
+  // Per-socket state
   socket.currentCall = null;
-  // Track current stream for this user
   socket.currentStream = null;
 
   // ============================================================
-  // CHAT EVENTS (Existing - DM Chat)
-  // ============================================================
-  
-  socket.on("join-chat", async (chatId) => {
-    try {
-      const { rows } = await pool.query(
-        "SELECT 1 FROM chats WHERE id = $1 AND $2 = ANY(participants)", 
-        [chatId, socket.userId]
-      );
-      
-      if (rows.length > 0) {
-        socket.join(`chat-${chatId}`);
-        console.log(`User ${socket.userId} joined chat ${chatId}`);
-      } else {
-        console.warn(`Unauthorized join attempt by ${socket.userId} for chat ${chatId}`);
-        socket.emit("error", { message: "Unauthorized to join this chat" });
-      }
-    } catch (err) {
-      console.error("Join chat error:", err);
-    }
-  });
-
-  socket.on("typing-start", (data) => {
-    socket.to(`chat-${data.chatId}`).emit("user-typing", { userId: socket.userId });
-  });
-
-  socket.on("typing-stop", (data) => {
-    socket.to(`chat-${data.chatId}`).emit("user-stopped-typing", { userId: socket.userId });
-  });
-
-  // ============================================================
-  // CALL SIGNALING EVENTS (Existing)
+  // CALL SIGNALING
   // ============================================================
 
   socket.on("call-user", async (data) => {
     const { receiverId, callId, channelName } = data;
-    
-    const receiverSocket = Array.from(io.sockets.sockets.values()).find(s => s.userId === receiverId && s.currentCall);
-    
+
+    const receiverSocket = Array.from(io.sockets.sockets.values())
+      .find(s => s.userId === receiverId && s.currentCall);
+
     if (receiverSocket) {
       socket.emit("call-busy", { receiverId, callId });
       return;
     }
 
-    io.to(`user-${receiverId}`).emit("incoming-call", { 
-      from: socket.userId, 
+    io.to(`user-${receiverId}`).emit("incoming-call", {
+      from: socket.userId,
       callId,
       channel: channelName,
       callerName: socket.username || "User"
@@ -415,83 +384,144 @@ io.on("connection", (socket) => {
   });
 
   socket.on("answer-call", async (data) => {
-    const { callId, callerId } = data;
-    
-    socket.currentCall = callId;
-    
-    io.to(`user-${callerId}`).emit("call-answered", { 
-      callId, 
-      answererId: socket.userId 
-    });
-    
-    await pool.query("UPDATE calls SET status = 'active' WHERE id = $1", [callId]);
+    try {
+      const { callId, callerId } = data;
+
+      socket.currentCall = callId;
+
+      io.to(`user-${callerId}`).emit("call-answered", {
+        callId,
+        answererId: socket.userId
+      });
+
+      await pool.query(
+        "UPDATE calls SET status = 'active' WHERE id = $1",
+        [callId]
+      );
+    } catch (err) {
+      console.error("Answer call error:", err);
+    }
   });
 
   socket.on("reject-call", async (data) => {
-    const { callId, callerId } = data;
-    
-    io.to(`user-${callerId}`).emit("call-rejected", { 
-      callId, 
-      reason: "User rejected the call" 
-    });
-    
-    await pool.query("UPDATE calls SET status = 'rejected', ended_at = NOW() WHERE id = $1", [callId]);
+    try {
+      const { callId, callerId } = data;
+
+      io.to(`user-${callerId}`).emit("call-rejected", {
+        callId,
+        reason: "User rejected the call"
+      });
+
+      await pool.query(
+        "UPDATE calls SET status = 'rejected', ended_at = NOW() WHERE id = $1",
+        [callId]
+      );
+    } catch (err) {
+      console.error("Reject call error:", err);
+    }
   });
 
   socket.on("end-call", async (data) => {
-    const { callId, otherUserId } = data;
-    
-    socket.currentCall = null;
-    
-    io.to(`user-${otherUserId}`).emit("call-ended", { callId });
-    
-    await pool.query("UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = $1", [callId]);
+    try {
+      const { callId, otherUserId } = data;
+
+      socket.currentCall = null;
+
+      io.to(`user-${otherUserId}`).emit("call-ended", {
+        callId
+      });
+
+      await pool.query(
+        "UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = $1",
+        [callId]
+      );
+    } catch (err) {
+      console.error("End call error:", err);
+    }
   });
 
   // ============================================================
-  // LIVESTREAM CHAT EVENTS (New)
+  // LIVESTREAM CHAT
   // ============================================================
 
   socket.on("join-stream", async (streamId) => {
     try {
-      // Verify stream exists and is live
       const { rows } = await pool.query(
-        "SELECT id, stream_key FROM livestreams WHERE (id = $1 OR stream_key = $1) AND is_live = true",
+        `SELECT id, stream_key
+         FROM livestreams
+         WHERE (id = $1 OR stream_key = $1)
+         AND is_live = true`,
         [streamId]
       );
 
-      if (rows.length === 0) {
-        socket.emit("stream-error", { message: "Stream not found or not live" });
+      if (!rows.length) {
+        socket.emit("stream-error", {
+          message: "Stream not found or not live"
+        });
         return;
       }
 
       const stream = rows[0];
       const actualStreamId = stream.id;
       const streamRoom = `stream-${actualStreamId}`;
-      
+
+      // If already in another stream, clean it up first
+      if (
+        socket.currentStream &&
+        socket.currentStream !== actualStreamId
+      ) {
+        await redisClient?.sRem(
+          `stream-viewers:${socket.currentStream}`,
+          socket.userId.toString()
+        );
+
+        socket.leave(`stream-${socket.currentStream}`);
+      }
+
       socket.join(streamRoom);
       socket.currentStream = actualStreamId;
 
-      // Add to viewers set in Redis
-      await redisSAdd(`stream-viewers:${actualStreamId}`, socket.userId);
-      
-      // Update viewer count
-      const viewerCount = await redisClient?.scard(`stream-viewers:${actualStreamId}`) || 0;
+      await redisSAdd(
+        `stream-viewers:${actualStreamId}`,
+        socket.userId
+      );
+
+      const viewerCount =
+        await redisClient?.scard(
+          `stream-viewers:${actualStreamId}`
+        ) || 0;
+
       await pool.query(
-        "UPDATE livestreams SET viewers = $1, peak_viewers = GREATEST(peak_viewers, $1) WHERE id = $2",
+        `UPDATE livestreams
+         SET viewers = $1,
+             peak_viewers = GREATEST(peak_viewers, $1)
+         WHERE id = $2`,
         [viewerCount, actualStreamId]
       );
 
-      // Emit updated viewer count to all in stream
-      io.to(streamRoom).emit("viewer-count", viewerCount);
+      io.to(streamRoom).emit(
+        "viewer-count",
+        viewerCount
+      );
 
-      // Send chat mode settings to the joining user
-      const chatMode = await redisHGetAll(`chat-mode:${actualStreamId}`);
-      if (chatMode && chatMode.mode && chatMode.mode !== 'normal') {
-        socket.emit("chat-mode-updated", chatMode);
+      const chatMode = await redisGet(
+        `chat-mode:${actualStreamId}`
+      );
+
+      if (
+        chatMode &&
+        chatMode.mode &&
+        chatMode.mode !== "normal"
+      ) {
+        socket.emit(
+          "chat-mode-updated",
+          chatMode
+        );
       }
 
-      console.log(`User ${socket.userId} joined stream ${actualStreamId}`);
+      console.log(
+        `User ${socket.userId} joined stream ${actualStreamId}`
+      );
     } catch (err) {
       console.error("Join stream error:", err);
     }
@@ -499,27 +529,43 @@ io.on("connection", (socket) => {
 
   socket.on("leave-stream", async (streamId) => {
     try {
-      const actualStreamId = socket.currentStream || streamId;
+      const actualStreamId =
+        socket.currentStream || streamId;
+
       if (!actualStreamId) return;
 
-      const streamRoom = `stream-${actualStreamId}`;
+      const streamRoom =
+        `stream-${actualStreamId}`;
+
       socket.leave(streamRoom);
 
-      // Remove from viewers set
       if (redisClient) {
-        await redisClient.sRem(`stream-viewers:${actualStreamId}`, socket.userId.toString());
-        const viewerCount = await redisClient.scard(`stream-viewers:${actualStreamId}`);
-        
+        await redisClient.sRem(
+          `stream-viewers:${actualStreamId}`,
+          socket.userId.toString()
+        );
+
+        const viewerCount =
+          await redisClient.scard(
+            `stream-viewers:${actualStreamId}`
+          );
+
         await pool.query(
           "UPDATE livestreams SET viewers = $1 WHERE id = $2",
           [viewerCount, actualStreamId]
         );
 
-        io.to(streamRoom).emit("viewer-count", viewerCount);
+        io.to(streamRoom).emit(
+          "viewer-count",
+          viewerCount
+        );
       }
 
       socket.currentStream = null;
-      console.log(`User ${socket.userId} left stream ${actualStreamId}`);
+
+      console.log(
+        `User ${socket.userId} left stream ${actualStreamId}`
+      );
     } catch (err) {
       console.error("Leave stream error:", err);
     }
@@ -527,104 +573,210 @@ io.on("connection", (socket) => {
 
   socket.on("stream-chat-message", async (data) => {
     try {
-      const { streamId, text } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!text || !text.trim() || !actualStreamId) return;
-      if (text.length > 500) {
-        socket.emit("chat-error", { message: "Message too long (max 500 chars)" });
+      const {
+        streamId,
+        text
+      } = data;
+
+      const actualStreamId =
+        socket.currentStream || streamId;
+
+      if (
+        !actualStreamId ||
+        !text ||
+        !text.trim()
+      ) {
         return;
       }
 
-      // Check chat mode restrictions
-      const chatMode = await redisHGetAll(`chat-mode:${actualStreamId}`);
-      
+      if (text.length > 500) {
+        socket.emit("chat-error", {
+          message: "Message too long (max 500 chars)"
+        });
+        return;
+      }
+
+      const chatMode =
+        await redisGet(
+          `chat-mode:${actualStreamId}`
+        ) || {
+          mode: "normal",
+          blockedWords: []
+        };
+
+      // Slow mode
       if (chatMode.mode === "slow") {
-        const lastMsgTime = await redisGet(`last-stream-msg:${socket.userId}:${actualStreamId}`);
-        const interval = parseInt(chatMode.interval) || 10;
-        if (lastMsgTime && Date.now() - lastMsgTime < interval * 1000) {
-          socket.emit("chat-error", { message: `Slow mode: wait ${interval}s between messages` });
+        const lastMsgTime =
+          await redisGet(
+            `last-stream-msg:${socket.userId}:${actualStreamId}`
+          );
+
+        const interval =
+          parseInt(chatMode.interval) || 10;
+
+        if (
+          lastMsgTime &&
+          Date.now() - lastMsgTime <
+            interval * 1000
+        ) {
+          socket.emit("chat-error", {
+            message:
+              `Slow mode: wait ${interval}s between messages`
+          });
           return;
         }
       }
-      
-      if (chatMode.mode === "followers_only") {
-        const streamData = await pool.query(
-          "SELECT user_id FROM livestreams WHERE id = $1",
-          [actualStreamId]
-        );
-        if (streamData.rows.length) {
-          const streamerId = streamData.rows[0].user_id;
-          if (socket.userId !== streamerId) {
-            const followCheck = await pool.query(
-              "SELECT created_at FROM follows WHERE follower_id = $1 AND following_id = $2",
-              [socket.userId, streamerId]
+
+      // Followers only
+      if (
+        chatMode.mode === "followers_only"
+      ) {
+        const streamData =
+          await pool.query(
+            "SELECT user_id FROM livestreams WHERE id = $1",
+            [actualStreamId]
+          );
+
+        if (
+          streamData.rows.length &&
+          socket.userId !==
+            streamData.rows[0].user_id
+        ) {
+          const followCheck =
+            await pool.query(
+              `SELECT created_at
+               FROM follows
+               WHERE follower_id = $1
+               AND following_id = $2`,
+              [
+                socket.userId,
+                streamData.rows[0].user_id
+              ]
             );
-            if (!followCheck.rows.length) {
-              socket.emit("chat-error", { message: "Followers only chat" });
+
+          if (!followCheck.rows.length) {
+            socket.emit("chat-error", {
+              message: "Followers only chat"
+            });
+            return;
+          }
+
+          const minDays =
+            parseInt(chatMode.minDays) || 0;
+
+          if (minDays > 0) {
+            const followDate =
+              new Date(
+                followCheck.rows[0].created_at
+              );
+
+            const minDate =
+              new Date(
+                Date.now() -
+                minDays *
+                24 *
+                60 *
+                60 *
+                1000
+              );
+
+            if (followDate > minDate) {
+              socket.emit("chat-error", {
+                message:
+                  `Must follow for ${minDays}+ days to chat`
+              });
               return;
             }
-            const minDays = parseInt(chatMode.minDays) || 0;
-            if (minDays > 0) {
-              const followDate = new Date(followCheck.rows[0].created_at);
-              const minDate = new Date(Date.now() - minDays * 24 * 60 * 60 * 1000);
-              if (followDate > minDate) {
-                socket.emit("chat-error", { message: `Must follow for ${minDays}+ days to chat` });
-                return;
-              }
-            }
           }
         }
       }
-      
-      if (chatMode.mode === "subscribers_only") {
-        const streamData = await pool.query(
-          "SELECT user_id FROM livestreams WHERE id = $1",
-          [actualStreamId]
-        );
-        if (streamData.rows.length && socket.userId !== streamData.rows[0].user_id) {
-          const subCheck = await pool.query(
-            "SELECT 1 FROM user_subscriptions WHERE user_id = $1 AND status = 'active'",
-            [socket.userId]
+
+      // Subscribers only
+      if (
+        chatMode.mode ===
+        "subscribers_only"
+      ) {
+        const streamData =
+          await pool.query(
+            "SELECT user_id FROM livestreams WHERE id = $1",
+            [actualStreamId]
           );
+
+        if (
+          streamData.rows.length &&
+          socket.userId !==
+            streamData.rows[0].user_id
+        ) {
+          const subCheck =
+            await pool.query(
+              `SELECT 1
+               FROM user_subscriptions
+               WHERE user_id = $1
+               AND status = 'active'`,
+              [socket.userId]
+            );
+
           if (!subCheck.rows.length) {
-            socket.emit("chat-error", { message: "Subscribers only chat" });
+            socket.emit("chat-error", {
+              message:
+                "Subscribers only chat"
+            });
             return;
           }
         }
       }
 
-      if (chatMode.mode === "emote_only") {
-        // Check if message contains only emotes (simple check - in production, use emote detection)
-        const emoteRegex = /^[\p{Emoji}\s]+$/u;
+      // Emote only
+      if (
+        chatMode.mode === "emote_only"
+      ) {
+        const emoteRegex =
+          /^[\p{Emoji}\s]+$/u;
+
         if (!emoteRegex.test(text)) {
-          socket.emit("chat-error", { message: "Emotes only in this chat" });
+          socket.emit("chat-error", {
+            message:
+              "Emotes only in this chat"
+          });
           return;
         }
       }
 
-      // Check blocked words
-      if (chatMode.blockedWords) {
-        const blockedWords = Array.isArray(chatMode.blockedWords) ? chatMode.blockedWords : JSON.parse(chatMode.blockedWords || '[]');
-        const lowerText = text.toLowerCase();
-        for (const word of blockedWords) {
-          if (lowerText.includes(word.toLowerCase())) {
-            socket.emit("chat-error", { message: "Message contains blocked word" });
-            return;
-          }
+      // Blocked words
+      const blockedWords =
+        Array.isArray(chatMode.blockedWords)
+          ? chatMode.blockedWords
+          : [];
+
+      const lowerText =
+        text.toLowerCase();
+
+      for (const word of blockedWords) {
+        if (
+          lowerText.includes(
+            String(word).toLowerCase()
+          )
+        ) {
+          socket.emit("chat-error", {
+            message:
+              "Message contains blocked word"
+          });
+          return;
         }
       }
 
-      // Get user info
-      const { rows: userRows } = await pool.query(
-        "SELECT username, profile_url, role FROM users WHERE id = $1",
-        [socket.userId]
-      );
-      
+      const { rows: userRows } =
+        await pool.query(
+          `SELECT username, profile_url, role
+           FROM users
+           WHERE id = $1`,
+          [socket.userId]
+        );
+
       if (!userRows.length) return;
+
       const user = userRows[0];
 
-      // Build message object
       const message = {
         id: uuidv4(),
         userId: socket.userId,
@@ -636,1055 +788,487 @@ io.on("connection", (socket) => {
         timestamp: Date.now()
       };
 
-      // Update last message time for slow mode
-      await redisSet(`last-stream-msg:${socket.userId}:${actualStreamId}`, Date.now(), 300);
+      await redisSet(
+        `last-stream-msg:${socket.userId}:${actualStreamId}`,
+        Date.now(),
+        300
+      );
 
-      // Emit to all viewers in stream
-      io.to(`stream-${actualStreamId}`).emit("chat-message", message);
+      io.to(
+        `stream-${actualStreamId}`
+      ).emit(
+        "chat-message",
+        message
+      );
 
-      // Award channel points for chatting
-      await awardChannelPoints(socket.userId, 5, "chat");
-
+      await awardChannelPoints(
+        socket.userId,
+        5,
+        "chat"
+      );
     } catch (err) {
-      console.error("Stream chat message error:", err);
+      console.error(
+        "Stream chat message error:",
+        err
+      );
     }
   });
 
   // ============================================================
-  // SUPER CHAT EVENTS
+  // DM CHAT — ONLY ONE COPY
   // ============================================================
 
-  socket.on("super-chat", async (data) => {
-    try {
-      const { streamId, amount, message } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!amount || !message || !actualStreamId) return;
-      if (amount < 1) {
-        socket.emit("super-chat-error", { message: "Minimum $1" });
-        return;
-      }
-
-      // Check user balance
-      const { rows: userRows } = await pool.query(
-        "SELECT balance, username, profile_url FROM users WHERE id = $1",
-        [socket.userId]
-      );
-      
-      if (!userRows.length || userRows[0].balance < amount) {
-        socket.emit("super-chat-error", { message: "Insufficient balance" });
-        return;
-      }
-
-      // Deduct balance and add to streamer earnings
-      await pool.query("BEGIN");
-      
-      await pool.query(
-        "UPDATE users SET balance = balance - $1 WHERE id = $2",
-        [amount, socket.userId]
-      );
-
-      const streamData = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
-      );
-
-      if (streamData.rows.length) {
-        await pool.query(
-          "UPDATE users SET earnings = earnings + $1 WHERE id = $2",
-          [amount * 0.7, streamData.rows[0].user_id] // 70% to creator
-        );
-        await pool.query(
-          "UPDATE livestreams SET earnings = earnings + $1 WHERE id = $2",
-          [amount, actualStreamId]
-        );
-      }
-
-      // Record transaction
-      await pool.query(
-        "INSERT INTO transactions (user_id, amount, status, type, created_at) VALUES ($1, $2, 'succeeded', 'super_chat', NOW())",
-        [socket.userId, amount]
-      );
-
-      // Record super chat
-      const { rows: scRows } = await pool.query(
-        "INSERT INTO super_chats (stream_id, user_id, amount, message, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING *",
-        [actualStreamId, socket.userId, amount, message]
-      );
-
-      await pool.query("COMMIT");
-
-      // Build super chat message
-      const superChatMsg = {
-        id: scRows[0].id,
-        userId: socket.userId,
-        username: userRows[0].username,
-        avatar: userRows[0].profile_url,
-        amount: parseFloat(amount),
-        message: message.trim(),
-        timestamp: Date.now(),
-        type: "super_chat"
-      };
-
-      // Emit to all viewers
-      io.to(`stream-${actualStreamId}`).emit("super-chat", superChatMsg);
-
-      // Notify streamer
-      io.to(`user-${streamData.rows[0]?.user_id}`).emit("super-chat-received", {
-        username: userRows[0].username,
-        amount,
-        message: message.trim()
-      });
-
-      // Trigger hype train check
-      await checkHypeTrain(actualStreamId, socket.userId, userRows[0].username, amount);
-
-    } catch (err) {
-      console.error("Super chat error:", err);
-      await pool.query("ROLLBACK").catch(() => {});
-      socket.emit("super-chat-error", { message: "Failed to send super chat" });
-    }
-  });
-
-  // ============================================================
-  // GIFT EVENTS
-  // ============================================================
-
-  socket.on("send-gift", async (data) => {
-    try {
-      const { streamId, giftId, amount } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId || !amount) return;
-
-      // Check user balance
-      const { rows: userRows } = await pool.query(
-        "SELECT balance, username FROM users WHERE id = $1",
-        [socket.userId]
-      );
-      
-      if (!userRows.length || userRows[0].balance < amount) {
-        socket.emit("gift-error", { message: "Insufficient balance" });
-        return;
-      }
-
-      // Get gift info
-      const gifts = [
-        { id: 1, name: "Rose", icon: "🌹" },
-        { id: 2, name: "Heart", icon: "❤️" },
-        { id: 3, name: "Rocket", icon: "🚀" },
-        { id: 4, name: "Diamond", icon: "💎" },
-        { id: 5, name: "Universe", icon: "🪐" },
-      ];
-      const gift = gifts.find(g => g.id === giftId) || gifts[0];
-
-      // Process gift
-      await pool.query("BEGIN");
-      
-      await pool.query(
-        "UPDATE users SET balance = balance - $1 WHERE id = $2",
-        [amount, socket.userId]
-      );
-
-      const streamData = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
-      );
-
-      if (streamData.rows.length) {
-        await pool.query(
-          "UPDATE users SET earnings = earnings + $1 WHERE id = $2",
-          [amount * 0.7, streamData.rows[0].user_id]
-        );
-      }
-
-      await pool.query(
-        "INSERT INTO transactions (user_id, amount, status, type, created_at) VALUES ($1, $2, 'succeeded', 'gift', NOW())",
-        [socket.userId, amount]
-      );
-
-      await pool.query("COMMIT");
-
-      // Emit gift to stream
-      const giftMsg = {
-        userId: socket.userId,
-        username: userRows[0].username,
-        gift: gift,
-        amount,
-        timestamp: Date.now()
-      };
-
-      io.to(`stream-${actualStreamId}`).emit("gift-sent", giftMsg);
-
-      // Trigger hype train check
-      await checkHypeTrain(actualStreamId, socket.userId, userRows[0].username, amount);
-
-    } catch (err) {
-      console.error("Gift error:", err);
-      await pool.query("ROLLBACK").catch(() => {});
-      socket.emit("gift-error", { message: "Failed to send gift" });
-    }
-  });
-
-  // ============================================================
-  // CHAT MODE EVENTS (Streamer Only)
-  // ============================================================
-
-  socket.on("update-chat-mode", async (data) => {
-    try {
-      const { streamId, mode, interval, minDays, blockedWords } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId) return;
-
-      // Verify streamer ownership
-      const { rows } = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
-      );
-
-      if (!rows.length || rows[0].user_id !== socket.userId) {
-        socket.emit("error", { message: "Not authorized" });
-        return;
-      }
-
-      // Save to Redis
-      const modeData = {
-        mode: mode || "normal",
-        interval: interval || 10,
-        minDays: minDays || 0,
-        blockedWords: blockedWords || [],
-        updatedAt: Date.now()
-      };
-
-      await redisSet(`chat-mode:${actualStreamId}`, modeData);
-      
-      io.to(`stream-${actualStreamId}`).emit("chat-mode-updated", modeData);
-
-    } catch (err) {
-      console.error("Update chat mode error:", err);
-    }
-  });
-
-  socket.on("update-automod", async (data) => {
-    try {
-      const { streamId, setting, enabled } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId) return;
-
-      const { rows } = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
-      );
-
-      if (!rows.length || rows[0].user_id !== socket.userId) return;
-
-      const chatMode = await redisHGetAll(`chat-mode:${actualStreamId}`) || {};
-      chatMode.automod = chatMode.automod || {};
-      chatMode.automod[setting] = enabled;
-      
-      await redisSet(`chat-mode:${actualStreamId}`, chatMode);
-
-    } catch (err) {
-      console.error("Update automod error:", err);
-    }
-  });
-
-  socket.on("add-blocked-word", async (data) => {
-    try {
-      const { streamId, word } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId || !word) return;
-
-      const { rows } = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
-      );
-
-      if (!rows.length || rows[0].user_id !== socket.userId) return;
-
-      const chatMode = await redisGet(`chat-mode:${actualStreamId}`) || { blockedWords: [] };
-      const blockedWords = chatMode.blockedWords || [];
-      if (!blockedWords.includes(word.toLowerCase())) {
-        blockedWords.push(word.toLowerCase());
-        chatMode.blockedWords = blockedWords;
-        await redisSet(`chat-mode:${actualStreamId}`, chatMode);
-      }
-
-    } catch (err) {
-      console.error("Add blocked word error:", err);
-    }
-  });
-
-    // ============================================================
-  // CHAT EVENTS (DM Chat)
-  // ============================================================
-  
   socket.on("join-chat", async (chatId) => {
     try {
-      // Try new table structure first, fallback to old
       let isParticipant = false;
-      
-      const { rows: newCheck } = await pool.query(
-        "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
-        [chatId, socket.userId]
-      ).catch(() => ({ rows: [] }));
-      
+
+      // New chat_participants structure
+      const { rows: newCheck } =
+        await pool.query(
+          `SELECT 1
+           FROM chat_participants
+           WHERE chat_id = $1
+           AND user_id = $2`,
+          [chatId, socket.userId]
+        ).catch(() => ({ rows: [] }));
+
       if (newCheck.length > 0) {
         isParticipant = true;
       } else {
-        // Fallback to old array-based structure
-        const { rows: oldCheck } = await pool.query(
-          "SELECT 1 FROM chats WHERE id = $1 AND $2 = ANY(participants)",
-          [chatId, socket.userId]
-        ).catch(() => ({ rows: [] }));
-        isParticipant = oldCheck.length > 0;
+        // Legacy chats.participants structure
+        const { rows: oldCheck } =
+          await pool.query(
+            `SELECT 1
+             FROM chats
+             WHERE id = $1
+             AND $2 = ANY(participants)`,
+            [chatId, socket.userId]
+          ).catch(() => ({ rows: [] }));
+
+        isParticipant =
+          oldCheck.length > 0;
       }
-      
-      if (isParticipant) {
-        socket.join(`chat-${chatId}`);
-        console.log(`User ${socket.userId} joined chat ${chatId}`);
-      } else {
-        console.warn(`Unauthorized join attempt by ${socket.userId} for chat ${chatId}`);
-        socket.emit("error", { message: "Unauthorized to join this chat" });
+
+      if (!isParticipant) {
+        socket.emit("error", {
+          message:
+            "Unauthorized to join this chat"
+        });
+        return;
       }
+
+      socket.join(`chat-${chatId}`);
+
+      console.log(
+        `User ${socket.userId} joined chat ${chatId}`
+      );
     } catch (err) {
-      console.error("Join chat error:", err);
+      console.error(
+        "Join chat error:",
+        err
+      );
     }
   });
 
   socket.on("leave-chat", (chatId) => {
     socket.leave(`chat-${chatId}`);
-    console.log(`User ${socket.userId} left chat ${chatId}`);
+
+    console.log(
+      `User ${socket.userId} left chat ${chatId}`
+    );
   });
 
   socket.on("send-message", async (data) => {
     try {
-      const { chatId, content, type, media_url, replyTo, poll, tempId } = data;
-      
-      if (!chatId || (!content && !media_url)) return;
-      
-      // Verify participant (try both table structures)
+      const {
+        chatId,
+        content,
+        type,
+        media_url,
+        replyTo,
+        poll,
+        tempId
+      } = data;
+
+      if (
+        !chatId ||
+        (!content && !media_url)
+      ) {
+        return;
+      }
+
       let isParticipant = false;
-      
-      const { rows: newCheck } = await pool.query(
-        "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
-        [chatId, socket.userId]
-      ).catch(() => ({ rows: [] }));
-      
+
+      const { rows: newCheck } =
+        await pool.query(
+          `SELECT 1
+           FROM chat_participants
+           WHERE chat_id = $1
+           AND user_id = $2`,
+          [chatId, socket.userId]
+        ).catch(() => ({ rows: [] }));
+
       if (newCheck.length > 0) {
         isParticipant = true;
       } else {
-        const { rows: oldCheck } = await pool.query(
-          "SELECT 1 FROM chats WHERE id = $1 AND $2 = ANY(participants)",
-          [chatId, socket.userId]
-        ).catch(() => ({ rows: [] }));
-        isParticipant = oldCheck.length > 0;
+        const { rows: oldCheck } =
+          await pool.query(
+            `SELECT 1
+             FROM chats
+             WHERE id = $1
+             AND $2 = ANY(participants)`,
+            [chatId, socket.userId]
+          ).catch(() => ({ rows: [] }));
+
+        isParticipant =
+          oldCheck.length > 0;
       }
-      
+
       if (!isParticipant) {
-        socket.emit("error", { message: "Not a participant" });
+        socket.emit("error", {
+          message: "Not a participant"
+        });
         return;
       }
-      
-      // Get user info
-      const { rows: userRows } = await pool.query(
-        "SELECT username, profile_url FROM users WHERE id = $1",
-        [socket.userId]
-      ).catch(() => ({ rows: [] }));
-      
+
+      const { rows: userRows } =
+        await pool.query(
+          `SELECT username, profile_url
+           FROM users
+           WHERE id = $1`,
+          [socket.userId]
+        ).catch(() => ({ rows: [] }));
+
       const messageData = {
-        id: tempId,
+        id: tempId || uuidv4(),
         chat_id: chatId,
         sender_id: socket.userId,
-        sender: userRows[0] ? { 
-          id: socket.userId, 
-          username: userRows[0].username, 
-          profile_url: userRows[0].profile_url 
-        } : { id: socket.userId, username: socket.username },
+
+        sender: userRows[0]
+          ? {
+              id: socket.userId,
+              username:
+                userRows[0].username,
+              profile_url:
+                userRows[0].profile_url
+            }
+          : {
+              id: socket.userId,
+              username:
+                socket.username
+            },
+
         content,
         type: type || "text",
         media_url,
         replyTo,
         poll,
-        timestamp: new Date().toISOString(),
-        status: "sent",
+        timestamp:
+          new Date().toISOString(),
+        status: "sent"
       };
-      
-      // Broadcast to everyone in the chat room except sender
-      socket.to(`chat-${chatId}`).emit("new-message", messageData);
-      
-      // Update chat last message
+
+      // Send to everyone else in the room
+      socket
+        .to(`chat-${chatId}`)
+        .emit(
+          "new-message",
+          messageData
+        );
+
       await pool.query(
-        `UPDATE chats SET last_message = $1, last_message_at = NOW(), updated_at = NOW() WHERE id = $2`,
-        [content?.substring(0, 100) || "[Media]", chatId]
+        `UPDATE chats
+         SET last_message = $1,
+             last_message_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $2`,
+        [
+          content?.substring(0, 100) ||
+            "[Media]",
+          chatId
+        ]
       ).catch(() => {});
-      
     } catch (err) {
-      console.error("Socket send message error:", err);
+      console.error(
+        "Socket send message error:",
+        err
+      );
     }
   });
 
   socket.on("typing-start", (data) => {
-    socket.to(`chat-${data.chatId}`).emit("user-typing", { 
-      userId: socket.userId,
-      username: socket.username 
-    });
+    if (!data?.chatId) return;
+
+    socket
+      .to(`chat-${data.chatId}`)
+      .emit("user-typing", {
+        userId: socket.userId,
+        username: socket.username
+      });
   });
 
   socket.on("typing-stop", (data) => {
-    socket.to(`chat-${data.chatId}`).emit("user-stopped-typing", { 
-      userId: socket.userId 
-    });
-  });
+    if (!data?.chatId) return;
 
-  // ============================================================
-  // MODERATION EVENTS
-  // ============================================================
-
-  socket.on("stream-timeout-user", async (data) => {
-    try {
-      const { streamId, targetUserId, duration } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId) return;
-
-      // Verify moderator status
-      const { rows } = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
-      );
-
-      if (!rows.length) return;
-      const isOwner = rows[0].user_id === socket.userId;
-      // Add mod check here if you have mods
-
-      if (!isOwner) {
-        socket.emit("error", { message: "Not authorized" });
-        return;
-      }
-
-      // Add timeout to Redis
-      await redisSet(
-        `stream-timeout:${actualStreamId}:${targetUserId}`,
-        { timedOutBy: socket.userId, duration },
-        duration || 600
-      );
-
-      io.to(`stream-${actualStreamId}`).emit("user-timed-out", {
-        userId: targetUserId,
-        duration: duration || 600
-      });
-
-    } catch (err) {
-      console.error("Timeout user error:", err);
-    }
-  });
-
-  socket.on("stream-ban-user", async (data) => {
-    try {
-      const { streamId, targetUserId } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId) return;
-
-      const { rows } = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
-      );
-
-      if (!rows.length || rows[0].user_id !== socket.userId) return;
-
-      await redisSet(`stream-banned:${actualStreamId}:${targetUserId}`, true, 86400);
-
-      // Find and disconnect banned user's socket
-      const sockets = Array.from(io.sockets.sockets.values());
-      for (const s of sockets) {
-        if (s.userId === targetUserId && s.currentStream === parseInt(actualStreamId)) {
-          s.emit("stream-banned", { streamId: actualStreamId });
-          s.leave(`stream-${actualStreamId}`);
-          s.currentStream = null;
-          break;
+    socket
+      .to(`chat-${data.chatId}`)
+      .emit(
+        "user-stopped-typing",
+        {
+          userId: socket.userId
         }
-      }
-
-      io.to(`stream-${actualStreamId}`).emit("user-banned", { userId: targetUserId });
-
-    } catch (err) {
-      console.error("Ban user error:", err);
-    }
-  });
-
-  socket.on("delete-stream-message", async (data) => {
-    try {
-      const { streamId, messageId } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId) return;
-
-      const { rows } = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
       );
-
-      if (!rows.length || rows[0].user_id !== socket.userId) return;
-
-      io.to(`stream-${actualStreamId}`).emit("message-deleted", { messageId });
-
-    } catch (err) {
-      console.error("Delete message error:", err);
-    }
   });
 
   // ============================================================
-  // POLL EVENTS
+  // MODERATION
   // ============================================================
 
-  socket.on("create-poll", async (data) => {
-    try {
-      const { streamId, question, options, duration } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId || !question || !options || options.length < 2) return;
+  socket.on(
+    "stream-timeout-user",
+    async (data) => {
+      try {
+        const {
+          streamId,
+          targetUserId,
+          duration
+        } = data;
 
-      // Verify ownership
-      const { rows } = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
-      );
+        const actualStreamId =
+          socket.currentStream ||
+          streamId;
 
-      if (!rows.length || rows[0].user_id !== socket.userId) return;
+        if (!actualStreamId) return;
 
-      const pollOptions = options.map(opt => ({
-        text: typeof opt === 'string' ? opt : opt.text,
-        votes: 0
-      }));
+        const { rows } =
+          await pool.query(
+            `SELECT user_id
+             FROM livestreams
+             WHERE id = $1`,
+            [actualStreamId]
+          );
 
-      const { rows: pollRows } = await pool.query(
-        `INSERT INTO polls (stream_id, question, options, ends_at, created_at) 
-         VALUES ($1, $2, $3, NOW() + INTERVAL '1 second' * $4, NOW()) RETURNING *`,
-        [actualStreamId, question, JSON.stringify(pollOptions), duration || 60]
-      );
+        if (!rows.length) return;
 
-      const poll = {
-        id: pollRows[0].id,
-        question,
-        options: pollOptions,
-        endsAt: Date.now() + (duration || 60) * 1000,
-        duration: duration || 60
-      };
-
-      // Store in Redis for fast access
-      await redisSet(`active-poll:${actualStreamId}`, poll, duration || 60);
-
-      // Initialize vote tracking in Redis hash
-      for (let i = 0; i < pollOptions.length; i++) {
-        await redisHSet(`poll-votes:${poll.id}`, i.toString(), 0);
-      }
-
-      io.to(`stream-${actualStreamId}`).emit("poll-started", poll);
-
-      // Auto-end poll
-      setTimeout(async () => {
-        await redisDel(`active-poll:${actualStreamId}`);
-        await pool.query("UPDATE polls SET status = 'ended' WHERE id = $1", [poll.id]);
-        io.to(`stream-${actualStreamId}`).emit("poll-ended", { pollId: poll.id });
-      }, (duration || 60) * 1000);
-
-    } catch (err) {
-      console.error("Create poll error:", err);
-    }
-  });
-
-  socket.on("poll-vote", async (data) => {
-    try {
-      const { streamId, pollId, optionIndex } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (actualStreamId === undefined || optionIndex === undefined) return;
-
-      // Check if already voted
-      const hasVoted = await redisSIsMember(`poll-voted:${pollId}`, socket.userId);
-      if (hasVoted) {
-        socket.emit("poll-error", { message: "Already voted" });
-        return;
-      }
-
-      // Check poll is still active
-      const poll = await redisGet(`active-poll:${actualStreamId}`);
-      if (!poll || poll.id !== pollId) {
-        socket.emit("poll-error", { message: "Poll has ended" });
-        return;
-      }
-
-      // Record vote
-      await redisSAdd(`poll-voted:${pollId}`, socket.userId);
-      await redisHIncrBy(`poll-votes:${pollId}`, optionIndex.toString(), 1);
-
-      // Get updated vote counts
-      const votesData = await redisHGetAll(`poll-votes:${pollId}`);
-      const updatedOptions = poll.options.map((opt, i) => ({
-        ...opt,
-        votes: parseInt(votesData[i.toString()]) || 0
-      }));
-
-      io.to(`stream-${actualStreamId}`).emit("poll-updated", {
-        id: pollId,
-        options: updatedOptions
-      });
-
-    } catch (err) {
-      console.error("Poll vote error:", err);
-    }
-  });
-
-  // ============================================================
-  // PREDICTION EVENTS
-  // ============================================================
-
-  socket.on("create-prediction", async (data) => {
-    try {
-      const { streamId, question, outcomes, duration, lockTime } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId || !question || !outcomes || outcomes.length < 2) return;
-
-      const { rows } = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
-      );
-
-      if (!rows.length || rows[0].user_id !== socket.userId) return;
-
-      const { rows: predRows } = await pool.query(
-        `INSERT INTO predictions (stream_id, question, outcomes, duration, lock_time, status, created_at) 
-         VALUES ($1, $2, $3, $4, $5, 'active', NOW()) RETURNING *`,
-        [actualStreamId, question, JSON.stringify(outcomes), duration || 120, lockTime || 30]
-      );
-
-      const prediction = {
-        id: predRows[0].id,
-        question,
-        outcomes: outcomes.map(o => ({ ...o, channelPoints: 0 })),
-        duration: duration || 120,
-        lockTime: lockTime || 30,
-        status: 'active',
-        endsAt: Date.now() + (duration || 120) * 1000,
-        lockAt: Date.now() + ((duration || 120) - (lockTime || 30)) * 1000
-      };
-
-      await redisSet(`active-prediction:${actualStreamId}`, prediction, duration || 120);
-
-      io.to(`stream-${actualStreamId}`).emit("prediction-started", prediction);
-
-      // Lock predictions
-      setTimeout(async () => {
-        const currentPred = await redisGet(`active-prediction:${actualStreamId}`);
-        if (currentPred && currentPred.id === prediction.id && currentPred.status === 'active') {
-          currentPred.status = 'locked';
-          await redisSet(`active-prediction:${actualStreamId}`, currentPred, 60);
-          io.to(`stream-${actualStreamId}`).emit("prediction-locked", { predictionId: prediction.id });
-        }
-      }, ((duration || 120) - (lockTime || 30)) * 1000);
-
-    } catch (err) {
-      console.error("Create prediction error:", err);
-    }
-  });
-
-  socket.on("prediction-bet", async (data) => {
-    try {
-      const { streamId, predictionId, outcomeIndex, amount } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId || !outcomeIndex && outcomeIndex !== 0 || !amount) return;
-
-      const prediction = await redisGet(`active-prediction:${actualStreamId}`);
-      if (!prediction || prediction.id !== predictionId) {
-        socket.emit("prediction-error", { message: "Prediction not found" });
-        return;
-      }
-
-      if (prediction.status === 'locked' || prediction.status === 'resolved') {
-        socket.emit("prediction-error", { message: "Prediction is locked or resolved" });
-        return;
-      }
-
-      // Check if already bet
-      const hasBet = await redisSIsMember(`prediction-bet:${predictionId}`, socket.userId);
-      if (hasBet) {
-        socket.emit("prediction-error", { message: "Already placed a bet" });
-        return;
-      }
-
-      // Check channel points balance
-      const points = await getUserChannelPoints(socket.userId);
-      if (points < amount) {
-        socket.emit("prediction-error", { message: "Not enough channel points" });
-        return;
-      }
-
-      // Deduct points
-      await updateChannelPoints(socket.userId, -amount);
-
-      // Record bet
-      await pool.query(
-        `INSERT INTO prediction_bets (prediction_id, user_id, outcome_index, amount, created_at) 
-         VALUES ($1, $2, $3, $4, NOW())`,
-        [predictionId, socket.userId, outcomeIndex, amount]
-      );
-
-      await redisSAdd(`prediction-bet:${predictionId}`, socket.userId);
-      
-      // Update outcome channel points total
-      prediction.outcomes[outcomeIndex].channelPoints = 
-        (prediction.outcomes[outcomeIndex].channelPoints || 0) + amount;
-      
-      await redisSet(`active-prediction:${actualStreamId}`, prediction);
-
-      io.to(`stream-${actualStreamId}`).emit("prediction-updated", {
-        id: predictionId,
-        outcomes: prediction.outcomes
-      });
-
-    } catch (err) {
-      console.error("Prediction bet error:", err);
-    }
-  });
-
-  socket.on("resolve-prediction", async (data) => {
-    try {
-      const { streamId, predictionId, winningOutcomeIndex } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId || winningOutcomeIndex === undefined) return;
-
-      const { rows } = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
-      );
-
-      if (!rows.length || rows[0].user_id !== socket.userId) return;
-
-      const prediction = await redisGet(`active-prediction:${actualStreamId}`);
-      if (!prediction || prediction.id !== predictionId) return;
-
-      // Calculate total points on winning outcome
-      const winningOutcome = prediction.outcomes[winningOutcomeIndex];
-      const totalWinningPoints = winningOutcome.channelPoints || 0;
-      const totalAllPoints = prediction.outcomes.reduce((sum, o) => sum + (o.channelPoints || 0), 0);
-      
-      const multiplier = totalAllPoints > 0 ? totalAllPoints / totalWinningPoints : 1;
-
-      // Update prediction in DB
-      await pool.query(
-        `UPDATE predictions SET status = 'resolved', winning_outcome_index = $1, multiplier = $2, resolved_at = NOW() WHERE id = $3`,
-        [winningOutcomeIndex, multiplier, predictionId]
-      );
-
-      // Payout winners
-      const { rows: bets } = await pool.query(
-        "SELECT * FROM prediction_bets WHERE prediction_id = $1",
-        [predictionId]
-      );
-
-      for (const bet of bets) {
-        const won = bet.outcome_index === winningOutcomeIndex;
-        const winnings = won ? Math.floor(bet.amount * multiplier) : 0;
-        
-        await pool.query(
-          "UPDATE prediction_bets SET won = $1, winnings = $2 WHERE id = $3",
-          [won, winnings, bet.id]
-        );
-
-        if (won && winnings > 0) {
-          await updateChannelPoints(bet.user_id, winnings);
-          io.to(`user-${bet.user_id}`).emit("prediction-result", {
-            predictionId,
-            won: true,
-            winnings,
-            amount: bet.amount
+        if (
+          rows[0].user_id !==
+          socket.userId
+        ) {
+          socket.emit("error", {
+            message: "Not authorized"
           });
-        } else {
-          io.to(`user-${bet.user_id}`).emit("prediction-result", {
-            predictionId,
-            won: false,
-            amount: bet.amount
-          });
-        }
-      }
-
-      io.to(`stream-${actualStreamId}`).emit("prediction-resolved", {
-        predictionId,
-        winningOutcomeIndex,
-        multiplier
-      });
-
-      await redisDel(`active-prediction:${actualStreamId}`);
-
-    } catch (err) {
-      console.error("Resolve prediction error:", err);
-    }
-  });
-
-  // ============================================================
-  // RAID EVENTS
-  // ============================================================
-
-  socket.on("initiate-raid", async (data) => {
-    try {
-      const { fromStreamId, toStreamId, viewerCount } = data;
-      
-      // Verify ownership of source stream
-      const { rows: fromStream } = await pool.query(
-        "SELECT user_id, title FROM livestreams WHERE id = $1",
-        [fromStreamId]
-      );
-      
-      if (!fromStream.rows.length || fromStream.rows[0].user_id !== socket.userId) {
-        return;
-      }
-      
-      // Get target stream info
-      const { rows: toStream } = await pool.query(
-        "SELECT user_id, title, viewers FROM livestreams WHERE id = $1 AND is_live = true",
-        [toStreamId]
-      );
-      
-      if (!toStream.rows.length) {
-        socket.emit("raid-error", { message: "Target stream not found or not live" });
-        return;
-      }
-
-      // Record raid
-      await pool.query(
-        `INSERT INTO raids (from_stream_id, to_stream_id, raider_id, viewer_count, created_at) 
-         VALUES ($1, $2, $3, $4, NOW())`,
-        [fromStreamId, toStreamId, socket.userId, viewerCount]
-      );
-
-      // Notify target streamer
-      io.to(`stream-${toStreamId}`).emit("raid-received", {
-        fromStreamId,
-        fromTitle: fromStream.rows[0].title,
-        raiderUsername: socket.username,
-        raiderId: socket.userId,
-        viewerCount
-      });
-
-      io.to(`user-${toStream.rows[0].user_id}`).emit("raid-received", {
-        fromStreamId,
-        fromTitle: fromStream.rows[0].title,
-        raiderUsername: socket.username,
-        viewerCount
-      });
-
-      // Update viewer counts
-      await pool.query(
-        "UPDATE livestreams SET viewers = viewers + $1 WHERE id = $2",
-        [viewerCount, toStreamId]
-      );
-
-      // Notify all viewers in source stream to redirect
-      io.to(`stream-${fromStreamId}`).emit("raid-redirect", {
-        toStreamId,
-        toTitle: toStream.rows[0].title,
-        viewerCount
-      });
-
-      // End source stream
-      await pool.query(
-        "UPDATE livestreams SET is_live = false, ended_at = NOW() WHERE id = $1",
-        [fromStreamId]
-      );
-
-      // Leave all viewers from source stream room
-      const sockets = Array.from(io.sockets.sockets.values());
-      for (const s of sockets) {
-        if (s.currentStream === fromStreamId) {
-          s.leave(`stream-${fromStreamId}`);
-          s.currentStream = null;
-        }
-      }
-
-    } catch (err) {
-      console.error("Raid error:", err);
-      socket.emit("raid-error", { message: "Failed to initiate raid" });
-    }
-  });
-
-  // ============================================================
-  // CHANNEL POINTS REWARD EVENTS
-  // ============================================================
-
-  socket.on("redeem-reward", async (data) => {
-    try {
-      const { streamId, rewardId } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId || !rewardId) return;
-
-      // Get reward info
-      const { rows: rewardRows } = await pool.query(
-        "SELECT * FROM channel_rewards WHERE id = $1 AND stream_id = $2",
-        [rewardId, actualStreamId]
-      );
-
-      if (!rewardRows.length) {
-        socket.emit("reward-error", { message: "Reward not found" });
-        return;
-      }
-
-      const reward = rewardRows[0];
-
-      if (reward.is_paused) {
-        socket.emit("reward-error", { message: "Reward is currently paused" });
-        return;
-      }
-
-      // Check cooldown
-      if (reward.cooldown > 0) {
-        const cooldownKey = `reward-cooldown:${socket.userId}:${rewardId}`;
-        const lastRedeemed = await redisGet(cooldownKey);
-        if (lastRedeemed && Date.now() - lastRedeemed < reward.cooldown * 60 * 1000) {
-          const remaining = Math.ceil((reward.cooldown * 60 * 1000 - (Date.now() - lastRedeemed)) / 60000);
-          socket.emit("reward-error", { message: `Cooldown: ${remaining} minutes remaining` });
           return;
         }
-      }
 
-      // Check max per stream
-      if (reward.max_per_stream > 0) {
-        const { rows: redemptionCount } = await pool.query(
-          "SELECT COUNT(*) as count FROM reward_redemptions WHERE reward_id = $1 AND stream_id = $2",
-          [rewardId, actualStreamId]
+        await redisSet(
+          `stream-timeout:${actualStreamId}:${targetUserId}`,
+          {
+            timedOutBy:
+              socket.userId,
+            duration
+          },
+          duration || 600
         );
-        if (redemptionCount[0].count >= reward.max_per_stream) {
-          socket.emit("reward-error", { message: "Reward limit reached for this stream" });
+
+        io.to(
+          `stream-${actualStreamId}`
+        ).emit(
+          "user-timed-out",
+          {
+            userId: targetUserId,
+            duration:
+              duration || 600
+          }
+        );
+      } catch (err) {
+        console.error(
+          "Timeout user error:",
+          err
+        );
+      }
+    }
+  );
+
+  socket.on(
+    "stream-ban-user",
+    async (data) => {
+      try {
+        const {
+          streamId,
+          targetUserId
+        } = data;
+
+        const actualStreamId =
+          socket.currentStream ||
+          streamId;
+
+        if (!actualStreamId) return;
+
+        const { rows } =
+          await pool.query(
+            `SELECT user_id
+             FROM livestreams
+             WHERE id = $1`,
+            [actualStreamId]
+          );
+
+        if (
+          !rows.length ||
+          rows[0].user_id !==
+            socket.userId
+        ) {
           return;
         }
+
+        await redisSet(
+          `stream-banned:${actualStreamId}:${targetUserId}`,
+          true,
+          86400
+        );
+
+        const sockets =
+          Array.from(
+            io.sockets.sockets.values()
+          );
+
+        for (const s of sockets) {
+          if (
+            s.userId === targetUserId &&
+            String(s.currentStream) ===
+              String(actualStreamId)
+          ) {
+            s.emit(
+              "stream-banned",
+              {
+                streamId:
+                  actualStreamId
+              }
+            );
+
+            s.leave(
+              `stream-${actualStreamId}`
+            );
+
+            s.currentStream = null;
+          }
+        }
+
+        io.to(
+          `stream-${actualStreamId}`
+        ).emit(
+          "user-banned",
+          {
+            userId:
+              targetUserId
+          }
+        );
+      } catch (err) {
+        console.error(
+          "Ban user error:",
+          err
+        );
       }
-
-      // Check points
-      const points = await getUserChannelPoints(socket.userId);
-      if (points < reward.cost) {
-        socket.emit("reward-error", { message: "Not enough channel points" });
-        return;
-      }
-
-      // Deduct points and record redemption
-      await updateChannelPoints(socket.userId, -reward.cost);
-
-      const { rows: redemptionRows } = await pool.query(
-        `INSERT INTO reward_redemptions (reward_id, user_id, stream_id, status, redeemed_at) 
-         VALUES ($1, $2, $3, 'pending', NOW()) RETURNING *`,
-        [rewardId, socket.userId, actualStreamId]
-      );
-
-      // Set cooldown
-      if (reward.cooldown > 0) {
-        await redisSet(`reward-cooldown:${socket.userId}:${rewardId}`, Date.now(), reward.cooldown * 60);
-      }
-
-      // Notify stream
-      const { rows: userRows } = await pool.query(
-        "SELECT username FROM users WHERE id = $1",
-        [socket.userId]
-      );
-
-      io.to(`stream-${actualStreamId}`).emit("reward-redeemed", {
-        redemptionId: redemptionRows[0].id,
-        rewardId,
-        rewardName: reward.name,
-        userId: socket.userId,
-        username: userRows[0]?.username || "User",
-        cost: reward.cost
-      });
-
-    } catch (err) {
-      console.error("Redeem reward error:", err);
-      socket.emit("reward-error", { message: "Failed to redeem reward" });
     }
-  });
-
-  socket.on("toggle-reward", async (data) => {
-    try {
-      const { streamId, rewardId, isPaused } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
-      if (!actualStreamId) return;
-
-      const { rows } = await pool.query(
-        "SELECT user_id FROM livestreams WHERE id = $1",
-        [actualStreamId]
-      );
-
-      if (!rows.length || rows[0].user_id !== socket.userId) return;
-
-      await pool.query(
-        "UPDATE channel_rewards SET is_paused = $1 WHERE id = $2",
-        [isPaused, rewardId]
-      );
-
-    } catch (err) {
-      console.error("Toggle reward error:", err);
-    }
-  });
+  );
 
   // ============================================================
-  // STREAM LIKE/REACT EVENTS
+  // STREAM LIKES
   // ============================================================
 
   socket.on("stream-like", async (data) => {
     try {
       const { streamId } = data;
-      const actualStreamId = socket.currentStream || streamId;
-      
+
+      const actualStreamId =
+        socket.currentStream ||
+        streamId;
+
       if (!actualStreamId) return;
 
       await pool.query(
-        "UPDATE livestreams SET likes = likes + 1 WHERE id = $1",
+        `UPDATE livestreams
+         SET likes = likes + 1
+         WHERE id = $1`,
         [actualStreamId]
       );
 
-      io.to(`stream-${actualStreamId}`).emit("stream-liked", { userId: socket.userId });
-
+      io.to(
+        `stream-${actualStreamId}`
+      ).emit(
+        "stream-liked",
+        {
+          userId:
+            socket.userId
+        }
+      );
     } catch (err) {
-      console.error("Stream like error:", err);
+      console.error(
+        "Stream like error:",
+        err
+      );
     }
   });
 
   // ============================================================
-  // DISCONNECT HANDLER
+  // DISCONNECT
   // ============================================================
 
   socket.on("disconnect", async () => {
-    console.log("Disconnected:", socket.userId);
-    
-    // Clean up call state
+    console.log(
+      "Disconnected:",
+      socket.userId
+    );
+
+    // Call cleanup
     if (socket.currentCall) {
-      console.log(`User ${socket.userId} disconnected during call ${socket.currentCall}`);
+      console.log(
+        `User ${socket.userId} disconnected during call ${socket.currentCall}`
+      );
+
       socket.currentCall = null;
     }
 
-    // Clean up stream state
+    // Stream cleanup
     if (socket.currentStream) {
+      const streamId =
+        socket.currentStream;
+
       try {
-        await redisClient?.sRem(`stream-viewers:${socket.currentStream}`, socket.userId.toString());
-        const viewerCount = await redisClient?.scard(`stream-viewers:${socket.currentStream}`);
-        
-        if (viewerCount !== undefined) {
-          await pool.query(
-            "UPDATE livestreams SET viewers = $1 WHERE id = $2",
-            [viewerCount, socket.currentStream]
+        if (redisClient) {
+          await redisClient.sRem(
+            `stream-viewers:${streamId}`,
+            socket.userId.toString()
           );
-          io.to(`stream-${socket.currentStream}`).emit("viewer-count", viewerCount);
+
+          const viewerCount =
+            await redisClient.scard(
+              `stream-viewers:${streamId}`
+            );
+
+          await pool.query(
+            `UPDATE livestreams
+             SET viewers = $1
+             WHERE id = $2`,
+            [
+              viewerCount,
+              streamId
+            ]
+          );
+
+          io.to(
+            `stream-${streamId}`
+          ).emit(
+            "viewer-count",
+            viewerCount
+          );
         }
       } catch (err) {
-        console.error("Disconnect stream cleanup error:", err);
+        console.error(
+          "Disconnect stream cleanup error:",
+          err
+        );
       }
+
       socket.currentStream = null;
     }
   });
