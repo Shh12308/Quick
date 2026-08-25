@@ -12,6 +12,13 @@ import { Strategy as GitHubStrategy } from "passport-github2";
 import http from "http";
 import nodemailer from "nodemailer";
 import multer from "multer";
+// ==========================================
+// IMPORT AND USE FOLLOW ROUTES
+// ==========================================
+import followRoutes from './routes/follow.js';
+followRoutes.setPool(pool);
+app.use(followRoutes);
+
 import Stripe from "stripe";
 import path, { dirname } from 'path';
 import fs from "fs"; 
