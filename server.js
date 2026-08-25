@@ -7130,11 +7130,31 @@ app.get('/api/notifications', authenticate, async (req, res) => {
       [...params, limit, offset]
     );
     
-    // Get total count
-    const { rows: countRows } = await pool.query(
-      `SELECT COUNT(*) as total FROM notifications n ${whereClause}`,
-      params.slice(0, paramIndex - 3)
-    );
+    // Get notifications
+const { rows } = await pool.query(
+  `SELECT
+     n.id,
+     n.type,
+     n.title,
+     n.message,
+     n.data,
+     n.is_read,
+     n.created_at
+   FROM notifications n
+   ${whereClause}
+   ORDER BY n.created_at DESC
+   LIMIT $${paramIndex - 1}
+   OFFSET $${paramIndex}`,
+  params
+);
+
+// Get total count
+const { rows: countRows } = await pool.query(
+  `SELECT COUNT(*) AS total
+   FROM notifications n
+   ${whereClause}`,
+  params.slice(0, paramIndex - 3)
+);
     
     // Get unread counts
     const counts = await getUnreadNotificationCounts(userId);
