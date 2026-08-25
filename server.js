@@ -2548,18 +2548,45 @@ app.get("/api/health", async (req, res) => {
 // AUTHENTICATION MIDDLEWARE
 // ==========================================
 // Verifies the Bearer token sent from the frontend
+// ==========================================
+// AUTH MIDDLEWARE - FIXED FOR YOUR TOKEN FORMAT
+// ==========================================
 const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
-
-  if (!token) return res.status(401).json({ error: true, msg: "Access token required" });
-
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: "No Bearer token provided" });
+  }
+  
+  const token = authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: "Empty token" });
+  }
+  
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.userId = decoded.id;
+    
+    // Handle different token formats - try multiple field names
+    const userId = decoded.id || decoded.userId || decoded.user_id || decoded.sub;
+    const username = decoded.username || decoded.name || decoded.userName;
+    
+    if (!userId) {
+      console.error("Token missing user ID. Decoded:", JSON.stringify(decoded, null, 2));
+      return res.status(401).json({ error: "Token missing user ID" });
+    }
+    
+    req.user = {
+      id: parseInt(userId) || userId,  // Ensure it's a number if possible
+      username: username,
+      email: decoded.email,
+      role: decoded.role
+    };
+    
     next();
   } catch (err) {
-    return res.status(403).json({ error: true, msg: "Invalid or expired token" });
+    console.error("JWT verify error:", err.message);
+    return res.status(401).json({ error: "Invalid or expired token: " + err.message });
   }
 };
 
