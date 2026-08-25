@@ -6936,6 +6936,518 @@ app.get("/api/check-username", async (req, res) => {
   }
 });
 
+// ==========================================
+// NOTIFICATION ENDPOINTS
+// ==========================================
+
+// Helper: Create a notification
+async function createNotification(userId, senderId, type, title, message, data = null) {
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO notifications (user_id, sender_id, type, title, message, data)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [userId, senderId, type, title, message, data ? JSON.stringify(data) : null]
+    );
+
+    const notification = rows[0];
+
+    // Send push notification via OneSignal if available
+    if (oneSignalClient) {
+      try {
+        await oneSignalClient.createNotification({
+          contents: { en: message || title },
+          headings: { en: title || "New Notification" },
+          include_aliases: {
+            external_id: [userId.toString()]
+          },
+          data: {
+            type,
+            notificationId: notification.id,
+            ...data
+          }
+        });
+      } catch (pushErr) {
+        console.error("Push notification error:", pushErr.message);
+      }
+    }
+
+    // Emit real-time notification via Socket.io
+    io.to(`user-${userId}`).emit("new-notification", {
+      ...notification,
+      data: notification.data ? (typeof notification.data === 'string' ? JSON.parse(notification.data) : notification.data) : null
+    });
+
+    return notification;
+  } catch (err) {
+    console.error("Create notification error:", err);
+    return null;
+  }
+}
+
+// GET /api/notifications - Get all notifications for current user
+app.get('/api/notifications', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { rows } = await pool.query(
+      `SELECT 
+        n.id,
+        n.user_id,
+        n.sender_id,
+        n.type,
+        n.title,
+        n.message,
+        n.data,
+        n.is_read,
+        n.created_at,
+        u.username AS sender_username,
+        u.profile_url AS sender_avatar
+       FROM notifications n
+       LEFT JOIN users u ON n.sender_id = u.id
+       WHERE n.user_id = $1
+       ORDER BY n.created_at DESC
+       LIMIT 100`,
+      [userId]
+    );
+
+    // Parse JSON data and format for frontend
+    const formattedNotifications = rows.map(n => {
+      let parsedData = null;
+      if (n.data) {
+        try {
+          parsedData = typeof n.data === 'string' ? JSON.parse(n.data) : n.data;
+        } catch {
+          parsedData = null;
+        }
+      }
+
+      // Map to frontend expected format
+      return {
+        id: n.id,
+        userId: n.user_id,
+        senderId: n.sender_id,
+        type: n.type,
+        title: n.title,
+        message: n.message,
+        text: n.message, // Frontend uses both
+        data: parsedData,
+        is_read: n.is_read,
+        read: n.is_read, // Frontend uses both
+        created_at: n.created_at,
+        time: n.created_at, // Frontend uses both
+        // Flatten data fields for easy access in frontend
+        ...(parsedData || {}),
+        // Sender info
+        user: n.sender_username || 'System',
+        avatar: n.sender_avatar,
+        // Build link based on type
+        link: getNotificationLink(n.type, parsedData)
+      };
+    });
+
+    const unreadCount = rows.filter(n => !n.is_read).length;
+
+    res.json({
+      notifications: formattedNotifications,
+      unreadCount
+    });
+
+  } catch (err) {
+    console.error("Get notifications error:", err);
+    res.status(500).json({ error: "Failed to fetch notifications" });
+  }
+});
+
+// POST /api/notifications/read-all - Mark all notifications as read
+app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    await pool.query(
+      `UPDATE notifications 
+       SET is_read = true 
+       WHERE user_id = $1 AND is_read = false`,
+      [userId]
+    );
+
+    res.json({ success: true, message: "All notifications marked as read" });
+
+  } catch (err) {
+    console.error("Mark all read error:", err);
+    res.status(500).json({ error: "Failed to mark notifications as read" });
+  }
+});
+
+// PUT /api/notifications/:id/read - Mark single notification as read
+app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const notificationId = parseInt(req.params.id);
+
+    if (isNaN(notificationId)) {
+      return res.status(400).json({ error: "Invalid notification ID" });
+    }
+
+    const { rowCount } = await pool.query(
+      `UPDATE notifications 
+       SET is_read = true 
+       WHERE id = $1 AND user_id = $2`,
+      [notificationId, userId]
+    );
+
+    if (rowCount === 0) {
+      return res.status(404).json({ error: "Notification not found" });
+    }
+
+    res.json({ success: true, message: "Notification marked as read" });
+
+  } catch (err) {
+    console.error("Mark read error:", err);
+    res.status(500).json({ error: "Failed to mark notification as read" });
+  }
+});
+
+// DELETE /api/notifications/:id - Delete a single notification
+app.delete('/api/notifications/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const notificationId = parseInt(req.params.id);
+
+    if (isNaN(notificationId)) {
+      return res.status(400).json({ error: "Invalid notification ID" });
+    }
+
+    const { rowCount } = await pool.query(
+      `DELETE FROM notifications 
+       WHERE id = $1 AND user_id = $2`,
+      [notificationId, userId]
+    );
+
+    if (rowCount === 0) {
+      return res.status(404).json({ error: "Notification not found" });
+    }
+
+    res.json({ success: true, message: "Notification deleted" });
+
+  } catch (err) {
+    console.error("Delete notification error:", err);
+    res.status(500).json({ error: "Failed to delete notification" });
+  }
+});
+
+// GET /api/notifications/unread-count - Get only unread count (lightweight)
+app.get('/api/notifications/unread-count', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { rows } = await pool.query(
+      `SELECT COUNT(*) as unread_count 
+       FROM notifications 
+       WHERE user_id = $1 AND is_read = false`,
+      [userId]
+    );
+
+    res.json({ unreadCount: parseInt(rows[0].unread_count) || 0 });
+
+  } catch (err) {
+    console.error("Get unread count error:", err);
+    res.status(500).json({ error: "Failed to get unread count" });
+  }
+});
+
+// DELETE /api/notifications/read - Delete all read notifications
+app.delete('/api/notifications/read', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { rowCount } = await pool.query(
+      `DELETE FROM notifications 
+       WHERE user_id = $1 AND is_read = true`,
+      [userId]
+    );
+
+    res.json({ 
+      success: true, 
+      message: `Deleted ${rowCount} read notifications`,
+      deletedCount: rowCount
+    });
+
+  } catch (err) {
+    console.error("Delete read notifications error:", err);
+    res.status(500).json({ error: "Failed to delete read notifications" });
+  }
+});
+
+// ==========================================
+// NOTIFICATION HELPERS FOR OTHER FEATURES
+// ==========================================
+
+// Helper: Get notification link based on type
+function getNotificationLink(type, data) {
+  switch (type) {
+    case 'like':
+    case 'comment':
+      return data?.videoId ? `/watch/${data.videoId}` : null;
+    case 'follow':
+      return data?.followerId ? `/viewprofile/${data.followerId}` : null;
+    case 'mention':
+      return data?.videoId ? `/watch/${data.videoId}` : null;
+    case 'login':
+    case 'Login':
+      return null; // Opens modal, no navigation
+    case 'warning':
+    case 'Warning':
+      return null; // Opens modal, no navigation
+    case 'app_update':
+    case 'App Update':
+      return null; // Opens modal, no navigation
+    case 'subscription':
+      return '/profile';
+    case 'merch_order':
+      return data?.orderId ? `/orders/${data.orderId}` : '/shop';
+    case 'tip_received':
+      return data?.streamId ? `/live/${data.streamId}` : '/earnings';
+    case 'call_missed':
+      return data?.callerId ? `/messages` : null;
+    default:
+      return null;
+  }
+}
+
+// Helper: Create like notification
+async function notifyLike(videoOwnerId, likerId, videoId) {
+  if (videoOwnerId === likerId) return; // Don't notify self
+  
+  await createNotification(
+    videoOwnerId,
+    likerId,
+    'like',
+    'New Like',
+    'liked your video',
+    { videoId }
+  );
+}
+
+// Helper: Create comment notification
+async function notifyComment(videoOwnerId, commenterId, videoId, commentText) {
+  if (videoOwnerId === commenterId) return;
+  
+  await createNotification(
+    videoOwnerId,
+    commenterId,
+    'comment',
+    'New Comment',
+    `commented: ${commentText?.substring(0, 100)}${commentText?.length > 100 ? '...' : ''}`,
+    { videoId, commentText }
+  );
+}
+
+// Helper: Create follow notification
+async function notifyFollow(followingId, followerId) {
+  await createNotification(
+    followingId,
+    followerId,
+    'follow',
+    'New Follower',
+    'started following you',
+    { followerId }
+  );
+}
+
+// Helper: Create mention notification
+async function notifyMention(mentionedUserId, mentionerId, videoId) {
+  if (mentionedUserId === mentionerId) return;
+  
+  await createNotification(
+    mentionedUserId,
+    mentionerId,
+    'mention',
+    'You were mentioned',
+    'mentioned you in a video',
+    { videoId }
+  );
+}
+
+// Helper: Create login notification (for security)
+async function notifyLogin(userId, loginData) {
+  await createNotification(
+    userId,
+    null, // System notification
+    'Login',
+    'New Login Detected',
+    'A new login was detected on your account',
+    {
+      ip: loginData.ip,
+      device: loginData.device,
+      browser: loginData.browser,
+      location: loginData.location,
+      user_agent: loginData.userAgent
+    }
+  );
+}
+
+// Helper: Create warning notification (for moderation)
+async function notifyWarning(userId, warningData) {
+  await createNotification(
+    userId,
+    null, // System notification
+    'Warning',
+    'Account Warning',
+    warningData.reason,
+    {
+      reason: warningData.reason,
+      actionType: warningData.actionType,
+      category: warningData.category,
+      issuedBy: warningData.issuedBy || 'System'
+    }
+  );
+}
+
+// Helper: Create app update notification (admin only - sends to all users)
+async function notifyAppUpdate(version, changelog, summary) {
+  try {
+    const { rows } = await pool.query("SELECT id FROM users WHERE status = 'active'");
+    
+    for (const user of rows) {
+      await createNotification(
+        user.id,
+        null, // System notification
+        'App Update',
+        'App Update Available',
+        `Version ${version} is now available`,
+        {
+          version,
+          changelog,
+          summary
+        }
+      );
+    }
+  } catch (err) {
+    console.error("Notify app update error:", err);
+  }
+}
+
+// Helper: Create tip received notification
+async function notifyTipReceived(creatorId, senderId, amount, streamId = null) {
+  await createNotification(
+    creatorId,
+    senderId,
+    'tip_received',
+    'Tip Received',
+    `sent you a $${amount} tip`,
+    { amount, streamId, senderId }
+  );
+}
+
+// Helper: Create subscription notification
+async function notifySubscription(creatorId, subscriberId, tierName) {
+  await createNotification(
+    creatorId,
+    subscriberId,
+    'subscription',
+    'New Subscriber',
+    `subscribed to your ${tierName} tier`,
+    { subscriberId, tierName }
+  );
+}
+
+// ==========================================
+// ADMIN ENDPOINT: Send notification to all users
+// ==========================================
+app.post('/api/admin/notifications/broadcast', authenticateToken, async (req, res) => {
+  try {
+    // Check if user is admin
+    if (!req.user.is_admin) {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+
+    const { type, title, message, data } = req.body;
+
+    if (!title || !message) {
+      return res.status(400).json({ error: "Title and message are required" });
+    }
+
+    const { rows } = await pool.query(
+      "SELECT id FROM users WHERE status = 'active'"
+    );
+
+    let sentCount = 0;
+    for (const user of rows) {
+      const result = await createNotification(
+        user.id,
+        req.user.id,
+        type || 'system',
+        title,
+        message,
+        data
+      );
+      if (result) sentCount++;
+    }
+
+    res.json({ 
+      success: true, 
+      message: `Notification sent to ${sentCount} users`,
+      sentCount 
+    });
+
+  } catch (err) {
+    console.error("Broadcast notification error:", err);
+    res.status(500).json({ error: "Failed to broadcast notification" });
+  }
+});
+
+// ==========================================
+// ADMIN ENDPOINT: Send notification to single user
+// ==========================================
+app.post('/api/admin/notifications/send', authenticateToken, async (req, res) => {
+  try {
+    if (!req.user.is_admin) {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+
+    const { userId, type, title, message, data } = req.body;
+
+    if (!userId || !title || !message) {
+      return res.status(400).json({ error: "userId, title, and message are required" });
+    }
+
+    const notification = await createNotification(
+      userId,
+      req.user.id,
+      type || 'system',
+      title,
+      message,
+      data
+    );
+
+    if (!notification) {
+      return res.status(500).json({ error: "Failed to create notification" });
+    }
+
+    res.json({ success: true, notification });
+
+  } catch (err) {
+    console.error("Send notification error:", err);
+    res.status(500).json({ error: "Failed to send notification" });
+  }
+});
+
+// Make helpers available to other routes
+export {
+  createNotification,
+  notifyLike,
+  notifyComment,
+  notifyFollow,
+  notifyMention,
+  notifyLogin,
+  notifyWarning,
+  notifyAppUpdate,
+  notifyTipReceived,
+  notifySubscription,
+  getNotificationLink
+};
+
 app.post("/auth/check-vpn", async (req, res) => {
   try {
     const ip = req.headers["x-forwarded-for"]?.split(',')[0] || req.socket.remoteAddress;
