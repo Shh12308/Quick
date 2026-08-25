@@ -8342,6 +8342,9 @@ app.get("/api/music/audio/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
+    console.log(`🎵 Audio proxy request: track ${id}`);
+    console.log(`🎵 Range: ${req.headers.range || "none"}`);
+
     const { rows } = await pool.query(
       `
       SELECT
@@ -8355,6 +8358,7 @@ app.get("/api/music/audio/:id", async (req, res) => {
     );
 
     if (!rows.length) {
+      console.error(`❌ Track ${id} not found`);
       return res.status(404).json({
         error: "Track not found",
       });
@@ -8362,53 +8366,61 @@ app.get("/api/music/audio/:id", async (req, res) => {
 
     const track = rows[0];
 
-    const key =
-      track.audio_s3_key ||
-      track.s3_key;
+    const s3Key = track.audio_s3_key || track.s3_key;
 
-    if (!key) {
+    if (!s3Key) {
+      console.error(`❌ Track ${id} has no S3 key`);
       return res.status(404).json({
-        error: "Audio file has no S3 key",
+        error: "Audio file not configured",
       });
     }
 
-    /*
-     * First get object metadata.
-     */
-    const headCommand = new HeadObjectCommand({
-      Bucket: S3_BUCKET_NAME,
-      Key: key,
-    });
+    console.log(`🎵 S3 key: ${s3Key}`);
 
-    const metadata = await s3.send(headCommand);
+    // Get metadata first
+    const head = await s3.send(
+      new HeadObjectCommand({
+        Bucket: S3_BUCKET_NAME,
+        Key: s3Key,
+      })
+    );
 
-    const fileSize = Number(metadata.ContentLength || 0);
+    const fileSize = Number(head.ContentLength || 0);
 
     if (!fileSize) {
+      console.error("❌ S3 object has no content");
       return res.status(404).json({
         error: "Audio file is empty",
       });
     }
 
+    const contentType =
+      head.ContentType || "audio/mpeg";
+
+    console.log("🎵 S3 metadata:", {
+      contentType,
+      fileSize,
+    });
+
     const range = req.headers.range;
 
-    /*
-     * No Range header:
-     * return entire file.
-     */
-    if (!range) {
-      const command = new GetObjectCommand({
-        Bucket: S3_BUCKET_NAME,
-        Key: key,
-      });
+    // ==========================================
+    // FULL FILE
+    // ==========================================
 
-      const s3Response = await s3.send(command);
+    if (!range) {
+      const object = await s3.send(
+        new GetObjectCommand({
+          Bucket: S3_BUCKET_NAME,
+          Key: s3Key,
+        })
+      );
 
       res.status(200);
 
       res.setHeader(
         "Content-Type",
-        metadata.ContentType || "audio/mpeg"
+        contentType
       );
 
       res.setHeader(
@@ -8426,57 +8438,69 @@ app.get("/api/music/audio/:id", async (req, res) => {
         "public, max-age=3600"
       );
 
-      s3Response.Body.pipe(res);
+      if (object.Body) {
+        object.Body.pipe(res);
+      } else {
+        res.end();
+      }
 
       return;
     }
 
-    /*
-     * Parse Range:
-     *
-     * bytes=START-END
-     */
+    // ==========================================
+    // RANGE REQUEST
+    // ==========================================
+
     const match = range.match(
-      /bytes=(\d*)-(\d*)/
+      /^bytes=(\d*)-(\d*)$/
     );
 
     if (!match) {
-      return res.status(416).set({
-        "Content-Range": `bytes */${fileSize}`,
-      }).end();
+      return res
+        .status(416)
+        .setHeader(
+          "Content-Range",
+          `bytes */${fileSize}`
+        )
+        .end();
     }
 
-    let start = match[1]
-      ? Number(match[1])
-      : 0;
+    let start;
+    let end;
 
-    let end = match[2]
-      ? Number(match[2])
-      : fileSize - 1;
-
-    /*
-     * Handle suffix ranges:
-     * bytes=-500
-     */
-    if (!match[1] && match[2]) {
-      const suffixLength = Number(match[2]);
+    if (match[1] === "") {
+      // bytes=-500
+      const suffix = Number(match[2]);
 
       start = Math.max(
-        fileSize - suffixLength,
+        fileSize - suffix,
         0
       );
 
       end = fileSize - 1;
+    } else {
+      start = Number(match[1]);
+
+      end =
+        match[2] === ""
+          ? fileSize - 1
+          : Number(match[2]);
     }
 
     if (
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
       start < 0 ||
       start >= fileSize ||
       end < start
     ) {
-      return res.status(416).set({
-        "Content-Range": `bytes */${fileSize}`,
-      }).end();
+      return res
+        .status(416)
+        .setHeader(
+          "Content-Range",
+          `bytes */${fileSize}`
+        )
+        .end();
     }
 
     end = Math.min(
@@ -8484,37 +8508,34 @@ app.get("/api/music/audio/:id", async (req, res) => {
       fileSize - 1
     );
 
-    const chunkSize =
+    const contentLength =
       end - start + 1;
 
-    console.log("🎵 Audio range:", {
-      id,
-      key,
+    console.log("🎵 Streaming range:", {
       start,
       end,
-      chunkSize,
+      contentLength,
       fileSize,
     });
 
-    const command = new GetObjectCommand({
-      Bucket: S3_BUCKET_NAME,
-      Key: key,
-      Range: `bytes=${start}-${end}`,
-    });
-
-    const s3Response =
-      await s3.send(command);
+    const object = await s3.send(
+      new GetObjectCommand({
+        Bucket: S3_BUCKET_NAME,
+        Key: s3Key,
+        Range: `bytes=${start}-${end}`,
+      })
+    );
 
     res.status(206);
 
     res.setHeader(
       "Content-Type",
-      metadata.ContentType || "audio/mpeg"
+      contentType
     );
 
     res.setHeader(
       "Content-Length",
-      String(chunkSize)
+      String(contentLength)
     );
 
     res.setHeader(
@@ -8532,13 +8553,18 @@ app.get("/api/music/audio/:id", async (req, res) => {
       "public, max-age=3600"
     );
 
-    s3Response.Body.pipe(res);
+    if (object.Body) {
+      object.Body.pipe(res);
+    } else {
+      res.end();
+    }
 
   } catch (err) {
-    console.error(
-      "❌ Audio proxy error:",
-      err
-    );
+    console.error("❌ AUDIO PROXY ERROR");
+    console.error("message:", err.message);
+    console.error("code:", err.code);
+    console.error("name:", err.name);
+    console.error("stack:", err.stack);
 
     if (!res.headersSent) {
       res.status(500).json({
