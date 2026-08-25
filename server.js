@@ -8647,6 +8647,35 @@ app.get("/api/settings", authMiddleware, async (req, res) => {
   }
 });
 
+// In your user profile endpoint, add these fields to the SELECT query:
+app.get('/api/users/:id', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.*,
+              (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as followers_count,
+              (SELECT COUNT(*) FROM follows WHERE follower_id = u.id) as following_count,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM follows WHERE follower_id = $2 AND following_id = u.id
+              ) THEN true ELSE false END as is_following,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM follows WHERE follower_id = u.id AND following_id = $2
+              ) THEN true ELSE false END as is_followed_by_me
+       FROM users u
+       WHERE u.id = $1`,
+      [req.params.id, req.user.id]
+    );
+    
+    if (!rows.length) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("Get user error:", err);
+    res.status(500).json({ error: "Failed to get user" });
+  }
+});
+
 // PATCH /api/settings/profile
 app.patch("/api/settings/profile", authMiddleware, async (req, res) => {
   try {
