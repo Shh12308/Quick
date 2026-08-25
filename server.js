@@ -16,8 +16,7 @@ import multer from "multer";
 // IMPORT AND USE FOLLOW ROUTES
 // ==========================================
 import followRoutes from './routes/follow.js';
-followRoutes.setPool(pool);
-app.use(followRoutes);
+
 
 import Stripe from "stripe";
 import path, { dirname } from 'path';
