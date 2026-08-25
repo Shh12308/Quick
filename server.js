@@ -7353,6 +7353,319 @@ async function notifySubscription(creatorId, subscriberId, tierName) {
 }
 
 // ==========================================
+// FOLLOW SYSTEM ENDPOINTS
+// ==========================================
+
+// Initialize follows table if not exists
+await pool.query(`CREATE TABLE IF NOT EXISTS follows (
+  id SERIAL PRIMARY KEY,
+  follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(follower_id, following_id)
+)`);
+
+// Follow a user
+app.post('/api/users/:userId/follow', authenticateToken, async (req, res) => {
+  try {
+    const targetUserId = parseInt(req.params.userId);
+    const currentUserId = req.user.id;
+    
+    if (targetUserId === currentUserId) {
+      return res.status(400).json({ error: "Cannot follow yourself" });
+    }
+    
+    // Check if target user exists
+    const { rows: userCheck } = await pool.query(
+      "SELECT id, is_private FROM users WHERE id = $1",
+      [targetUserId]
+    );
+    
+    if (!userCheck.length) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    // Check if already following
+    const { rows: existingFollow } = await pool.query(
+      "SELECT id FROM follows WHERE follower_id = $1 AND following_id = $2",
+      [currentUserId, targetUserId]
+    );
+    
+    if (existingFollow.length > 0) {
+      return res.status(400).json({ error: "Already following" });
+    }
+    
+    // Create follow relationship
+    await pool.query(
+      "INSERT INTO follows (follower_id, following_id) VALUES ($1, $2)",
+      [currentUserId, targetUserId]
+    );
+    
+    // Update follower counts
+    await pool.query(
+      "UPDATE users SET total_follows = COALESCE((SELECT COUNT(*) FROM follows WHERE following_id = id), 0) WHERE id = $1",
+      [targetUserId]
+    );
+    
+    // Create notification
+    await pool.query(
+      `INSERT INTO notifications (user_id, sender_id, type, title, message, data) 
+       VALUES ($1, $2, 'follow', 'New Follower', 'started following you', '{"type": "follow"}')`,
+      [targetUserId, currentUserId]
+    );
+    
+    // Send real-time notification
+    io.to(`user-${targetUserId}`).emit("notification", {
+      type: "follow",
+      from: currentUserId
+    });
+    
+    res.json({ success: true, following: true });
+    
+  } catch (err) {
+    console.error("Follow error:", err);
+    res.status(500).json({ error: "Failed to follow user" });
+  }
+});
+
+// Unfollow a user
+app.delete('/api/users/:userId/follow', authenticateToken, async (req, res) => {
+  try {
+    const targetUserId = parseInt(req.params.userId);
+    const currentUserId = req.user.id;
+    
+    await pool.query(
+      "DELETE FROM follows WHERE follower_id = $1 AND following_id = $2",
+      [currentUserId, targetUserId]
+    );
+    
+    // Update follower counts
+    await pool.query(
+      "UPDATE users SET total_follows = COALESCE((SELECT COUNT(*) FROM follows WHERE following_id = id), 0) WHERE id = $1",
+      [targetUserId]
+    );
+    
+    res.json({ success: true, following: false });
+    
+  } catch (err) {
+    console.error("Unfollow error:", err);
+    res.status(500).json({ error: "Failed to unfollow user" });
+  }
+});
+
+// Check if following
+app.get('/api/users/:userId/follow-status', authenticateToken, async (req, res) => {
+  try {
+    const targetUserId = parseInt(req.params.userId);
+    const currentUserId = req.user.id;
+    
+    const { rows } = await pool.query(
+      "SELECT id FROM follows WHERE follower_id = $1 AND following_id = $2",
+      [currentUserId, targetUserId]
+    );
+    
+    res.json({ following: rows.length > 0 });
+    
+  } catch (err) {
+    console.error("Follow status error:", err);
+    res.status(500).json({ error: "Failed to get follow status" });
+  }
+});
+
+// Get followers list
+app.get('/api/users/:userId/followers', authenticateToken, async (req, res) => {
+  try {
+    const targetUserId = parseInt(req.params.userId);
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+    
+    const { rows } = await pool.query(
+      `SELECT u.id, u.username, u.profile_url, u.is_verified, u.is_musician,
+              f.created_at as followed_at,
+              (SELECT COUNT(*) FROM follows WHERE follower_id = u.id) as following_count,
+              (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as followers_count,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM follows WHERE follower_id = $2 AND following_id = u.id
+              ) THEN true ELSE false END as is_following
+       FROM follows f
+       JOIN users u ON f.follower_id = u.id
+       WHERE f.following_id = $1
+       ORDER BY f.created_at DESC
+       LIMIT $3 OFFSET $4`,
+      [targetUserId, req.user.id, limit, offset]
+    );
+    
+    const { rows: countRows } = await pool.query(
+      "SELECT COUNT(*) as total FROM follows WHERE following_id = $1",
+      [targetUserId]
+    );
+    
+    res.json({
+      followers: rows,
+      total: parseInt(countRows[0].total),
+      hasMore: offset + limit < parseInt(countRows[0].total)
+    });
+    
+  } catch (err) {
+    console.error("Get followers error:", err);
+    res.status(500).json({ error: "Failed to get followers" });
+  }
+});
+
+// Get following list
+app.get('/api/users/:userId/following', authenticateToken, async (req, res) => {
+  try {
+    const targetUserId = parseInt(req.params.userId);
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+    
+    const { rows } = await pool.query(
+      `SELECT u.id, u.username, u.profile_url, u.is_verified, u.is_musician,
+              f.created_at as followed_at,
+              (SELECT COUNT(*) FROM follows WHERE follower_id = u.id) as following_count,
+              (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as followers_count,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM follows WHERE follower_id = $2 AND following_id = u.id
+              ) THEN true ELSE false END as is_following
+       FROM follows f
+       JOIN users u ON f.following_id = u.id
+       WHERE f.follower_id = $1
+       ORDER BY f.created_at DESC
+       LIMIT $3 OFFSET $4`,
+      [targetUserId, req.user.id, limit, offset]
+    );
+    
+    const { rows: countRows } = await pool.query(
+      "SELECT COUNT(*) as total FROM follows WHERE follower_id = $1",
+      [targetUserId]
+    );
+    
+    res.json({
+      following: rows,
+      total: parseInt(countRows[0].total),
+      hasMore: offset + limit < parseInt(countRows[0].total)
+    });
+    
+  } catch (err) {
+    console.error("Get following error:", err);
+    res.status(500).json({ error: "Failed to get following" });
+  }
+});
+
+// ==========================================
+// CHAT CREATION ENDPOINT
+// ==========================================
+
+// Create or get existing chat with a user
+app.post('/api/chats/direct', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.body;
+    const currentUserId = req.user.id;
+    
+    if (!userId || userId === currentUserId) {
+      return res.status(400).json({ error: "Invalid user ID" });
+    }
+    
+    // Check if user exists
+    const { rows: userCheck } = await pool.query(
+      "SELECT id, username, profile_url FROM users WHERE id = $1",
+      [userId]
+    );
+    
+    if (!userCheck.length) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    // Check for existing chat
+    const { rows: existingChat } = await pool.query(
+      `SELECT c.* FROM chats c
+       JOIN chat_participants cp1 ON c.id = cp1.chat_id AND cp1.user_id = $1
+       JOIN chat_participants cp2 ON c.id = cp2.chat_id AND cp2.user_id = $2
+       WHERE c.type = 'private'
+       LIMIT 1`,
+      [currentUserId, userId]
+    );
+    
+    if (existingChat.length > 0) {
+      // Return existing chat
+      const chat = existingChat[0];
+      res.json({
+        id: chat.id,
+        type: chat.type,
+        name: userCheck[0].username,
+        avatar: userCheck[0].profile_url,
+        otherUserId: userId
+      });
+      return;
+    }
+    
+    // Create new chat
+    const { rows: newChat } = await pool.query(
+      `INSERT INTO chats (creator_id, type, name, avatar, participants, created_at)
+       VALUES ($1, 'private', $2, $3, ARRAY[$1, $4], NOW())
+       RETURNING *`,
+      [currentUserId, userCheck[0].username, userCheck[0].profile_url, userId]
+    );
+    
+    const chatId = newChat[0].id;
+    
+    // Add participants to chat_participants table
+    await pool.query(
+      `INSERT INTO chat_participants (chat_id, user_id, joined_at) VALUES 
+       ($1, $2, NOW()), ($1, $3, NOW())`,
+      [chatId, currentUserId, userId]
+    );
+    
+    res.json({
+      id: chatId,
+      type: 'private',
+      name: userCheck[0].username,
+      avatar: userCheck[0].profile_url,
+      otherUserId: userId
+    });
+    
+  } catch (err) {
+    console.error("Create direct chat error:", err);
+    res.status(500).json({ error: "Failed to create chat" });
+  }
+});
+
+// User search for finding users to follow/message
+app.get('/api/users/search', authenticateToken, async (req, res) => {
+  try {
+    const { q } = req.query;
+    const limit = parseInt(req.query.limit) || 20;
+    
+    if (!q || q.length < 2) {
+      return res.json({ users: [] });
+    }
+    
+    const { rows } = await pool.query(
+      `SELECT u.id, u.username, u.profile_url, u.bio, u.is_verified, u.is_musician, u.role,
+              (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as followers_count,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM follows WHERE follower_id = $2 AND following_id = u.id
+              ) THEN true ELSE false END as is_following
+       FROM users u
+       WHERE u.id != $2
+         AND u.status = 'active'
+         AND (u.username ILIKE $1 OR u.email ILIKE $1)
+       ORDER BY 
+         CASE WHEN u.username ILIKE $1 THEN 0 ELSE 1 END,
+         u.username
+       LIMIT $3`,
+      [`%${q}%`, req.user.id, limit]
+    );
+    
+    res.json({ users: rows });
+    
+  } catch (err) {
+    console.error("User search error:", err);
+    res.status(500).json({ error: "Failed to search users" });
+  }
+});
+
+// ==========================================
 // ADMIN ENDPOINT: Send notification to all users
 // ==========================================
 app.post('/api/admin/notifications/broadcast', authenticateToken, async (req, res) => {
