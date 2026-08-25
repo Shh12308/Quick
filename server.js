@@ -7096,83 +7096,85 @@ app.post('/api/admin/users/:id/suspend', adminAuth, async (req, res) => {
 // ==========================================
 
 // Get notifications with pagination and filtering
-app.get('/api/notifications', authenticate, async (req, res) => {
+// ==========================================
+// GET NOTIFICATIONS
+// ==========================================
+
+app.get("/api/notifications", authenticateToken, async (req, res) => {
   try {
-    const userId = req.userId;
-    const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
-    const type = req.query.type; // Filter by type: video_upload, music_upload, etc.
-    const unreadOnly = req.query.unread === 'true';
-    const offset = (page - 1) * limit;
-    
-    let whereClause = 'WHERE n.user_id = $1';
+    const userId = req.user.id;
+
+    const {
+      unreadOnly = "false",
+      limit = 50,
+      offset = 0
+    } = req.query;
+
+    const conditions = ["n.user_id = $1"];
     const params = [userId];
+
     let paramIndex = 2;
-    
-    if (type) {
-      whereClause += ` AND n.type = $${paramIndex++}`;
-      params.push(type);
+
+    if (unreadOnly === "true") {
+      conditions.push("n.is_read = false");
     }
-    
-    if (unreadOnly) {
-      whereClause += ` AND n.is_read = false';
-    }
-    
-    // Get notifications with sender info
+
+    const whereClause =
+      `WHERE ${conditions.join(" AND ")}`;
+
+    const safeLimit = Math.min(
+      Math.max(parseInt(limit, 10) || 50, 1),
+      100
+    );
+
+    const safeOffset =
+      Math.max(parseInt(offset, 10) || 0, 0);
+
+    const notificationsParams = [
+      ...params,
+      safeLimit,
+      safeOffset
+    ];
+
+    // Get notifications
     const { rows } = await pool.query(
-      `SELECT n.id, n.type, n.title, n.message, n.data, n.is_read, n.created_at,
-              s.id as sender_id, s.username as sender_username, s.profile_url as sender_avatar
+      `SELECT
+         n.id,
+         n.type,
+         n.title,
+         n.message,
+         n.data,
+         n.is_read,
+         n.created_at
        FROM notifications n
-       LEFT JOIN users s ON s.id = n.sender_id
        ${whereClause}
        ORDER BY n.created_at DESC
-       LIMIT $${paramIndex++} OFFSET $${paramIndex++}`,
-      [...params, limit, offset]
+       LIMIT $2
+       OFFSET $3`,
+      notificationsParams
     );
-    
-    // Get notifications
-const { rows } = await pool.query(
-  `SELECT
-     n.id,
-     n.type,
-     n.title,
-     n.message,
-     n.data,
-     n.is_read,
-     n.created_at
-   FROM notifications n
-   ${whereClause}
-   ORDER BY n.created_at DESC
-   LIMIT $${paramIndex - 1}
-   OFFSET $${paramIndex}`,
-  params
-);
 
-// Get total count
-const { rows: countRows } = await pool.query(
-  `SELECT COUNT(*) AS total
-   FROM notifications n
-   ${whereClause}`,
-  params.slice(0, paramIndex - 3)
-);
-    
-    // Get unread counts
-    const counts = await getUnreadNotificationCounts(userId);
-    
-    res.json({
-      success: true,
+    // Get total count
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*) AS total
+       FROM notifications n
+       ${whereClause}`,
+      params
+    );
+
+    return res.json({
       notifications: rows,
-      pagination: {
-        page,
-        limit,
-        total: parseInt(countRows[0].total),
-        pages: Math.ceil(countRows[0].total / limit)
-      },
-      unread_counts: counts
+      total: parseInt(countRows[0]?.total || 0, 10),
+      limit: safeLimit,
+      offset: safeOffset
     });
+
   } catch (err) {
-    console.error('Get notifications error:', err);
-    res.status(500).json({ error: 'Failed to get notifications' });
+    console.error("Get notifications error:", err);
+
+    return res.status(500).json({
+      error: "Failed to fetch notifications"
+    });
   }
 });
 
