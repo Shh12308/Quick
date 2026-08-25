@@ -7057,6 +7057,228 @@ app.post("/api/auth/login", checkBan, async (req, res) => {
   } catch (err) { console.error("Login error:", err); res.status(500).json({ error: "Login failed" }); }
 });
 
+// In your suspend user endpoint (admin):
+app.post('/api/admin/users/:id/suspend', adminAuth, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const { duration, reason } = req.body;
+    
+    const suspendUntil = duration 
+      ? new Date(Date.now() + duration * 60 * 60 * 1000) 
+      : null;
+    
+    await pool.query(
+      `UPDATE users SET status = 'suspended', suspend_until = $1, suspension_reason = $2, updated_at = NOW() WHERE id = $3`,
+      [suspendUntil, reason, userId]
+    );
+    
+    // Clean up notifications
+    // Option 1: Remove all notifications this user sent (recommended)
+    await cleanupSuspendedUserNotifications(userId, true, false);
+    
+    // Option 2: Also mark their received notifications as read
+    // await cleanupSuspendedUserNotifications(userId, true, true);
+    
+    // Notify the user they've been suspended
+    io.to(`user-${userId}`).emit('account-suspended', {
+      reason,
+      until: suspendUntil
+    });
+    
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to suspend user' });
+  }
+});
+
+// ==========================================
+// NOTIFICATION API ENDPOINTS
+// ==========================================
+
+// Get notifications with pagination and filtering
+app.get('/api/notifications', authenticate, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const type = req.query.type; // Filter by type: video_upload, music_upload, etc.
+    const unreadOnly = req.query.unread === 'true';
+    const offset = (page - 1) * limit;
+    
+    let whereClause = 'WHERE n.user_id = $1';
+    const params = [userId];
+    let paramIndex = 2;
+    
+    if (type) {
+      whereClause += ` AND n.type = $${paramIndex++}`;
+      params.push(type);
+    }
+    
+    if (unreadOnly) {
+      whereClause += ` AND n.is_read = false';
+    }
+    
+    // Get notifications with sender info
+    const { rows } = await pool.query(
+      `SELECT n.id, n.type, n.title, n.message, n.data, n.is_read, n.created_at,
+              s.id as sender_id, s.username as sender_username, s.profile_url as sender_avatar
+       FROM notifications n
+       LEFT JOIN users s ON s.id = n.sender_id
+       ${whereClause}
+       ORDER BY n.created_at DESC
+       LIMIT $${paramIndex++} OFFSET $${paramIndex++}`,
+      [...params, limit, offset]
+    );
+    
+    // Get total count
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*) as total FROM notifications n ${whereClause}`,
+      params.slice(0, paramIndex - 3)
+    );
+    
+    // Get unread counts
+    const counts = await getUnreadNotificationCounts(userId);
+    
+    res.json({
+      success: true,
+      notifications: rows,
+      pagination: {
+        page,
+        limit,
+        total: parseInt(countRows[0].total),
+        pages: Math.ceil(countRows[0].total / limit)
+      },
+      unread_counts: counts
+    });
+  } catch (err) {
+    console.error('Get notifications error:', err);
+    res.status(500).json({ error: 'Failed to get notifications' });
+  }
+});
+
+// Get unread notification counts
+app.get('/api/notifications/counts', authenticate, async (req, res) => {
+  try {
+    const counts = await getUnreadNotificationCounts(req.userId);
+    res.json({ success: true, counts });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to get notification counts' });
+  }
+});
+
+// Mark notification(s) as read
+app.put('/api/notifications/read', authenticate, async (req, res) => {
+  try {
+    const { notificationId, type } = req.body;
+    await markNotificationsRead(req.userId, notificationId, type);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to mark notifications as read' });
+  }
+});
+
+// Mark all notifications as read
+app.put('/api/notifications/read-all', authenticate, async (req, res) => {
+  try {
+    await markNotificationsRead(req.userId);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to mark all notifications as read' });
+  }
+});
+
+// Delete a notification
+app.delete('/api/notifications/:id', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `DELETE FROM notifications WHERE id = $1 AND user_id = $2 RETURNING type, is_read`,
+      [req.params.id, req.userId]
+    );
+    
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+    
+    // Update unread count if it was unread
+    if (!rows[0].is_read) {
+      await redisHIncrBy(`unread-counts:${req.userId}`, 'total', -1);
+      await redisHIncrBy(`unread-counts:${req.userId}`, rows[0].type, -1);
+    }
+    
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete notification' });
+  }
+});
+
+// Update notification style preference
+app.put('/api/user/notification-style', authenticate, async (req, res) => {
+  try {
+    const { style } = req.body;
+    
+    if (!['named', 'minimal', 'descriptive'].includes(style)) {
+      return res.status(400).json({ error: 'Invalid notification style' });
+    }
+    
+    await pool.query(
+      `UPDATE users SET notification_style = $1, updated_at = NOW() WHERE id = $2`,
+      [style, req.userId]
+    );
+    
+    res.json({ success: true, notification_style: style });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update notification style' });
+  }
+});
+
+// Register OneSignal device ID
+app.post('/api/notifications/register-device', authenticate, async (req, res) => {
+  try {
+    const { onesignalId, deviceId } = req.body;
+    
+    if (!onesignalId) {
+      return res.status(400).json({ error: 'OneSignal ID required' });
+    }
+    
+    // Update or insert the device record
+    if (deviceId) {
+      await pool.query(
+        `UPDATE user_devices SET onesignal_id = $1 WHERE user_id = $2 AND device_id = $3`,
+        [onesignalId, req.userId, deviceId]
+      );
+    }
+    
+    // Cache the OneSignal ID
+    await redisSet(`onesignal-id:${req.userId}`, onesignalId, 86400);
+    
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to register device' });
+  }
+});
+
+// In your unsuspend user endpoint:
+app.post('/api/admin/users/:id/unsuspend', adminAuth, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    
+    await pool.query(
+      `UPDATE users SET status = 'active', suspend_until = NULL, suspension_reason = NULL, updated_at = NOW() WHERE id = $1`,
+      [userId]
+    );
+    
+    // Clear any cached notification restrictions
+    await redisDel(`user-suspended:${userId}`);
+    
+    // Notify the user they've been unsuspended
+    io.to(`user-${userId}`).emit('account-unsuspended', {});
+    
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to unsuspend user' });
+  }
+});
+
 app.get("/api/auth/google", passport.authenticate("google", { scope: ["profile", "email"], session: false }));
 app.get("/api/auth/google/callback", passport.authenticate("google", { failureRedirect: "/login", session: false }), (req, res) => { const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
 app.get("/api/auth/discord", passport.authenticate("discord", { session: false }));
