@@ -3009,7 +3009,7 @@ app.post("/api/uploads", authenticateToken, shortsUpload.single("video"), async 
     title,
     description = "",
     category = "general",
-    isShort = "true",
+    is_short = "true",
     isPublic = "true",
     ageRestriction = "none",
   } = req.body;
