@@ -3001,17 +3001,7 @@ app.post("/api/uploadv", authenticateToken, async (req, res) => {
 });
 
 
-// ==========================================
-// /api/uploads — SHORTS UPLOAD
-// ==========================================
-// Expects multipart/form-data:
-//   video: File (required, video/*, max 500MB)
-//   title: string (required)
-//   description?: string
-//   category?: string
-//   isShort?: "true"
-//   isPublic?: "true"
-//   ageRestriction?: string
+
 app.post("/api/uploads", authenticateToken, shortsUpload.single("video"), async (req, res) => {
   const userId = req.userId;
 
