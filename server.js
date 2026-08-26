@@ -3079,7 +3079,7 @@ app.post("/api/uploads", authenticateToken, shortsUpload.single("video"), async 
         category,
         s3Key,
         fileUrl,
-        isShort === "true",
+        is_short === "true",
         isPublic === "true",
         ageRestriction,
         "processing",
