@@ -2545,56 +2545,82 @@ app.get("/api/health", async (req, res) => {
 });
 
 // ==========================================
-// AUTHENTICATION MIDDLEWARE
 // ==========================================
-// Verifies the Bearer token sent from the frontend
+// CONSISTENT AUTH MIDDLEWARE
 // ==========================================
-// AUTH MIDDLEWARE - FIXED FOR YOUR TOKEN FORMAT
-// ==========================================
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: "No Bearer token provided" });
-  }
-  
-  const token = authHeader.split(' ')[1];
-  
-  if (!token) {
-    return res.status(401).json({ error: "Empty token" });
-  }
-  
+const authenticateUser = async (req, res, next) => {
   try {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "No token provided" });
+    }
+
+    const token = authHeader.split(" ")[1];
+    
+    if (!token) {
+      return res.status(401).json({ error: "No token provided" });
+    }
+
     const decoded = jwt.verify(token, JWT_SECRET);
     
-    // Handle different token formats - try multiple field names
-    const userId = decoded.id || decoded.userId || decoded.user_id || decoded.sub;
-    const username = decoded.username || decoded.name || decoded.userName;
+    // Try BOTH common field names for compatibility
+    const userId = decoded.id || decoded.userId || decoded.sub;
     
     if (!userId) {
-      console.error("Token missing user ID. Decoded:", JSON.stringify(decoded, null, 2));
-      return res.status(401).json({ error: "Token missing user ID" });
+      return res.status(401).json({ error: "Invalid token payload" });
     }
-    
-    req.user = {
-      id: parseInt(userId) || userId,  // Ensure it's a number if possible
-      username: username,
-      email: decoded.email,
-      role: decoded.role
-    };
-    
+
+    const { rows } = await pool.query(
+      "SELECT id, username, email, role, profile_url, is_verified, status FROM users WHERE id = $1",
+      [userId]
+    );
+
+    if (!rows.length) {
+      console.error(`[AUTH] User ${userId} not found in database (token was valid)`);
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const user = rows[0];
+
+    // Check if user is suspended
+    if (user.status === 'suspended') {
+      if (user.suspend_until && new Date(user.suspend_until) > new Date()) {
+        return res.status(403).json({ 
+          error: "Account suspended",
+          reason: "Your account is temporarily suspended",
+          until: user.suspend_until
+        });
+      } else if (!user.suspend_until) {
+        return res.status(403).json({ 
+          error: "Account permanently suspended",
+          reason: "Your account has been permanently suspended"
+        });
+      } else {
+        // Suspension expired, reactivate
+        await pool.query(
+          "UPDATE users SET status = 'active', suspend_until = NULL WHERE id = $1",
+          [userId]
+        );
+      }
+    }
+
+    // Attach user to request - USE CONSISTENT NAMING
+    req.user = user;
+    req.userId = user.id;  // For backward compatibility
+
     next();
   } catch (err) {
-    console.error("JWT verify error:", err.message);
-    return res.status(401).json({ error: "Invalid or expired token: " + err.message });
+    if (err.name === 'JsonWebTokenError') {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: "Token expired" });
+    }
+    console.error("[AUTH] Unexpected error:", err);
+    return res.status(500).json({ error: "Authentication failed" });
   }
 };
-
-// ==========================================
-// SETTINGS ROUTES
-// ==========================================
-
-
 // ==========================================
 // LIBRARY / USER DATA ROUTES
 // ==========================================
