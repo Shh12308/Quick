@@ -2548,7 +2548,7 @@ app.get("/api/health", async (req, res) => {
 // ==========================================
 // CONSISTENT AUTH MIDDLEWARE
 // ==========================================
-const authenticateUser = async (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
     
