@@ -6967,6 +6967,302 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
   }
 });
 
+// ═══════ GET /api/users/:id/follow-status ═══════
+app.get("/api/users/:id/follow-status", async (req, res) => {
+  try {
+    const targetUserId = parseInt(req.params.id);
+    const viewerId = req.user?.id;
+
+    if (!viewerId || isNaN(targetUserId) || viewerId === targetUserId) {
+      return res.json({ following: false, requested: false });
+    }
+
+    // Check follow status
+    const followResult = await pool.query(
+      `SELECT status FROM follows 
+       WHERE follower_id = $1 AND following_id = $2 
+       LIMIT 1`,
+      [viewerId, targetUserId]
+    );
+
+    const row = followResult.rows[0];
+    
+    return res.json({
+      following: row?.status === 'accepted',
+      requested: row?.status === 'pending'
+    });
+
+  } catch (err) {
+    console.error("Follow status error:", err);
+    return res.status(500).json({ error: "Failed to fetch follow status" });
+  }
+});
+
+
+// ═══════ POST /api/users/:id/follow ═══════
+app.post("/api/users/:id/follow", async (req, res) => {
+  try {
+    const targetUserId = parseInt(req.params.id);
+    const viewerId = req.user?.id;
+
+    if (!viewerId) {
+      return res.status(401).json({ error: "Must be logged in" });
+    }
+
+    if (isNaN(targetUserId)) {
+      return res.status(400).json({ error: "Invalid user ID" });
+    }
+
+    if (viewerId === targetUserId) {
+      return res.status(400).json({ error: "Cannot follow yourself" });
+    }
+
+    // Check if target user exists and get privacy setting
+    const userResult = await pool.query(
+      `SELECT id, privacy_settings, status FROM users WHERE id = $1`,
+      [targetUserId]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const targetUser = userResult.rows[0];
+
+    if (targetUser.status === 'banned' || targetUser.status === 'suspended') {
+      return res.status(400).json({ error: "Cannot follow this user" });
+    }
+
+    // Parse privacy_settings to check if private
+    let isPrivate = false;
+    try {
+      const privacy = typeof targetUser.privacy_settings === 'string'
+        ? JSON.parse(targetUser.privacy_settings || '{}')
+        : (targetUser.privacy_settings || {});
+      isPrivate = privacy.privateAccount === true;
+    } catch (e) {
+      // If parsing fails, assume public
+    }
+
+    // Check if already following/requested
+    const existing = await pool.query(
+      `SELECT id, status FROM follows 
+       WHERE follower_id = $1 AND following_id = $2`,
+      [viewerId, targetUserId]
+    );
+
+    if (existing.rows.length > 0) {
+      // Already following or has pending request
+      const currentStatus = existing.rows[0].status;
+      return res.json({
+        following: currentStatus === 'accepted',
+        requested: currentStatus === 'pending'
+      });
+    }
+
+    // Create follow with appropriate status
+    const followStatus = isPrivate ? 'pending' : 'accepted';
+
+    await pool.query(
+      `INSERT INTO follows (follower_id, following_id, status, created_at) 
+       VALUES ($1, $2, $3, NOW())`,
+      [viewerId, targetUserId, followStatus]
+    );
+
+    // Only increment followers count if not pending
+    if (followStatus === 'accepted') {
+      await pool.query(
+        `UPDATE users 
+         SET followers_count = COALESCE(followers_count, 0) + 1 
+         WHERE id = $1`,
+        [targetUserId]
+      );
+    }
+
+    return res.json({
+      following: followStatus === 'accepted',
+      requested: followStatus === 'pending'
+    });
+
+  } catch (err) {
+    console.error("Follow error:", err);
+    return res.status(500).json({ error: "Failed to follow user" });
+  }
+});
+
+
+// ═══════ DELETE /api/users/:id/follow ═══════
+app.delete("/api/users/:id/follow", async (req, res) => {
+  try {
+    const targetUserId = parseInt(req.params.id);
+    const viewerId = req.user?.id;
+
+    if (!viewerId) {
+      return res.status(401).json({ error: "Must be logged in" });
+    }
+
+    if (isNaN(targetUserId)) {
+      return res.status(400).json({ error: "Invalid user ID" });
+    }
+
+    // Check if follow exists
+    const existing = await pool.query(
+      `SELECT id, status FROM follows 
+       WHERE follower_id = $1 AND following_id = $2`,
+      [viewerId, targetUserId]
+    );
+
+    if (existing.rows.length === 0) {
+      return res.json({ following: false, requested: false });
+    }
+
+    // Delete the follow
+    await pool.query(
+      `DELETE FROM follows WHERE id = $1`,
+      [existing.rows[0].id]
+    );
+
+    // Decrement followers count only if was accepted
+    if (existing.rows[0].status === 'accepted') {
+      await pool.query(
+        `UPDATE users 
+         SET followers_count = GREATEST(0, COALESCE(followers_count, 0) - 1) 
+         WHERE id = $1`,
+        [targetUserId]
+      );
+    }
+
+    return res.json({ following: false, requested: false });
+
+  } catch (err) {
+    console.error("Unfollow error:", err);
+    return res.status(500).json({ error: "Failed to unfollow user" });
+  }
+});
+
+// ═══════ GET /api/users/me/follow-requests ═══════
+app.get("/api/users/me/follow-requests", async (req, res) => {
+  try {
+    const viewerId = req.user?.id;
+    if (!viewerId) {
+      return res.status(401).json({ error: "Must be logged in" });
+    }
+
+    const result = await pool.query(
+      `SELECT f.id, f.follower_id, f.created_at,
+              u.username, u.display_name, u.profile_url
+       FROM follows f
+       JOIN users u ON u.id = f.follower_id
+       WHERE f.following_id = $1 AND f.status = 'pending'
+       ORDER BY f.created_at DESC`,
+      [viewerId]
+    );
+
+    return res.json({
+      requests: result.rows.map(r => ({
+        id: r.id,
+        userId: r.follower_id,
+        username: r.username,
+        displayName: r.display_name || r.username,
+        avatar: r.profile_url,
+        requestedAt: r.created_at
+      }))
+    });
+
+  } catch (err) {
+    console.error("Follow requests error:", err);
+    return res.status(500).json({ error: "Failed to fetch follow requests" });
+  }
+});
+
+
+// ═══════ POST /api/users/me/follow-requests/:requestId/accept ═══════
+app.post("/api/users/me/follow-requests/:requestId/accept", async (req, res) => {
+  try {
+    const viewerId = req.user?.id;
+    const requestId = parseInt(req.params.requestId);
+
+    if (!viewerId) {
+      return res.status(401).json({ error: "Must be logged in" });
+    }
+
+    // Get the follow request
+    const request = await pool.query(
+      `SELECT follower_id FROM follows 
+       WHERE id = $1 AND following_id = $2 AND status = 'pending'`,
+      [requestId, viewerId]
+    );
+
+    if (request.rows.length === 0) {
+      return res.status(404).json({ error: "Request not found" });
+    }
+
+    const followerId = request.rows[0].follower_id;
+
+    // Update status
+    await pool.query(
+      `UPDATE follows SET status = 'accepted' WHERE id = $1`,
+      [requestId]
+    );
+
+    // Increment followers count
+    await pool.query(
+      `UPDATE users 
+       SET followers_count = COALESCE(followers_count, 0) + 1 
+       WHERE id = $1`,
+      [viewerId]
+    );
+
+    // Create notification (optional)
+    try {
+      await pool.query(
+        `INSERT INTO notifications (user_id, from_user_id, type, reference_id, created_at)
+         VALUES ($1, $2, 'follow_accepted', $3, NOW())`,
+        [followerId, viewerId, requestId]
+      );
+    } catch (e) {
+      // Notifications table might not exist, that's ok
+    }
+
+    return res.json({ success: true, message: "Follow request accepted" });
+
+  } catch (err) {
+    console.error("Accept request error:", err);
+    return res.status(500).json({ error: "Failed to accept request" });
+  }
+});
+
+
+// ═══════ POST /api/users/me/follow-requests/:requestId/reject ═══════
+app.post("/api/users/me/follow-requests/:requestId/reject", async (req, res) => {
+  try {
+    const viewerId = req.user?.id;
+    const requestId = parseInt(req.params.requestId);
+
+    if (!viewerId) {
+      return res.status(401).json({ error: "Must be logged in" });
+    }
+
+    // Delete the follow request
+    const result = await pool.query(
+      `DELETE FROM follows 
+       WHERE id = $1 AND following_id = $2 AND status = 'pending'
+       RETURNING id`,
+      [requestId, viewerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Request not found" });
+    }
+
+    return res.json({ success: true, message: "Follow request rejected" });
+
+  } catch (err) {
+    console.error("Reject request error:", err);
+    return res.status(500).json({ error: "Failed to reject request" });
+  }
+});
+
 app.get("/videos", (req, res) => { res.redirect("/api/videos"); });
 app.get("/users/me", (req, res) => { res.redirect("/api/users/me"); });
 
