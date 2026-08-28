@@ -8402,7 +8402,7 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
 // FOLLOW / UNFOLLOW — MUST be BEFORE the catch-all user route
 // ==========================================
 
-app.post('/api/users/:username/follow', async (req, res) => {
+app.post('/api/users/:userId/follow', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Not authenticated' });
@@ -8554,7 +8554,7 @@ app.put("/api/users/profile", async (req, res) => {
 });
 
 
-app.post('/api/users/:username/unfollow', async (req, res) => {
+app.post('/api/users/:userId/unfollow', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Not authenticated' });
