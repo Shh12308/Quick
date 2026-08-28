@@ -3849,7 +3849,7 @@ app.get("/api/users/:username", async (req, res) => {
     const { username } = req.params;
     const viewerId = req.user?.id || null;
 
-    // 1. Fetch user — NO created_at (doesn't exist), use updated_at instead
+    // 1. Fetch user
     const result = await pool.query(
       `SELECT id, username, display_name, profile_url, cover_url, bio, 
               location, website, is_verified, is_musician, is_creator, 
@@ -3865,6 +3865,7 @@ app.get("/api/users/:username", async (req, res) => {
     }
 
     const u = result.rows[0];
+    const isSelf = viewerId && viewerId === u.id;
 
     // Parse privacy_settings jsonb
     const privacy = typeof u.privacy_settings === 'string'
@@ -3887,12 +3888,13 @@ app.get("/api/users/:username", async (req, res) => {
       isMusician: u.is_musician || false,
       banned: isBanned,
       isPrivate,
+      isSelf,  // ← ADD THIS
       blockedByViewer: false,
       viewerBlockedUser: false,
       isFollowing: false,
       followersCount: u.followers_count || 0,
       followingCount: 0,
-      createdAt: u.updated_at  // mapped to what exists
+      createdAt: u.updated_at
     };
 
     const response = {
@@ -3921,7 +3923,7 @@ app.get("/api/users/:username", async (req, res) => {
           userProfile.viewerBlockedUser = blockResult.rows[0].blocker_id === u.id;
         }
       } catch (e) {
-        console.log("blocked_users error:", e.message);
+        console.error("blocked_users error:", e);
       }
     }
 
@@ -3929,35 +3931,34 @@ app.get("/api/users/:username", async (req, res) => {
       return res.json(response);
     }
 
-    // 3. Check following
+    // 3. Check following — ALWAYS fetch, not just for non-owners
     if (viewerId && viewerId !== u.id) {
       try {
         const followResult = await pool.query(
           `SELECT 1 FROM follows 
-           WHERE follower_id::text = $1::text 
-             AND following_id::text = $2::text 
+           WHERE follower_id = $1 AND following_id = $2 
            LIMIT 1`,
           [viewerId, u.id]
         );
         userProfile.isFollowing = followResult.rows.length > 0;
       } catch (e) {
-        console.log("follows error:", e.message);
-      }
-
-      try {
-        const countResult = await pool.query(
-          `SELECT COUNT(*) as count FROM follows 
-           WHERE follower_id::text = $1::text`,
-          [u.id]
-        );
-        userProfile.followingCount = parseInt(countResult.rows[0]?.count) || 0;
-      } catch (e) {
-        console.log("following count error:", e.message);
+        console.error("follows check error:", e);
       }
     }
 
-    // 4. Privacy check
-    const canViewContent = !isPrivate || viewerId === u.id || userProfile.isFollowing;
+    // 4. ALWAYS fetch following count (owner should see their own count too)
+    try {
+      const countResult = await pool.query(
+        `SELECT COUNT(*)::int as count FROM follows WHERE follower_id = $1`,
+        [u.id]
+      );
+      userProfile.followingCount = countResult.rows[0]?.count || 0;
+    } catch (e) {
+      console.error("following count error:", e);
+    }
+
+    // 5. Privacy check
+    const canViewContent = !isPrivate || isSelf || userProfile.isFollowing;
     if (!canViewContent) {
       return res.json(response);
     }
@@ -3966,18 +3967,16 @@ app.get("/api/users/:username", async (req, res) => {
     const fmtDuration = (secs) => {
       if (!secs) return "0:00";
       const m = Math.floor(secs / 60);
-      const s = secs % 60;
+      const s = Math.floor(secs % 60);
       return `${m}:${s.toString().padStart(2, '0')}`;
     };
 
-    // 5. Stories
+    // 6. Stories
     try {
       const storiesResult = await pool.query(
         `SELECT id, media_url, media_type, duration, created_at
          FROM stories 
-         WHERE user_id = $1 
-           AND is_active = true 
-           AND expires_at > NOW()
+         WHERE user_id = $1 AND is_active = true AND expires_at > NOW()
          ORDER BY created_at ASC`,
         [u.id]
       );
@@ -3990,10 +3989,10 @@ app.get("/api/users/:username", async (req, res) => {
         reactions: []
       }));
     } catch (e) {
-      console.log("stories error:", e.message);
+      console.error("stories error:", e);
     }
 
-    // 6. Highlights
+    // 7. Highlights
     try {
       const highlightsResult = await pool.query(
         `SELECT id, title, cover_url FROM highlights 
@@ -4007,32 +4006,49 @@ app.get("/api/users/:username", async (req, res) => {
         cover: h.cover_url
       }));
     } catch (e) {
-      console.log("highlights error:", e.message);
+      console.error("highlights error:", e);
     }
 
-    // 7. Videos
+    // 8. Videos
     try {
       const videosResult = await pool.query(
-        `SELECT id, title, thumbnail_url, duration, views, created_at
+        `SELECT id, title, thumbnail_url, duration, views, created_at, is_short
          FROM videos 
          WHERE user_id = $1 AND is_public = true
          ORDER BY created_at DESC`,
         [u.id]
       );
-      response.videos = videosResult.rows.map(v => ({
-        id: v.id,
-        title: v.title,
-        thumbnail: v.thumbnail_url,
-        duration: fmtDuration(v.duration),
-        views: parseInt(v.views) || 0,
-        type: "video",
-        createdAt: v.created_at
-      }));
+      
+      // Split into videos and shorts
+      const regularVideos = [];
+      const shortsVideos = [];
+      
+      videosResult.rows.forEach(v => {
+        const item = {
+          id: v.id,
+          title: v.title,
+          thumbnail: v.thumbnail_url,
+          duration: fmtDuration(v.duration),
+          views: parseInt(v.views) || 0,
+          type: "video",
+          isShort: v.is_short || false,
+          createdAt: v.created_at
+        };
+        
+        if (v.is_short) {
+          shortsVideos.push(item);
+        } else {
+          regularVideos.push(item);
+        }
+      });
+      
+      response.videos = regularVideos;
+      response.shorts = shortsVideos;
     } catch (e) {
-      console.log("videos error:", e.message);
+      console.error("videos error:", e);
     }
 
-    // 8. Music
+    // 9. Music
     try {
       const musicResult = await pool.query(
         `SELECT id, title, cover_url, duration, listens, created_at
@@ -4051,16 +4067,51 @@ app.get("/api/users/:username", async (req, res) => {
         createdAt: m.created_at
       }));
     } catch (e) {
-      console.log("music error:", e.message);
+      console.error("music error:", e);
     }
 
-    // 9. Liked videos (owner only)
-    if (viewerId === u.id) {
+    // 10. Reposts
+    try {
+      const repostsResult = await pool.query(
+        `SELECT r.id, r.video_id, r.pinned, r.created_at,
+                v.id as vid_id, v.title, v.thumbnail_url, v.duration, v.views, v.is_short,
+                u.username as original_username, u.display_name as original_display_name
+         FROM reposts r
+         JOIN videos v ON v.id = r.video_id
+         LEFT JOIN users u ON u.id = v.user_id
+         WHERE r.user_id = $1
+         ORDER BY r.pinned DESC, r.created_at DESC`,
+        [u.id]
+      );
+      response.reposts = repostsResult.rows.map(r => ({
+        id: r.id,
+        pinned: r.pinned,
+        createdAt: r.created_at,
+        originalVideo: {
+          id: r.vid_id,
+          title: r.title,
+          thumbnail: r.thumbnail_url,
+          duration: fmtDuration(r.duration),
+          views: parseInt(r.views) || 0,
+          isShort: r.is_short || false,
+          createdAt: r.created_at,
+          originalUser: {
+            username: r.original_username,
+            displayName: r.original_display_name
+          }
+        }
+      }));
+    } catch (e) {
+      console.error("reposts error:", e);
+    }
+
+    // 11. Liked videos (owner only)
+    if (isSelf) {
       try {
         const likesResult = await pool.query(
-          `SELECT v.id, v.title, v.thumbnail_url, v.duration, v.views, v.created_at
+          `SELECT v.id, v.title, v.thumbnail_url, v.duration, v.views, v.created_at, v.is_short
            FROM likes l
-           JOIN videos v ON v.id::text = l.content_id::text
+           JOIN videos v ON v.id = l.content_id
            WHERE l.user_id = $1 AND l.content_type = 'video'
            ORDER BY l.created_at DESC
            LIMIT 100`,
@@ -4073,13 +4124,16 @@ app.get("/api/users/:username", async (req, res) => {
           duration: fmtDuration(v.duration),
           views: parseInt(v.views) || 0,
           type: "video",
+          isShort: v.is_short || false,
           createdAt: v.created_at
         }));
       } catch (e) {
-        console.log("likes error:", e.message);
+        console.error("likes error:", e);
       }
     }
 
+    console.log(`Profile ${username}: ${response.videos.length} videos, ${response.shorts.length} shorts, ${response.music.length} music, ${response.reposts.length} reposts, ${response.likes.length} likes`);
+    
     return res.json(response);
 
   } catch (err) {
@@ -4087,7 +4141,6 @@ app.get("/api/users/:username", async (req, res) => {
     return res.status(500).json({ error: "Failed to fetch profile" });
   }
 });
-
 
 // ==========================================
 // WALLET / COIN PURCHASE ENDPOINTS
