@@ -3629,12 +3629,146 @@ app.get('/api/videos', optionalAuth, async (req, res) => {
 // ==========================================
 app.get('/api/search', async (req, res) => {
   try {
-    if (!req.query.q?.trim()) return res.json({ users: [] });
-    const q = req.query.q.trim();
-    const { rows } = await pool.query(`SELECT id, username, profile_url as avatar, CONCAT('@', username) as handle FROM users WHERE username ILIKE $1 OR display_name ILIKE $1 ORDER BY followers_count DESC LIMIT 20`, [`%${q}%`]);
-    res.json({ users: rows });
+    const q = req.query.q?.trim();
+
+    const emptyResult = {
+      videos: [],
+      shorts: [],
+      users: [],
+      livestreams: [],
+      music: []
+    };
+
+    if (!q) {
+      return res.json(emptyResult);
+    }
+
+    const search = `%${q}%`;
+
+    const [
+      usersResult,
+      videosResult,
+      liveResult,
+      musicResult
+    ] = await Promise.all([
+      // USERS
+      pool.query(`
+        SELECT
+          id,
+          username,
+          profile_url AS avatar,
+          CONCAT('@', username) AS handle,
+          bio,
+          followers_count AS followers
+        FROM users
+        WHERE
+          username ILIKE $1
+          OR display_name ILIKE $1
+        ORDER BY followers_count DESC
+        LIMIT 20
+      `, [search]),
+
+      // VIDEOS + SHORTS
+      pool.query(`
+        SELECT
+          v.*,
+          u.username,
+          u.profile_url AS avatar
+        FROM videos v
+        LEFT JOIN users u ON u.id = v.user_id
+        WHERE
+          v.title ILIKE $1
+          OR v.description ILIKE $1
+          OR u.username ILIKE $1
+        ORDER BY v.created_at DESC
+        LIMIT 40
+      `, [search]),
+
+      // LIVESTREAMS
+      pool.query(`
+        SELECT
+          l.*,
+          u.username,
+          u.profile_url AS avatar
+        FROM livestreams l
+        LEFT JOIN users u ON u.id = l.user_id
+        WHERE
+          l.title ILIKE $1
+          OR l.description ILIKE $1
+          OR u.username ILIKE $1
+        ORDER BY l.created_at DESC
+        LIMIT 20
+      `, [search]),
+
+      // MUSIC
+      pool.query(`
+        SELECT
+          m.*,
+          u.username,
+          u.profile_url AS avatar
+        FROM music m
+        LEFT JOIN users u ON u.id = m.user_id
+        WHERE
+          m.title ILIKE $1
+          OR m.artist ILIKE $1
+          OR m.album ILIKE $1
+          OR u.username ILIKE $1
+        ORDER BY m.created_at DESC
+        LIMIT 20
+      `, [search])
+    ]);
+
+    const allVideos = videosResult.rows;
+
+    const videos = allVideos
+      .filter(v => !v.is_short && !v.is_live)
+      .map(v => ({
+        ...v,
+        type: 'video'
+      }));
+
+    const shorts = allVideos
+      .filter(v => v.is_short)
+      .map(v => ({
+        ...v,
+        type: 'short'
+      }));
+
+    const livestreams = [
+      ...liveResult.rows
+    ].map(l => ({
+      ...l,
+      type: 'livestream',
+      is_live: true
+    }));
+
+    const music = musicResult.rows.map(m => ({
+      ...m,
+      type: 'music'
+    }));
+
+    res.json({
+      videos,
+      shorts,
+      users: usersResult.rows.map(u => ({
+        ...u,
+        type: 'user'
+      })),
+      livestreams,
+      music
+    });
+
   } catch (err) {
-    res.status(500).json({ error: "Search failed", users: [] });
+    console.error('Search failed:', err);
+
+    res.status(500).json({
+      error: 'Search failed',
+      videos: [],
+      shorts: [],
+      users: [],
+      livestreams: [],
+      music: []
+    });
   }
 });
 
