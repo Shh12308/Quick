@@ -7375,7 +7375,7 @@ app.delete(
 );
 
 // ═══════ GET /api/users/me/follow-requests ═══════
-app.get("/api/users/me/follow-requests", async (req, res) => {
+app.get("/api/users/me/follow-requests", authMiddleware, async (req, res) => {
   try {
     const viewerId = req.user?.id;
     if (!viewerId) {
@@ -7411,7 +7411,7 @@ app.get("/api/users/me/follow-requests", async (req, res) => {
 
 
 // ═══════ POST /api/users/me/follow-requests/:requestId/accept ═══════
-app.post("/api/users/me/follow-requests/:requestId/accept", async (req, res) => {
+app.post("/api/users/me/follow-requests/:requestId/accept", authMiddleware, async (req, res) => {
   try {
     const viewerId = req.user?.id;
     const requestId = parseInt(req.params.requestId);
@@ -7468,7 +7468,7 @@ app.post("/api/users/me/follow-requests/:requestId/accept", async (req, res) => 
 
 
 // ═══════ POST /api/users/me/follow-requests/:requestId/reject ═══════
-app.post("/api/users/me/follow-requests/:requestId/reject", async (req, res) => {
+app.post("/api/users/me/follow-requests/:requestId/reject", authMiddleware, async (req, res) => {
   try {
     const viewerId = req.user?.id;
     const requestId = parseInt(req.params.requestId);
