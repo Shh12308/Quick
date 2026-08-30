@@ -8191,74 +8191,112 @@ app.get('/api/users/:userId/following', authenticateToken, async (req, res) => {
 // Create or get existing chat with a user
 app.post('/api/chats/direct', authenticateToken, async (req, res) => {
   try {
-    const { userId } = req.body;
-    const currentUserId = req.user.id;
-    
-    if (!userId || userId === currentUserId) {
+    const targetUserId = Number(req.body.userId);
+    const currentUserId = Number(req.user.id);
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
       return res.status(400).json({ error: "Invalid user ID" });
     }
-    
-    // Check if user exists
+
+    if (!Number.isInteger(currentUserId) || currentUserId === targetUserId) {
+      return res.status(400).json({ error: "Invalid user ID" });
+    }
+
+    // Check if target user exists
     const { rows: userCheck } = await pool.query(
-      "SELECT id, username, profile_url FROM users WHERE id = $1",
-      [userId]
+      `SELECT id, username, profile_url
+       FROM users
+       WHERE id = $1::integer`,
+      [targetUserId]
     );
-    
+
     if (!userCheck.length) {
       return res.status(404).json({ error: "User not found" });
     }
-    
-    // Check for existing chat
+
+    // Check for an existing direct/private chat
     const { rows: existingChat } = await pool.query(
-      `SELECT c.* FROM chats c
-       JOIN chat_participants cp1 ON c.id = cp1.chat_id AND cp1.user_id = $1
-       JOIN chat_participants cp2 ON c.id = cp2.chat_id AND cp2.user_id = $2
+      `SELECT c.*
+       FROM chats c
+       JOIN chat_participants cp1
+         ON c.id = cp1.chat_id
+        AND cp1.user_id = $1::integer
+       JOIN chat_participants cp2
+         ON c.id = cp2.chat_id
+        AND cp2.user_id = $2::integer
        WHERE c.type = 'private'
        LIMIT 1`,
-      [currentUserId, userId]
+      [currentUserId, targetUserId]
     );
-    
+
     if (existingChat.length > 0) {
-      // Return existing chat
       const chat = existingChat[0];
-      res.json({
+
+      return res.json({
         id: chat.id,
         type: chat.type,
         name: userCheck[0].username,
         avatar: userCheck[0].profile_url,
-        otherUserId: userId
+        otherUserId: targetUserId
       });
-      return;
     }
-    
+
     // Create new chat
     const { rows: newChat } = await pool.query(
-      `INSERT INTO chats (creator_id, type, name, avatar, participants, created_at)
-       VALUES ($1, 'private', $2, $3, ARRAY[$1, $4], NOW())
+      `INSERT INTO chats (
+         creator_id,
+         type,
+         name,
+         avatar,
+         participants,
+         created_at
+       )
+       VALUES (
+         $1::integer,
+         'private',
+         $2,
+         $3,
+         ARRAY[$1::integer, $4::integer],
+         NOW()
+       )
        RETURNING *`,
-      [currentUserId, userCheck[0].username, userCheck[0].profile_url, userId]
+      [
+        currentUserId,
+        userCheck[0].username,
+        userCheck[0].profile_url,
+        targetUserId
+      ]
     );
-    
+
     const chatId = newChat[0].id;
-    
-    // Add participants to chat_participants table
+
+    // Add both users to chat_participants
     await pool.query(
-      `INSERT INTO chat_participants (chat_id, user_id, joined_at) VALUES 
-       ($1, $2, NOW()), ($1, $3, NOW())`,
-      [chatId, currentUserId, userId]
+      `INSERT INTO chat_participants (
+         chat_id,
+         user_id,
+         created_at
+       )
+       VALUES
+         ($1::uuid, $2::integer, NOW()),
+         ($1::uuid, $3::integer, NOW())
+       ON CONFLICT (chat_id, user_id) DO NOTHING`,
+      [chatId, currentUserId, targetUserId]
     );
-    
-    res.json({
+
+    return res.json({
       id: chatId,
       type: 'private',
       name: userCheck[0].username,
       avatar: userCheck[0].profile_url,
-      otherUserId: userId
+      otherUserId: targetUserId
     });
-    
+
   } catch (err) {
     console.error("Create direct chat error:", err);
-    res.status(500).json({ error: "Failed to create chat" });
+    return res.status(500).json({
+      error: "Failed to create chat"
+    });
   }
 });
 
