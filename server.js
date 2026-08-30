@@ -5469,6 +5469,31 @@ app.put('/api/users/profile', async (req, res) => {
   }
 });
 
+// Cleanup stale streams for a user
+app.post("/api/livestreams/cleanup", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+    
+    const result = await db.query(
+      `UPDATE livestreams 
+       SET status = 'ended', ended_at = NOW() 
+       WHERE user_id = $1 AND status = 'live'
+       RETURNING stream_id`,
+      [userId]
+    );
+
+    if (result.rows.length > 0) {
+      console.log(`Cleaned up ${result.rows.length} stale stream(s) for user ${userId}`);
+      return res.json({ cleaned: true, count: result.rows.length });
+    }
+
+    res.json({ cleaned: false, count: 0 });
+  } catch (err) {
+    console.error("Cleanup error:", err);
+    res.status(500).json({ error: "Cleanup failed" });
+  }
+});
+
 // Get current user's videos
 app.get('/api/users/my/videos', async (req, res) => {
   try {
@@ -6330,6 +6355,8 @@ app.delete('/api/settings/login-activity/:id', authenticateToken, async (req, re
     res.status(500).json({ error: true, msg: "Failed to revoke session" });
   }
 });
+
+
 
 // 8. Get Blocked Users
 app.get('/api/settings/blocked', authenticateToken, async (req, res) => {
