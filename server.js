@@ -5363,6 +5363,7 @@ app.post("/api/chats/:chatId/messages", authenticateREST, async (req, res) => {
 // ==========================================
 
 // Get current user's profile
+// Get current user's profile
 app.get('/api/users/profile', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
@@ -5374,8 +5375,8 @@ app.get('/api/users/profile', async (req, res) => {
       `SELECT 
         id, username, email, display_name, bio, location, website,
         profile_url, cover_url, is_verified, role,
-        subscribers_count, total_views, following_count,
-        is_private, created_at,
+        followers_count, following_count,
+        privacy_settings, created_at,
         (SELECT COUNT(*) FROM videos WHERE user_id = users.id AND is_short = false AND is_public = true) as video_count,
         (SELECT COUNT(*) FROM videos WHERE user_id = users.id AND is_short = true AND is_public = true) as short_count
        FROM users 
@@ -5389,6 +5390,15 @@ app.get('/api/users/profile', async (req, res) => {
 
     const user = rows[0];
 
+    // Parse privacy_settings to derive is_private
+    let isPrivate = false;
+    try {
+      const ps = typeof user.privacy_settings === 'string' 
+        ? JSON.parse(user.privacy_settings) 
+        : (user.privacy_settings || {});
+      isPrivate = ps.privateAccount === true;
+    } catch {}
+
     res.json({
       id: user.id,
       username: user.username,
@@ -5401,10 +5411,11 @@ app.get('/api/users/profile', async (req, res) => {
       cover_url: user.cover_url,
       is_verified: user.is_verified,
       role: user.role,
-      subscribers_count: user.subscribers_count || 0,
-      total_views: user.total_views || 0,
+      // ✅ Fixed column names
+      subscribers_count: user.followers_count || 0,
+      total_views: 0,  // No column exists — compute if needed (see below)
       following_count: user.following_count || 0,
-      is_private: user.is_private || false,
+      is_private: isPrivate,
       video_count: user.video_count || 0,
       short_count: user.short_count || 0,
       created_at: user.created_at,
