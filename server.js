@@ -7815,6 +7815,200 @@ app.get('/api/notifications/unread-count', authenticateToken, async (req, res) =
   }
 });
 
+app.get("/api/messages/search", async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const q = String(req.query.q || "").trim();
+
+    if (!q) {
+      return res.json({
+        users: [],
+        chats: []
+      });
+    }
+
+    const search = `%${q}%`;
+
+    // Users you can start/message a chat with
+    const usersResult = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.name,
+        u.display_name,
+        u.profile_url,
+        u.is_verified,
+        u.status
+      FROM users u
+      WHERE u.id <> $1
+        AND u.status = 'active'
+        AND (
+          u.username ILIKE $2
+          OR u.name ILIKE $2
+          OR u.display_name ILIKE $2
+        )
+        AND COALESCE(
+          (u.privacy_settings->>'allowDirectMessages')::boolean,
+          true
+        ) = true
+      ORDER BY
+        CASE
+          WHEN LOWER(u.username) = LOWER($3) THEN 0
+          WHEN LOWER(u.display_name) = LOWER($3) THEN 1
+          ELSE 2
+        END,
+        u.username
+      LIMIT 20
+      `,
+      [userId, search, q]
+    );
+
+    // Existing chats
+    const chatsResult = await pool.query(
+      `
+      SELECT DISTINCT
+        c.id,
+        c.type,
+        c.name,
+        c.avatar,
+        c.last_message,
+        c.last_message_at
+      FROM chats c
+      JOIN chat_participants cp
+        ON cp.chat_id = c.id
+      WHERE cp.user_id = $1
+        AND (
+          c.name ILIKE $2
+          OR EXISTS (
+            SELECT 1
+            FROM chat_participants cp2
+            JOIN users u ON u.id = cp2.user_id
+            WHERE cp2.chat_id = c.id
+              AND cp2.user_id <> $1
+              AND (
+                u.username ILIKE $2
+                OR u.name ILIKE $2
+                OR u.display_name ILIKE $2
+              )
+          )
+        )
+      ORDER BY c.last_message_at DESC NULLS LAST
+      LIMIT 20
+      `,
+      [userId, search]
+    );
+
+    res.json({
+      users: usersResult.rows,
+      chats: chatsResult.rows
+    });
+
+  } catch (err) {
+    console.error("Message search error:", err);
+    res.status(500).json({
+      error: "Failed to search messages"
+    });
+  }
+});
+
+app.get("/api/chats", async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const result = await pool.query(
+      `
+      SELECT
+        c.id,
+        c.type,
+        c.name,
+        c.avatar,
+        c.last_message,
+        c.last_message_id,
+        c.last_message_at,
+        c.is_archived,
+
+        CASE
+          WHEN $1 = ANY(c.pinned_by)
+          THEN true
+          ELSE false
+        END AS is_pinned,
+
+        CASE
+          WHEN EXISTS (
+            SELECT 1
+            FROM jsonb_each_text(
+              COALESCE(c.muted_by::jsonb, '{}'::jsonb)
+            ) AS m(key, value)
+            WHERE m.key = $1::text
+              AND m.value = 'true'
+          )
+          THEN true
+          ELSE false
+        END AS is_muted,
+
+        other_user.id AS other_user_id,
+        other_user.username AS other_username,
+        other_user.name AS other_name,
+        other_user.display_name AS other_display_name,
+        other_user.profile_url AS other_profile_url,
+        other_user.is_verified AS other_is_verified,
+
+        COALESCE(unread.unread_count, 0) AS unread_count
+
+      FROM chats c
+
+      JOIN chat_participants me
+        ON me.chat_id = c.id
+       AND me.user_id = $1
+
+      LEFT JOIN LATERAL (
+        SELECT u.*
+        FROM chat_participants cp
+        JOIN users u ON u.id = cp.user_id
+        WHERE cp.chat_id = c.id
+          AND cp.user_id <> $1
+        ORDER BY cp.created_at
+        LIMIT 1
+      ) other_user ON true
+
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::integer AS unread_count
+        FROM messages m
+        LEFT JOIN chat_read_states rs
+          ON rs.chat_id = c.id
+         AND rs.user_id = $1
+        WHERE m.chat_id = c.id
+          AND m.sender_id <> $1
+          AND (
+            rs.last_read_at IS NULL
+            OR COALESCE(m.timestamp, m.created_at) > rs.last_read_at
+          )
+      ) unread ON true
+
+      WHERE c.is_archived = false
+
+      ORDER BY
+        CASE
+          WHEN $1 = ANY(c.pinned_by) THEN 0
+          ELSE 1
+        END,
+        c.last_message_at DESC NULLS LAST,
+        c.created_at DESC
+      `,
+      [userId]
+    );
+
+    res.json(result.rows);
+
+  } catch (err) {
+    console.error("GET /api/chats:", err);
+    res.status(500).json({
+      error: "Failed to load chats"
+    });
+  }
+});
+
 // DELETE /api/notifications/read - Delete all read notifications
 app.delete('/api/notifications/read', authenticateToken, async (req, res) => {
   try {
