@@ -5557,6 +5557,51 @@ app.post("/api/chats/:chatId/messages", authenticateREST, async (req, res) => {
   }
 });
 
+app.post("/api/chats/direct", authenticateREST, async (req, res) => {
+  try {
+    const myId = req.user.id;
+    const targetId = parseInt(req.body?.userId, 10);
+
+    if (!targetId || isNaN(targetId)) {
+      return res.status(400).json({ error: "Invalid user" });
+    }
+    if (targetId === myId) {
+      return res.status(400).json({ error: "Cannot chat with yourself" });
+    }
+
+    const targetUser = await pool.query(
+      "SELECT id FROM users WHERE id = $1", [targetId]
+    );
+    if (targetUser.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Find existing DM
+    const existing = await pool.query(
+      `SELECT id FROM chats
+       WHERE type = 'private' AND $1 = ANY(participants) AND $2 = ANY(participants)
+       LIMIT 1`,
+      [myId, targetId]
+    );
+    if (existing.rows.length > 0) {
+      return res.json({ id: existing.rows[0].id });
+    }
+
+    // Create DM
+    const created = await pool.query(
+      `INSERT INTO chats (participants, type, created_at)
+       VALUES (ARRAY[$1::int, $2::int], 'private', NOW())
+       RETURNING id`,
+      [myId, targetId]
+    );
+
+    res.json({ id: created.rows[0].id });
+  } catch (err) {
+    console.error("Direct chat error:", err.message);
+    res.status(500).json({ error: "Failed to create chat" });
+  }
+});
+
 // ==========================================
 // USER PROFILE & "MY CONTENT" ROUTES
 // ==========================================
