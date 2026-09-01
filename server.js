@@ -1477,6 +1477,21 @@ async function awardPassiveChannelPoints() {
 // Run every 10 minutes
 setInterval(awardPassiveChannelPoints, 10 * 60 * 1000);
 
+async function safeAddColumn(tableName, columnName, definition) {
+  try {
+    await pool.query(`
+      ALTER TABLE ${tableName}
+      ADD COLUMN IF NOT EXISTS ${columnName} ${definition}
+    `);
+  } catch (error) {
+    console.error(
+      `❌ Failed to add column ${tableName}.${columnName}:`,
+      error.message
+    );
+    throw error;
+  }
+}
+
 // ==========================================
 // DATABASE INITIALIZATION
 // ==========================================
