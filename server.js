@@ -1480,70 +1480,78 @@ setInterval(awardPassiveChannelPoints, 10 * 60 * 1000);
 // ==========================================
 // DATABASE INITIALIZATION
 // ==========================================
-async function safeAddColumn(table, column, definition) {
-  try {
-    await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
-  } catch (err) {
-    console.warn(`Column ${table}.${column} may already exist: ${err.message}`);
-  }
-}
-
 async function initializeTables() {
   try {
-    // 1. USERS FIRST — referenced by everything else
+    // ============================================================
+    // UUID SUPPORT
+    // ============================================================
+
+    await pool.query(`
+      CREATE EXTENSION IF NOT EXISTS pgcrypto
+    `);
+
+    // ============================================================
+    // 1. USERS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY, 
-      username VARCHAR(255) UNIQUE NOT NULL, 
-      email VARCHAR(255) UNIQUE NOT NULL, 
-      password_hash VARCHAR(255), 
-      phone VARCHAR(20), 
-      device_id VARCHAR(255), 
-      profile_url TEXT, 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      username VARCHAR(255) UNIQUE NOT NULL,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password_hash VARCHAR(255),
+      phone VARCHAR(20),
+      device_id VARCHAR(255),
+      profile_url TEXT,
       cover_url TEXT,
-      bio TEXT, 
+      bio TEXT,
       location TEXT,
       website TEXT,
-      social_links JSON, 
-      role VARCHAR(20) DEFAULT 'free', 
-      subscription_plan VARCHAR(20) DEFAULT 'free', 
-      subscription_expires TIMESTAMP, 
-      is_musician BOOLEAN DEFAULT false, 
-      is_creator BOOLEAN DEFAULT false, 
-      is_admin BOOLEAN DEFAULT false, 
-      is_verified BOOLEAN DEFAULT false, 
-      status VARCHAR(20) DEFAULT 'active', 
-      suspend_until TIMESTAMP, 
-      suspension_reason TEXT, 
-      auth_provider VARCHAR(50), 
-      earnings DECIMAL(10, 2) DEFAULT 0, 
-      balance DECIMAL(10, 2) DEFAULT 0, 
-      dob DATE, 
+      social_links JSON,
+      role VARCHAR(20) DEFAULT 'free',
+      subscription_plan VARCHAR(20) DEFAULT 'free',
+      subscription_expires TIMESTAMP,
+      is_musician BOOLEAN DEFAULT false,
+      is_creator BOOLEAN DEFAULT false,
+      is_admin BOOLEAN DEFAULT false,
+      is_verified BOOLEAN DEFAULT false,
+      status VARCHAR(20) DEFAULT 'active',
+      suspend_until TIMESTAMP,
+      suspension_reason TEXT,
+      auth_provider VARCHAR(50),
+      earnings DECIMAL(10, 2) DEFAULT 0,
+      balance DECIMAL(10, 2) DEFAULT 0,
+      dob DATE,
       warning_count INTEGER DEFAULT 0,
-      preferences JSON, 
-      failed_login_count INTEGER DEFAULT 0, 
-      last_login_at TIMESTAMP, 
-      created_at TIMESTAMP DEFAULT NOW(), 
+      preferences JSON,
+      failed_login_count INTEGER DEFAULT 0,
+      last_login_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW(),
-      notification_style VARCHAR(20) DEFAULT 'named'
+      notification_style VARCHAR(20) DEFAULT 'named',
+      privacy_settings JSONB DEFAULT '{"profileVisibility":"public","allowComments":true,"allowDirectMessages":true,"allowDownloads":true,"privateAccount":false,"hideViewHistory":false}',
+      hidden_words TEXT[] DEFAULT '{}'
     )`);
 
-    // 2. INDEPENDENT TABLES (no foreign keys)
+    // ============================================================
+    // 2. INDEPENDENT TABLES
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS banned_devices (
-      id SERIAL PRIMARY KEY,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       identifier VARCHAR(255) UNIQUE NOT NULL,
       reason TEXT,
       banned_at TIMESTAMP DEFAULT NOW()
     )`);
 
     await pool.query(`CREATE TABLE IF NOT EXISTS password_resets (
-      id SERIAL PRIMARY KEY,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       email VARCHAR(255) NOT NULL,
       code VARCHAR(10) NOT NULL,
       expires_at TIMESTAMP NOT NULL
     )`);
 
     await pool.query(`CREATE TABLE IF NOT EXISTS subscription_tiers (
-      id SERIAL PRIMARY KEY,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       name VARCHAR(100),
       price DECIMAL(10,2),
       benefits JSON,
@@ -1551,32 +1559,67 @@ async function initializeTables() {
     )`);
 
     await pool.query(`CREATE TABLE IF NOT EXISTS stripe_events (
-      id SERIAL PRIMARY KEY, 
-      event_id TEXT UNIQUE NOT NULL, 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      event_id TEXT UNIQUE NOT NULL,
       processed_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // 3. TABLES THAT REFERENCE USERS
-    await pool.query(`CREATE TABLE IF NOT EXISTS user_devices (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, device_id VARCHAR(255) NOT NULL, ip_address VARCHAR(45), user_agent TEXT, last_seen TIMESTAMP, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, device_id))`);
-    
-    await pool.query(`CREATE TABLE IF NOT EXISTS security_logs (id SERIAL PRIMARY KEY, event_type VARCHAR(50) NOT NULL, user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, ip_address VARCHAR(45), device_id VARCHAR(255), details JSONB, created_at TIMESTAMP DEFAULT NOW())`);
-    
-    await pool.query(`CREATE TABLE IF NOT EXISTS creator_stats (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, total_likes INTEGER DEFAULT 0, total_follows INTEGER DEFAULT 0, total_views INTEGER DEFAULT 0, total_tips DECIMAL(10,2) DEFAULT 0, total_merch_sales INTEGER DEFAULT 0, earnings DECIMAL(10,2) DEFAULT 0, updated_at TIMESTAMP DEFAULT NOW())`);
-    
+    // ============================================================
+    // 3. USER-RELATED TABLES
+    // ============================================================
+
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_devices (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      device_id VARCHAR(255) NOT NULL,
+      ip_address VARCHAR(45),
+      user_agent TEXT,
+      last_seen TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id, device_id)
+    )`);
+
+    await pool.query(`CREATE TABLE IF NOT EXISTS security_logs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      event_type VARCHAR(50) NOT NULL,
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      ip_address VARCHAR(45),
+      device_id VARCHAR(255),
+      details JSONB,
+      created_at TIMESTAMP DEFAULT NOW()
+    )`);
+
+    await pool.query(`CREATE TABLE IF NOT EXISTS creator_stats (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      total_likes INTEGER DEFAULT 0,
+      total_follows INTEGER DEFAULT 0,
+      total_views INTEGER DEFAULT 0,
+      total_tips DECIMAL(10,2) DEFAULT 0,
+      total_merch_sales INTEGER DEFAULT 0,
+      earnings DECIMAL(10,2) DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW()
+    )`);
+
     await pool.query(`CREATE TABLE IF NOT EXISTS chat_moderation (
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      chat_id TEXT, 
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      chat_id UUID,
       warning_count INTEGER DEFAULT 0,
       chat_suspended_until TIMESTAMP,
       last_warning_at TIMESTAMP,
       PRIMARY KEY (user_id, chat_id)
     )`);
 
-    await pool.query(`CREATE TABLE IF NOT EXISTS email_confirmations (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, token VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMP NOT NULL, created_at TIMESTAMP DEFAULT NOW())`);
-    
+    await pool.query(`CREATE TABLE IF NOT EXISTS email_confirmations (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      token VARCHAR(255) UNIQUE NOT NULL,
+      expires_at TIMESTAMP NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    )`);
+
     await pool.query(`CREATE TABLE IF NOT EXISTS user_subscriptions (
-      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      tier_id INTEGER REFERENCES subscription_tiers(id) ON DELETE SET NULL,
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      tier_id UUID REFERENCES subscription_tiers(id) ON DELETE SET NULL,
       stripe_subscription_id TEXT,
       status TEXT,
       current_period_start TIMESTAMP,
@@ -1585,11 +1628,22 @@ async function initializeTables() {
       updated_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    await pool.query(`CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), amount DECIMAL(10,2), status TEXT, type TEXT, created_at TIMESTAMP DEFAULT NOW())`);
-    
+    await pool.query(`CREATE TABLE IF NOT EXISTS transactions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id),
+      amount DECIMAL(10,2),
+      status TEXT,
+      type TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    )`);
+
+    // ============================================================
+    // 4. PRODUCTS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS products (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
       name VARCHAR(255) NOT NULL,
       description TEXT,
       price DECIMAL(10, 2) NOT NULL,
@@ -1605,93 +1659,108 @@ async function initializeTables() {
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
+    // ============================================================
+    // 5. VIDEOS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS videos (
-      id SERIAL PRIMARY KEY, 
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
-      title VARCHAR(255) NOT NULL, 
-      description TEXT, 
-      video_url VARCHAR(500) NOT NULL, 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      title VARCHAR(255) NOT NULL,
+      description TEXT,
+      video_url VARCHAR(500) NOT NULL,
       video_s3_key VARCHAR(500),
-      thumbnail_url VARCHAR(500), 
+      thumbnail_url VARCHAR(500),
       thumbnail_s3_key VARCHAR(500),
-      duration INTEGER, 
-      tags JSON, 
-      category VARCHAR(100), 
-      is_public BOOLEAN DEFAULT true, 
-      is_short BOOLEAN DEFAULT false, 
-      processing_status VARCHAR(20) DEFAULT 'pending', 
-      views INTEGER DEFAULT 0, 
-      likes INTEGER DEFAULT 0, 
-      dislikes INTEGER DEFAULT 0, 
-      comments_count INTEGER DEFAULT 0, 
-      shares INTEGER DEFAULT 0, 
-      earnings DECIMAL(10, 2) DEFAULT 0, 
-      content_rating VARCHAR(10) DEFAULT 'general', 
-      language VARCHAR(10) DEFAULT 'en', 
-      transcription TEXT, 
-      auto_captions JSON, 
-      custom_captions JSON, 
-      download_allowed BOOLEAN DEFAULT true, 
-      monetization_enabled BOOLEAN DEFAULT true, 
-      ad_breaks JSON, 
-      featured BOOLEAN DEFAULT false, 
-      trending_score DECIMAL(10, 2) DEFAULT 0, 
-      recommendation_score DECIMAL(10, 2) DEFAULT 0, 
-      created_at TIMESTAMP DEFAULT NOW(), 
+      duration INTEGER,
+      tags JSON,
+      category VARCHAR(100),
+      is_public BOOLEAN DEFAULT true,
+      is_short BOOLEAN DEFAULT false,
+      processing_status VARCHAR(20) DEFAULT 'pending',
+      views INTEGER DEFAULT 0,
+      likes INTEGER DEFAULT 0,
+      dislikes INTEGER DEFAULT 0,
+      comments_count INTEGER DEFAULT 0,
+      shares INTEGER DEFAULT 0,
+      earnings DECIMAL(10, 2) DEFAULT 0,
+      content_rating VARCHAR(10) DEFAULT 'general',
+      language VARCHAR(10) DEFAULT 'en',
+      transcription TEXT,
+      auto_captions JSON,
+      custom_captions JSON,
+      download_allowed BOOLEAN DEFAULT true,
+      monetization_enabled BOOLEAN DEFAULT true,
+      ad_breaks JSON,
+      featured BOOLEAN DEFAULT false,
+      trending_score DECIMAL(10, 2) DEFAULT 0,
+      recommendation_score DECIMAL(10, 2) DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
     )`);
-    
+
+    // ============================================================
+    // 6. MUSIC
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS music (
-      id SERIAL PRIMARY KEY, 
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
-      title VARCHAR(255) NOT NULL, 
-      artist VARCHAR(255), 
-      album VARCHAR(255), 
-      genre VARCHAR(100), 
-      is_explicit BOOLEAN DEFAULT false, 
-      audio_url VARCHAR(500) NOT NULL, 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      title VARCHAR(255) NOT NULL,
+      artist VARCHAR(255),
+      album VARCHAR(255),
+      genre VARCHAR(100),
+      is_explicit BOOLEAN DEFAULT false,
+      audio_url VARCHAR(500) NOT NULL,
       audio_s3_key VARCHAR(500),
-      cover_url VARCHAR(500), 
+      cover_url VARCHAR(500),
       cover_s3_key VARCHAR(500),
       duration INTEGER DEFAULT 0,
-      tags JSON, 
+      tags JSON,
       plays INTEGER DEFAULT 0,
       likes INTEGER DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // LIVESTREAMS - Use TEXT type for stream_key to handle both UUID and VARCHAR
+    // ============================================================
+    // 7. LIVESTREAMS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS livestreams (
-      id SERIAL PRIMARY KEY, 
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
-      title VARCHAR(255) NOT NULL, 
-      description TEXT, 
-      category VARCHAR(100), 
-      thumbnail_url VARCHAR(500), 
-      stream_key VARCHAR(255) UNIQUE NOT NULL, 
-      is_live BOOLEAN DEFAULT false, 
-      is_scheduled BOOLEAN DEFAULT false, 
-      scheduled_start TIMESTAMP, 
-      viewers INTEGER DEFAULT 0, 
-      peak_viewers INTEGER DEFAULT 0, 
-      likes INTEGER DEFAULT 0, 
-      shares INTEGER DEFAULT 0, 
-      duration INTEGER, 
-      recording_url VARCHAR(500), 
-      chat_enabled BOOLEAN DEFAULT true, 
-      delay_seconds INTEGER DEFAULT 0, 
-      tags JSON, 
-      earnings DECIMAL(10, 2) DEFAULT 0, 
-      started_at TIMESTAMP, 
-      ended_at TIMESTAMP, 
-      created_at TIMESTAMP DEFAULT NOW(), 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      title VARCHAR(255) NOT NULL,
+      description TEXT,
+      category VARCHAR(100),
+      thumbnail_url VARCHAR(500),
+      stream_key VARCHAR(255) UNIQUE NOT NULL,
+      is_live BOOLEAN DEFAULT false,
+      is_scheduled BOOLEAN DEFAULT false,
+      scheduled_start TIMESTAMP,
+      viewers INTEGER DEFAULT 0,
+      peak_viewers INTEGER DEFAULT 0,
+      likes INTEGER DEFAULT 0,
+      shares INTEGER DEFAULT 0,
+      duration INTEGER,
+      recording_url VARCHAR(500),
+      chat_enabled BOOLEAN DEFAULT true,
+      delay_seconds INTEGER DEFAULT 0,
+      tags JSON,
+      earnings DECIMAL(10,2) DEFAULT 0,
+      started_at TIMESTAMP,
+      ended_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
     )`);
 
+    // ============================================================
+    // 8. CALLS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS calls (
-      id SERIAL PRIMARY KEY,
-      caller_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      caller_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      receiver_id UUID REFERENCES users(id) ON DELETE CASCADE,
       channel_name VARCHAR(255) UNIQUE NOT NULL,
       status VARCHAR(20) DEFAULT 'ringing',
       type VARCHAR(10) DEFAULT 'video',
@@ -1699,107 +1768,142 @@ async function initializeTables() {
       ended_at TIMESTAMP
     )`);
 
+    // ============================================================
+    // 9. CHATS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS chats (
-      id SERIAL PRIMARY KEY, 
-      creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
-      type VARCHAR(10), 
-      name VARCHAR(255), 
-      avatar TEXT, 
-      participants INTEGER[] DEFAULT '{}', 
-      admin_id INTEGER REFERENCES users(id), 
-      pinned_by INTEGER[] DEFAULT '{}', 
-      muted_by JSONB DEFAULT '{}', 
-      last_message_id INTEGER, 
-      last_message_at TIMESTAMP, 
-      is_archived BOOLEAN DEFAULT false, 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      creator_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      type VARCHAR(10),
+      name VARCHAR(255),
+      avatar TEXT,
+      participants UUID[] DEFAULT '{}',
+      admin_id UUID REFERENCES users(id),
+      pinned_by UUID[] DEFAULT '{}',
+      muted_by JSONB DEFAULT '{}',
+      last_message_id UUID,
+      last_message_at TIMESTAMP,
+      is_archived BOOLEAN DEFAULT false,
       created_at TIMESTAMP DEFAULT NOW()
     )`);
-    
+
+    // ============================================================
+    // 10. CHAT MESSAGES
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS chat_messages (
-      id SERIAL PRIMARY KEY, 
-      chat_id TEXT, 
-      sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
-      type VARCHAR(20), 
-      content TEXT, 
-      media_url TEXT, 
-      thumbnail_url TEXT, 
-      is_deleted BOOLEAN DEFAULT FALSE, 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      chat_id UUID REFERENCES chats(id) ON DELETE CASCADE,
+      sender_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      type VARCHAR(20),
+      content TEXT,
+      media_url TEXT,
+      thumbnail_url TEXT,
+      is_deleted BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT NOW()
     )`);
-    
+
+    // ============================================================
+    // 11. MESSAGE REACTIONS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS message_reactions (
-      id SERIAL PRIMARY KEY, 
-      message_id TEXT, 
-      user_id INTEGER REFERENCES users(id), 
-      reaction TEXT, 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      message_id UUID REFERENCES chat_messages(id) ON DELETE CASCADE,
+      user_id UUID REFERENCES users(id),
+      reaction TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     )`);
-    
+
+    // ============================================================
+    // 12. CONTENT REACTIONS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS content_reactions (
-      id SERIAL PRIMARY KEY, 
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
-      content_type VARCHAR(20), 
-      content_id INTEGER NOT NULL, 
-      reaction_type VARCHAR(10), 
-      created_at TIMESTAMP DEFAULT NOW(), 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      content_type VARCHAR(20),
+      content_id UUID NOT NULL,
+      reaction_type VARCHAR(10),
+      created_at TIMESTAMP DEFAULT NOW(),
       UNIQUE(user_id, content_id, content_type)
     )`);
-    
+
+    // ============================================================
+    // 13. COMMENTS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS comments (
-      id SERIAL PRIMARY KEY, 
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
-      content_type VARCHAR(20), 
-      content_id INTEGER NOT NULL, 
-      parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE, 
-      content TEXT NOT NULL, 
-      likes INTEGER DEFAULT 0, 
-      dislikes INTEGER DEFAULT 0, 
-      replies_count INTEGER DEFAULT 0, 
-      is_pinned BOOLEAN DEFAULT false, 
-      is_deleted BOOLEAN DEFAULT false, 
-      created_at TIMESTAMP DEFAULT NOW(), 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      content_type VARCHAR(20),
+      content_id UUID NOT NULL,
+      parent_id UUID REFERENCES comments(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      likes INTEGER DEFAULT 0,
+      dislikes INTEGER DEFAULT 0,
+      replies_count INTEGER DEFAULT 0,
+      is_pinned BOOLEAN DEFAULT false,
+      is_deleted BOOLEAN DEFAULT false,
+      created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
     )`);
-    
+
+    // ============================================================
+    // 14. NOTIFICATIONS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS notifications (
-      id SERIAL PRIMARY KEY, 
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
-      sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL, 
-      type VARCHAR(50) NOT NULL, 
-      title VARCHAR(255), 
-      message TEXT, 
-      data JSON, 
-      is_read BOOLEAN DEFAULT false, 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      sender_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      type VARCHAR(50) NOT NULL,
+      title VARCHAR(255),
+      message TEXT,
+      data JSON,
+      is_read BOOLEAN DEFAULT false,
       created_at TIMESTAMP DEFAULT NOW()
     )`);
-    
+
+    // ============================================================
+    // 15. LIKES
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS likes (
-      id SERIAL PRIMARY KEY, 
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
-      content_type VARCHAR(20), 
-      content_id INTEGER NOT NULL, 
-      created_at TIMESTAMP DEFAULT NOW(), 
-      UNIQUE(user_id, content_type, content_id)
-    )`);
-    
-    await pool.query(`CREATE TABLE IF NOT EXISTS dislikes (
-      id SERIAL PRIMARY KEY, 
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, 
-      content_type VARCHAR(20), 
-      content_id INTEGER NOT NULL, 
-      created_at TIMESTAMP DEFAULT NOW(), 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      content_type VARCHAR(20),
+      content_id UUID NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
       UNIQUE(user_id, content_type, content_id)
     )`);
 
-    // 4. TABLES THAT REFERENCE PRODUCTS
+    // ============================================================
+    // 16. DISLIKES
+    // ============================================================
+
+    await pool.query(`CREATE TABLE IF NOT EXISTS dislikes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      content_type VARCHAR(20),
+      content_id UUID NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id, content_type, content_id)
+    )`);
+
+    // ============================================================
+    // 17. ORDERS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS orders (
-      id SERIAL PRIMARY KEY,
-      buyer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-      seller_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-      product_id INTEGER REFERENCES products(id) ON DELETE SET NULL, 
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      buyer_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      seller_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      product_id UUID REFERENCES products(id) ON DELETE SET NULL,
       product_name VARCHAR(255),
       product_image TEXT,
-      product_type VARCHAR(20), 
+      product_type VARCHAR(20),
       total DECIMAL(10, 5),
       currency VARCHAR(10) DEFAULT 'USD',
       status VARCHAR(20) DEFAULT 'pending',
@@ -1809,10 +1913,14 @@ async function initializeTables() {
       updated_at TIMESTAMP DEFAULT NOW()
     )`);
 
+    // ============================================================
+    // 18. ORDER ITEMS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS order_items (
-      id SERIAL PRIMARY KEY,
-      order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
-      product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      order_id UUID REFERENCES orders(id) ON DELETE CASCADE,
+      product_id UUID REFERENCES products(id) ON DELETE SET NULL,
       product_name VARCHAR(255),
       product_price DECIMAL(10, 2),
       quantity INTEGER DEFAULT 1,
@@ -1820,33 +1928,36 @@ async function initializeTables() {
     )`);
 
     // ============================================================
-    // 5. LIVESTREAM FEATURE TABLES
-    // NOTE: Using TEXT for stream_id references to be compatible with
-    // both INTEGER and UUID primary keys in existing livestreams table
+    // 19. FOLLOWS
     // ============================================================
 
-    // Follows table (for followers_only chat mode)
     await pool.query(`CREATE TABLE IF NOT EXISTS follows (
-      follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      follower_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      following_id UUID REFERENCES users(id) ON DELETE CASCADE,
       created_at TIMESTAMP DEFAULT NOW(),
       PRIMARY KEY (follower_id, following_id)
     )`);
 
-    // Channel Points
+    // ============================================================
+    // 20. CHANNEL POINTS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS channel_points (
-      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       points INTEGER DEFAULT 0,
       level INTEGER DEFAULT 1,
       xp INTEGER DEFAULT 0,
       updated_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Channel Rewards - NO FK to livestreams to avoid type mismatch
+    // ============================================================
+    // 21. CHANNEL REWARDS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS channel_rewards (
-      id SERIAL PRIMARY KEY,
-      stream_id TEXT NOT NULL,
-      creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      stream_id UUID NOT NULL,
+      creator_id UUID REFERENCES users(id) ON DELETE CASCADE,
       name VARCHAR(100) NOT NULL,
       description TEXT,
       cost INTEGER NOT NULL,
@@ -1857,21 +1968,27 @@ async function initializeTables() {
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Reward Redemptions - NO FK to livestreams
+    // ============================================================
+    // 22. REWARD REDEMPTIONS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS reward_redemptions (
-      id SERIAL PRIMARY KEY,
-      reward_id INTEGER REFERENCES channel_rewards(id) ON DELETE CASCADE,
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      stream_id TEXT NOT NULL,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      reward_id UUID REFERENCES channel_rewards(id) ON DELETE CASCADE,
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      stream_id UUID NOT NULL,
       status VARCHAR(20) DEFAULT 'pending',
       redeemed_at TIMESTAMP DEFAULT NOW(),
       fulfilled_at TIMESTAMP
     )`);
 
-    // Polls - NO FK to livestreams
+    // ============================================================
+    // 23. POLLS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS polls (
-      id SERIAL PRIMARY KEY,
-      stream_id TEXT NOT NULL,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      stream_id UUID NOT NULL,
       question TEXT NOT NULL,
       options JSONB NOT NULL,
       ends_at TIMESTAMP NOT NULL,
@@ -1879,19 +1996,25 @@ async function initializeTables() {
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Poll Votes
+    // ============================================================
+    // 24. POLL VOTES
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS poll_votes (
-      poll_id INTEGER REFERENCES polls(id) ON DELETE CASCADE,
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      poll_id UUID REFERENCES polls(id) ON DELETE CASCADE,
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
       option_index INTEGER NOT NULL,
       created_at TIMESTAMP DEFAULT NOW(),
       PRIMARY KEY (poll_id, user_id)
     )`);
 
-    // Predictions - NO FK to livestreams
+    // ============================================================
+    // 25. PREDICTIONS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS predictions (
-      id SERIAL PRIMARY KEY,
-      stream_id TEXT NOT NULL,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      stream_id UUID NOT NULL,
       question TEXT NOT NULL,
       outcomes JSONB NOT NULL,
       duration INTEGER NOT NULL,
@@ -1903,11 +2026,14 @@ async function initializeTables() {
       resolved_at TIMESTAMP
     )`);
 
-    // Prediction Bets
+    // ============================================================
+    // 26. PREDICTION BETS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS prediction_bets (
-      id SERIAL PRIMARY KEY,
-      prediction_id INTEGER REFERENCES predictions(id) ON DELETE CASCADE,
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      prediction_id UUID REFERENCES predictions(id) ON DELETE CASCADE,
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
       outcome_index INTEGER NOT NULL,
       amount INTEGER NOT NULL,
       won BOOLEAN,
@@ -1915,11 +2041,14 @@ async function initializeTables() {
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Clips - NO FK to livestreams
+    // ============================================================
+    // 27. CLIPS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS clips (
-      id SERIAL PRIMARY KEY,
-      stream_id TEXT NOT NULL,
-      creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      stream_id UUID NOT NULL,
+      creator_id UUID REFERENCES users(id) ON DELETE CASCADE,
       start_time DECIMAL(10,3) NOT NULL,
       end_time DECIMAL(10,3) NOT NULL,
       duration DECIMAL(10,3) NOT NULL,
@@ -1930,30 +2059,39 @@ async function initializeTables() {
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Raids - NO FK to livestreams
+    // ============================================================
+    // 28. RAIDS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS raids (
-      id SERIAL PRIMARY KEY,
-      from_stream_id TEXT,
-      to_stream_id TEXT,
-      raider_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      from_stream_id UUID,
+      to_stream_id UUID,
+      raider_id UUID REFERENCES users(id) ON DELETE SET NULL,
       viewer_count INTEGER DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Super Chats - NO FK to livestreams
+    // ============================================================
+    // 29. SUPER CHATS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS super_chats (
-      id SERIAL PRIMARY KEY,
-      stream_id TEXT NOT NULL,
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      stream_id UUID NOT NULL,
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
       amount DECIMAL(10,2) NOT NULL,
       message TEXT NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Hype Trains - NO FK to livestreams
+    // ============================================================
+    // 30. HYPE TRAINS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS hype_trains (
-      id SERIAL PRIMARY KEY,
-      stream_id TEXT NOT NULL,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      stream_id UUID NOT NULL,
       level INTEGER DEFAULT 1,
       total_amount DECIMAL(10,2) DEFAULT 0,
       contributors JSONB DEFAULT '[]',
@@ -1963,13 +2101,12 @@ async function initializeTables() {
     )`);
 
     // ============================================================
-    // 6. SETTINGS & PRIVACY TABLES (NEW)
+    // 31. LOGIN SESSIONS
     // ============================================================
-    
-    // Login Sessions
+
     await pool.query(`CREATE TABLE IF NOT EXISTS login_sessions (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
       device VARCHAR(255),
       ip_address VARCHAR(45),
       user_agent TEXT,
@@ -1977,18 +2114,24 @@ async function initializeTables() {
       is_current BOOLEAN DEFAULT false
     )`);
 
-    // Blocked Users
+    // ============================================================
+    // 32. BLOCKED USERS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS blocked_users (
-      blocker_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      blocked_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      blocker_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      blocked_id UUID REFERENCES users(id) ON DELETE CASCADE,
       created_at TIMESTAMP DEFAULT NOW(),
       PRIMARY KEY (blocker_id, blocked_id)
     )`);
 
-    // Support Tickets (Feedback, Reports, Contact)
+    // ============================================================
+    // 33. SUPPORT TICKETS
+    // ============================================================
+
     await pool.query(`CREATE TABLE IF NOT EXISTS support_tickets (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
       type VARCHAR(50),
       category VARCHAR(100),
       subject TEXT,
@@ -1998,7 +2141,10 @@ async function initializeTables() {
       created_at TIMESTAMP DEFAULT NOW()
     )`);
 
-    // 7. MIGRATIONS — Add columns that may be missing on existing databases
+    // ============================================================
+    // 34. MIGRATIONS / MISSING COLUMNS
+    // ============================================================
+
     await safeAddColumn('users', 'cover_url', 'TEXT');
     await safeAddColumn('users', 'notification_style', "VARCHAR(20) DEFAULT 'named'");
     await safeAddColumn('users', 'warning_count', 'INTEGER DEFAULT 0');
@@ -2026,28 +2172,66 @@ async function initializeTables() {
     await safeAddColumn('videos', 'thumbnail_s3_key', 'VARCHAR(500)');
     await safeAddColumn('music', 'audio_s3_key', 'VARCHAR(500)');
     await safeAddColumn('music', 'cover_s3_key', 'VARCHAR(500)');
-    
-    // Settings specific columns
-    await safeAddColumn('users', 'privacy_settings', "JSONB DEFAULT '{\"profileVisibility\":\"public\",\"allowComments\":true,\"allowDirectMessages\":true,\"allowDownloads\":true,\"privateAccount\":false,\"hideViewHistory\":false}'");
-    await safeAddColumn('users', 'hidden_words', "TEXT[] DEFAULT '{}'");
 
-    // 8. SEED SUBSCRIPTION TIERS
-    const tierCount = await pool.query("SELECT COUNT(*) FROM subscription_tiers");
+    await safeAddColumn(
+      'users',
+      'privacy_settings',
+      `JSONB DEFAULT '{"profileVisibility":"public","allowComments":true,"allowDirectMessages":true,"allowDownloads":true,"privateAccount":false,"hideViewHistory":false}'`
+    );
+
+    await safeAddColumn(
+      'users',
+      'hidden_words',
+      "TEXT[] DEFAULT '{}'"
+    );
+
+    // ============================================================
+    // 35. SEED SUBSCRIPTION TIERS
+    // ============================================================
+
+    const tierCount = await pool.query(
+      "SELECT COUNT(*) FROM subscription_tiers"
+    );
+
     if (parseInt(tierCount.rows[0].count) === 0) {
       console.log("🌱 Seeding Subscription Tiers...");
-      await pool.query(`INSERT INTO subscription_tiers (id, name, price, benefits, role) VALUES 
-      (1, 'Monthly', 4.99, '["7-day Free Trial", "Ad-Free Viewing"]', 'monthly'),
-      (2, 'Yearly', 49.99, '["Save 30%", "8K Ultra HD", "Custom Themes"]', 'yearly'),
-      (3, 'Elite', 14.99, '["5 Devices", "VIP Badge", "Privacy Alerts", "Custom Themes"]', 'elite')`);
+
+      await pool.query(`
+        INSERT INTO subscription_tiers
+          (name, price, benefits, role)
+        VALUES
+          (
+            'Monthly',
+            4.99,
+            '["7-day Free Trial", "Ad-Free Viewing"]',
+            'monthly'
+          ),
+          (
+            'Yearly',
+            49.99,
+            '["Save 30%", "8K Ultra HD", "Custom Themes"]',
+            'yearly'
+          ),
+          (
+            'Elite',
+            14.99,
+            '["5 Devices", "VIP Badge", "Privacy Alerts", "Custom Themes"]',
+            'elite'
+          )
+      `);
     }
 
-    console.log("✅ Database tables initialized successfully");
-  } catch (error) { 
-    console.error("❌ Error initializing database tables:", error); 
-    throw error; 
+    console.log("✅ UUID database tables initialized successfully");
+
+  } catch (error) {
+    console.error(
+      "❌ Error initializing UUID database tables:",
+      error
+    );
+
+    throw error;
   }
 }
-
 // ==========================================
 // SECURITY HELPERS (PASSWORDS)
 // ==========================================
