@@ -5431,34 +5431,41 @@ const authenticateREST = async (req, res, next) => {
 // DM & MESSAGES ENDPOINTS
 // ==========================================
 
-// GET /api/chats/:identifier/messages
-// If identifier is a number -> treat as userId, find/create DM
-// If identifier is a UUID -> treat as chatId, fetch messages
 app.get("/api/chats/:identifier/messages", authenticateREST, async (req, res) => {
   try {
     const myId = req.user.id;
     const identifier = req.params.identifier;
     let chatId;
 
-    const isUserId = !isNaN(parseInt(identifier)) && identifier.length < 15;
+    // FIX 1: pure digits = user ID, anything else = chat UUID.
+    // (The old check was unsafe: parseInt("123e4567") is a valid number,
+    //  so any UUID starting with digits passed the isNaN test and relied
+    //  entirely on the length hack.)
+    const isUserId = /^\d+$/.test(identifier);
 
     if (isUserId) {
-      const targetId = parseInt(identifier);
+      const targetId = parseInt(identifier, 10);
+
+      if (Number(targetId) === Number(myId)) {
+        return res.status(400).json({ error: "Cannot chat with yourself" });
+      }
 
       const targetUser = await pool.query(
-        "SELECT id, username, profile_url FROM users WHERE id = $1", [targetId]
+        "SELECT id, username, profile_url FROM users WHERE id = $1",
+        [targetId]
       );
       if (targetUser.rows.length === 0) {
         return res.status(404).json({ error: "User not found" });
       }
-      if (targetId === myId) {
-        return res.status(400).json({ error: "Cannot chat with yourself" });
-      }
 
-      // Check for existing DM
+      // Check for existing DM (exactly 2 participants, so a group chat
+      // containing both users can never be mistaken for their DM)
       const existingChat = await pool.query(
-        `SELECT id FROM chats 
-         WHERE type = 'private' AND $1 = ANY(participants) AND $2 = ANY(participants) 
+        `SELECT id FROM chats
+         WHERE type = 'private'
+           AND cardinality(participants) = 2
+           AND $1 = ANY(participants)
+           AND $2 = ANY(participants)
          LIMIT 1`,
         [myId, targetId]
       );
@@ -5466,10 +5473,9 @@ app.get("/api/chats/:identifier/messages", authenticateREST, async (req, res) =>
       if (existingChat.rows.length > 0) {
         chatId = existingChat.rows[0].id;
       } else {
-        // Create new DM
         const newChat = await pool.query(
-          `INSERT INTO chats (participants, type, created_at) 
-           VALUES (ARRAY[$1::int, $2::int], 'private', NOW()) 
+          `INSERT INTO chats (participants, type, created_at)
+           VALUES (ARRAY[$1::int, $2::int], 'private', NOW())
            RETURNING id`,
           [myId, targetId]
         );
@@ -5477,10 +5483,11 @@ app.get("/api/chats/:identifier/messages", authenticateREST, async (req, res) =>
         console.log(`✅ Created DM ${chatId} between ${myId} and ${targetId}`);
       }
     } else {
-      // It's a real Chat ID (UUID)
+      // Real Chat ID (UUID)
       chatId = identifier;
       const chatCheck = await pool.query(
-        "SELECT id FROM chats WHERE id = $1 AND $2 = ANY(participants)", [chatId, myId]
+        "SELECT id FROM chats WHERE id = $1 AND $2 = ANY(participants)",
+        [chatId, myId]
       );
       if (chatCheck.rows.length === 0) {
         return res.status(403).json({ error: "Not in this chat" });
@@ -5496,7 +5503,30 @@ app.get("/api/chats/:identifier/messages", authenticateREST, async (req, res) =>
       [chatId]
     );
 
-    res.json({ chatId: chatId, messages: messagesRes.rows });
+    // FIX 2: return meId + otherUser so the client can align bubbles
+    // and populate the header without extra requests
+    const chatRow = await pool.query(
+      "SELECT participants FROM chats WHERE id = $1",
+      [chatId]
+    );
+    const participants = chatRow.rows[0]?.participants || [];
+    const otherId = participants.find((p) => Number(p) !== Number(myId));
+
+    let otherUser = null;
+    if (otherId != null) {
+      const otherRes = await pool.query(
+        "SELECT id, username, profile_url FROM users WHERE id = $1",
+        [otherId]
+      );
+      otherUser = otherRes.rows[0] || null;
+    }
+
+    res.json({
+      chatId,
+      meId: myId,
+      otherUser,
+      messages: messagesRes.rows,
+    });
 
   } catch (err) {
     console.error("DM Fetch Error:", err.message, err.stack);
