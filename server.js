@@ -8841,6 +8841,36 @@ app.get('/api/users/search', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/users/friends
+// Returns accepted connections for the logged-in user.
+app.get("/api/users/friends", authenticateREST, async (req, res) => {
+  try {
+    const myId = req.user.id;
+
+    const result = await pool.query(
+      `SELECT u.id, u.username, u.profile_url
+       FROM users u
+       WHERE u.id IN (
+         SELECT CASE
+                  WHEN follower_id = $1 THEN following_id
+                  ELSE follower_id
+                END AS friend_id
+         FROM follows
+         WHERE status = 'accepted'
+           AND (follower_id = $1 OR following_id = $1)
+       )
+       ORDER BY u.username ASC`,
+      [myId]
+    );
+
+    res.json({ friends: result.rows });
+
+  } catch (err) {
+    console.error("Friends fetch error:", err.message);
+    res.status(500).json({ error: "Failed to load friends" });
+  }
+});
+
 // ==========================================
 // ADMIN ENDPOINT: Send notification to all users
 // ==========================================
