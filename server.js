@@ -8977,6 +8977,117 @@ app.post("/auth/check-vpn", async (req, res) => {
   } catch (err) { console.error("check-vpn error:", err); res.status(500).json({ error: "Failed to check VPN status" }); }
 });
 
+// ============================================
+// GET /api/chats — my conversations, split into inbox and requests
+// Request = a chat where I don't follow the other person
+// ============================================
+app.get("/api/chats", authenticateToken, async (req, res) => {
+  try {
+    const myId = req.user.id;
+
+    const { rows } = await pool.query(
+      `SELECT c.id, c.last_message, c.last_message_at, c.created_at,
+              u.id AS other_id, u.username AS other_username, u.profile_url AS other_avatar,
+              EXISTS (SELECT 1 FROM follows f
+                      WHERE f.follower_id = $1 AND f.following_id = u.id) AS i_follow,
+              (SELECT COUNT(*) FROM messages m
+               WHERE m.chat_id = c.id AND m.sender_id <> $1 AND m.is_read = false) AS unread
+       FROM chats c
+       CROSS JOIN LATERAL (
+         SELECT id, username, profile_url FROM users
+         WHERE id = ANY(c.participants) AND id <> $1
+         LIMIT 1
+       ) u
+       WHERE $1 = ANY(c.participants)
+       ORDER BY COALESCE(c.last_message_at, c.created_at) DESC`,
+      [myId]
+    );
+
+    const chats = rows.map((r) => ({
+      id: r.id,
+      lastMessage: r.last_message,
+      lastMessageAt: r.last_message_at || r.created_at,
+      unread: parseInt(r.unread, 10) || 0,
+      isRequest: !r.i_follow,
+      otherUser: {
+        id: r.other_id,
+        username: r.other_username,
+        profile_url: r.other_avatar,
+      },
+    }));
+
+    res.json({
+      inbox: chats.filter((c) => !c.isRequest),
+      requests: chats.filter((c) => c.isRequest),
+    });
+  } catch (err) {
+    console.error("Chats list error:", err.message);
+    res.status(500).json({ error: "Failed to load chats" });
+  }
+});
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// POST /api/chats/:chatId/accept — accept request = follow them back
+app.post("/api/chats/:chatId/accept", authenticateToken, async (req, res) => {
+  try {
+    const myId = req.user.id;
+    const chatId = req.params.chatId;
+
+    if (!UUID_RE.test(chatId)) return res.status(400).json({ error: "Invalid chat id" });
+
+    const { rows } = await pool.query(
+      "SELECT participants FROM chats WHERE id = $1 AND $2 = ANY(participants)",
+      [chatId, myId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Chat not found" });
+
+    const otherId = (rows[0].participants || [])
+      .find((p) => Number(p) !== Number(myId));
+
+    // Following them back moves the chat to the inbox
+    await pool.query(
+      `INSERT INTO follows (follower_id, following_id)
+       VALUES ($1, $2) ON CONFLICT (follower_id, following_id) DO NOTHING`,
+      [myId, otherId]
+    );
+
+    await pool.query(
+      "UPDATE messages SET is_read = true WHERE chat_id = $1 AND sender_id <> $1",
+      [chatId, myId]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Accept request error:", err.message);
+    res.status(500).json({ error: "Failed to accept request" });
+  }
+});
+
+// DELETE /api/chats/:chatId — decline request (deletes the conversation)
+app.delete("/api/chats/:chatId", authenticateToken, async (req, res) => {
+  try {
+    const myId = req.user.id;
+    const chatId = req.params.chatId;
+
+    if (!UUID_RE.test(chatId)) return res.status(400).json({ error: "Invalid chat id" });
+
+    const { rows } = await pool.query(
+      "SELECT id FROM chats WHERE id = $1 AND $2 = ANY(participants)",
+      [chatId, myId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Chat not found" });
+
+    await pool.query("DELETE FROM messages WHERE chat_id = $1", [chatId]);
+    await pool.query("DELETE FROM chats WHERE id = $1", [chatId]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Decline request error:", err.message);
+    res.status(500).json({ error: "Failed to decline request" });
+  }
+});
+
 app.post("/api/auth/register", checkBan, async (req, res) => {
   try {
     const { username, email, password, dob, captchaToken, profile_url } = req.body;
