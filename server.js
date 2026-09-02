@@ -8983,37 +8983,41 @@ app.post("/auth/check-vpn", async (req, res) => {
 // ============================================
 app.get("/api/chats", authenticateToken, async (req, res) => {
   try {
-    const myId = req.user.id;
+    const myId = Number(req.user.id);
 
-    const { rows } = await pool.query(
-      `SELECT c.id, c.last_message, c.last_message_at, c.created_at,
+    const result = await pool.query(
+      `SELECT c.id, c.created_at,
               u.id AS other_id, u.username AS other_username, u.profile_url AS other_avatar,
               EXISTS (SELECT 1 FROM follows f
                       WHERE f.follower_id = $1 AND f.following_id = u.id) AS i_follow,
+              lm.content AS last_message,
+              COALESCE(lm.timestamp, c.created_at) AS last_message_at,
               (SELECT COUNT(*) FROM messages m
                WHERE m.chat_id = c.id AND m.sender_id <> $1 AND m.is_read = false) AS unread
        FROM chats c
-       CROSS JOIN LATERAL (
+       LEFT JOIN LATERAL (
          SELECT id, username, profile_url FROM users
          WHERE id = ANY(c.participants) AND id <> $1
-         LIMIT 1
-       ) u
+         ORDER BY id LIMIT 1
+       ) u ON true
+       LEFT JOIN LATERAL (
+         SELECT content, timestamp FROM messages
+         WHERE chat_id = c.id ORDER BY timestamp DESC LIMIT 1
+       ) lm ON true
        WHERE $1 = ANY(c.participants)
-       ORDER BY COALESCE(c.last_message_at, c.created_at) DESC`,
+       ORDER BY COALESCE(lm.timestamp, c.created_at) DESC`,
       [myId]
     );
 
-    const chats = rows.map((r) => ({
-      id: r.id,
-      lastMessage: r.last_message,
-      lastMessageAt: r.last_message_at || r.created_at,
-      unread: parseInt(r.unread, 10) || 0,
-      isRequest: !r.i_follow,
-      otherUser: {
-        id: r.other_id,
-        username: r.other_username,
-        profile_url: r.other_avatar,
-      },
+    const chats = (result.rows || []).map((r) => ({
+      id: r?.id ?? null,
+      lastMessage: r?.last_message ?? null,
+      lastMessageAt: r?.last_message_at ?? null,
+      unread: Number(r?.unread ?? 0),
+      isRequest: !r?.i_follow,
+      otherUser: r?.other_id
+        ? { id: r.other_id, username: r.other_username, profile_url: r.other_avatar }
+        : null,
     }));
 
     res.json({
@@ -9021,12 +9025,10 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
       requests: chats.filter((c) => c.isRequest),
     });
   } catch (err) {
-    console.error("Chats list error:", err.message);
-    res.status(500).json({ error: "Failed to load chats" });
+    console.error("GET /api/chats failed:", err); // full error + stack
+    res.status(500).json({ error: "Failed to load chats", detail: String(err?.message || err) });
   }
 });
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // POST /api/chats/:chatId/accept — accept request = follow them back
 app.post("/api/chats/:chatId/accept", authenticateToken, async (req, res) => {
