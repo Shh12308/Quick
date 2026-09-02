@@ -9971,58 +9971,94 @@ app.get("/api/livestreams/search", async (req, res) => {
   }
 });
 
-// Get single livestream with full details
 app.get("/api/livestreams/:id", async (req, res) => {
   try {
+    const { id } = req.params;
+
     const { rows } = await pool.query(
-      `SELECT l.*, u.username, u.profile_url, u.is_verified
-       FROM livestreams l 
-       JOIN users u ON l.user_id = u.id 
-       WHERE l.id = $1 OR l.stream_key = $1`,
-      [req.params.id]
+      `SELECT
+         l.*,
+         u.username,
+         u.profile_url,
+         u.is_verified
+       FROM livestreams l
+       JOIN users u ON l.user_id = u.id
+       WHERE l.id = $1
+       LIMIT 1`,
+      [id]
     );
-    
+
     if (!rows.length) {
-      return res.status(404).json({ error: "Stream not found" });
+      return res.status(404).json({
+        error: "Stream not found"
+      });
     }
-    
-    res.json({ stream: rows[0] });
+
+    res.json({
+      stream: rows[0]
+    });
+
   } catch (err) {
     console.error("Get livestream error:", err);
-    res.status(500).json({ error: "Failed to fetch stream" });
+
+    res.status(500).json({
+      error: "Failed to fetch stream"
+    });
   }
 });
 
-// End livestream
+// Get single livestream with full details
 app.post("/api/livestreams/end/:id", authMiddleware, async (req, res) => {
   try {
+    const { id } = req.params;
+
     const { rows } = await pool.query(
-      `UPDATE livestreams 
-       SET is_live = false, ended_at = NOW(), duration = EXTRACT(EPOCH FROM (NOW() - started_at))::INTEGER
-       WHERE (id = $1 OR stream_key = $1) AND user_id = $2
+      `UPDATE livestreams
+       SET
+         is_live = false,
+         ended_at = NOW(),
+         duration = EXTRACT(
+           EPOCH FROM (NOW() - started_at)
+         )::INTEGER
+       WHERE id = $1
+         AND user_id = $2
+         AND is_live = true
        RETURNING *`,
-      [req.params.id, req.user.id]
+      [id, req.user.id]
     );
-    
+
     if (!rows.length) {
-      return res.status(404).json({ error: "Stream not found" });
+      return res.status(404).json({
+        error: "Live stream not found or already ended"
+      });
     }
-    
-    // Clean up Redis keys
-    await redisDel(`chat-mode:${rows[0].id}`);
-    await redisDel(`active-poll:${rows[0].id}`);
-    await redisDel(`active-prediction:${rows[0].id}`);
-    await redisDel(`hype-train:${rows[0].id}`);
-    
-    io.to(`stream-${rows[0].id}`).emit("stream-ended", { streamId: rows[0].id });
-    
-    res.json({ stream: rows[0], success: true });
+
+    const stream = rows[0];
+
+    // Clean up Redis
+    await redisDel(`chat-mode:${stream.id}`);
+    await redisDel(`active-poll:${stream.id}`);
+    await redisDel(`active-prediction:${stream.id}`);
+    await redisDel(`hype-train:${stream.id}`);
+
+    // Notify viewers
+    io.to(`stream-${stream.id}`).emit("stream-ended", {
+      streamId: stream.id
+    });
+
+    res.json({
+      success: true,
+      stream
+    });
+
   } catch (err) {
     console.error("End stream error:", err);
-    res.status(500).json({ error: "Failed to end stream" });
+
+    res.status(500).json({
+      error: "Failed to end stream"
+    });
   }
 });
-
 // ============================================================
 // SETTINGS & PRIVACY ROUTES
 // ============================================================
