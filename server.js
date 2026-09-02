@@ -8916,6 +8916,322 @@ app.post('/api/admin/notifications/broadcast', authenticateToken, async (req, re
   }
 });
 
+app.post(
+
+  "/applications",
+
+  upload.single("resume"),
+
+  async (req, res) => {
+
+    try {
+
+      console.log("New application received");
+
+      // -----------------------------
+
+      // Get form fields
+
+      // -----------------------------
+
+      const {
+
+        position,
+
+        name,
+
+        email,
+
+        phone,
+
+        dob,
+
+        address,
+
+        questionAnswer,
+
+      } = req.body;
+
+      // -----------------------------
+
+      // Validate required fields
+
+      // -----------------------------
+
+      if (
+
+        !position ||
+
+        !name ||
+
+        !email ||
+
+        !phone ||
+
+        !dob ||
+
+        !address
+
+      ) {
+
+        return res.status(400).json({
+
+          error: "Please fill in all required fields.",
+
+        });
+
+      }
+
+      // -----------------------------
+
+      // Validate resume
+
+      // -----------------------------
+
+      if (!req.file) {
+
+        return res.status(400).json({
+
+          error: "Resume is required.",
+
+        });
+
+      }
+
+      // -----------------------------
+
+      // Resume information
+
+      // -----------------------------
+
+      const resume = {
+
+        filename: req.file.filename,
+
+        originalName: req.file.originalname,
+
+        mimetype: req.file.mimetype,
+
+        size: req.file.size,
+
+        path: req.file.path,
+
+      };
+
+      console.log("Application:");
+
+      console.log({
+
+        position,
+
+        name,
+
+        email,
+
+        phone,
+
+        dob,
+
+        address,
+
+        questionAnswer,
+
+        resume,
+
+      });
+
+      // =================================================
+
+      // SAVE TO DATABASE HERE
+
+      // =================================================
+
+      /*
+
+        Example:
+
+        await db.query(
+
+          `
+
+          INSERT INTO applications
+
+          (
+
+            position,
+
+            name,
+
+            email,
+
+            phone,
+
+            dob,
+
+            address,
+
+            question_answer,
+
+            resume_filename,
+
+            resume_original_name
+
+          )
+
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+          `,
+
+          [
+
+            position,
+
+            name,
+
+            email,
+
+            phone,
+
+            dob,
+
+            address,
+
+            questionAnswer || null,
+
+            req.file.filename,
+
+            req.file.originalname,
+
+          ]
+
+        );
+
+      */
+
+      // -----------------------------
+
+      // Success response
+
+      // -----------------------------
+
+      return res.status(201).json({
+
+        success: true,
+
+        message: "Application submitted successfully.",
+
+        application: {
+
+          position,
+
+          name,
+
+          email,
+
+          phone,
+
+          dob,
+
+          address,
+
+          questionAnswer: questionAnswer || null,
+
+          resume: {
+
+            filename: req.file.filename,
+
+            originalName: req.file.originalname,
+
+            size: req.file.size,
+
+          },
+
+        },
+
+      });
+
+    } catch (error) {
+
+      console.error("Application submission error:", error);
+
+      // Delete uploaded file if something failed
+
+      if (req.file) {
+
+        try {
+
+          fs.unlinkSync(req.file.path);
+
+        } catch (deleteError) {
+
+          console.error(
+
+            "Could not delete uploaded file:",
+
+            deleteError
+
+          );
+
+        }
+
+      }
+
+      return res.status(500).json({
+
+        error: "Failed to submit application.",
+
+      });
+
+    }
+
+  }
+
+);
+
+// =====================================================
+
+// MULTER / GENERAL ERROR HANDLER
+
+// =====================================================
+
+app.use((error, req, res, next) => {
+
+  console.error(error);
+
+  if (error instanceof multer.MulterError) {
+
+    if (error.code === "LIMIT_FILE_SIZE") {
+
+      return res.status(400).json({
+
+        error: "Resume must be smaller than 10 MB.",
+
+      });
+
+    }
+
+    return res.status(400).json({
+
+      error: error.message,
+
+    });
+
+  }
+
+  if (error) {
+
+    return res.status(400).json({
+
+      error: error.message,
+
+    });
+
+  }
+
+  next();
+
+});
+
 // ==========================================
 // ADMIN ENDPOINT: Send notification to single user
 // ==========================================
