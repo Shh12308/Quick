@@ -8344,6 +8344,69 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
   }
 });
 
+app.post("/api/users/block", authenticateToken, async (req, res) => {
+  try {
+    const blockerId = Number(req.userId);
+    const blockedId = Number(req.body?.userId);
+
+    if (!Number.isInteger(blockerId)) {
+      return res.status(401).json({
+        error: "Invalid authenticated user"
+      });
+    }
+
+    if (!Number.isInteger(blockedId)) {
+      return res.status(400).json({
+        error: "Invalid user ID"
+      });
+    }
+
+    if (blockerId === blockedId) {
+      return res.status(400).json({
+        error: "You cannot block yourself"
+      });
+    }
+
+    // Make sure the target user exists.
+    const userCheck = await pool.query(
+      `
+      SELECT id
+      FROM users
+      WHERE id = $1
+      `,
+      [blockedId]
+    );
+
+    if (!userCheck.rowCount) {
+      return res.status(404).json({
+        error: "User not found"
+      });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO blocked_users (blocker_id, blocked_id)
+      VALUES ($1, $2)
+      ON CONFLICT (blocker_id, blocked_id)
+      DO NOTHING
+      `,
+      [blockerId, blockedId]
+    );
+
+    return res.json({
+      success: true,
+      blockedUserId: blockedId
+    });
+
+  } catch (err) {
+    console.error("POST /api/users/block:", err);
+
+    return res.status(500).json({
+      error: "Failed to block user"
+    });
+  }
+});
+
 app.get("/api/me/restrictions", authenticateToken, async (req, res) => {
   try {
     const userId = Number(req.userId);
