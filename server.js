@@ -8197,21 +8197,14 @@ app.get("/api/messages/search", async (req, res) => {
   }
 });
 
-app.get("/api/chats", authenticateToken, async (req, res) => {
-  //                      ^^^ ⚠️ use the SAME middleware name your other chat
-  //                          routes use (auth / authenticate / verifyToken…).
-  //                          Check how /api/chats/:id/messages is declared
-  //                          and copy it exactly.
-
+app.get("/api/chats", async (req, res) => {
   try {
-    const userId = req.user?.id;
-
-    // defensive: if auth ever gets dropped from this route again,
-    // return 401 instead of crashing with a 500
-    if (userId == null) {
-      return res.status(401).json({ error: "Unauthorized" });
+    const userId = Number(req.user.id);
+    if (!Number.isInteger(userId)) {
+      return res.status(401).json({
+        error: "Invalid authenticated user"
+      });
     }
-
     const result = await pool.query(
       `
       SELECT
@@ -8223,63 +8216,61 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
         c.last_message_id,
         c.last_message_at,
         c.is_archived,
-
         CASE
-          WHEN $1 = ANY(c.pinned_by)
+          WHEN $1 = ANY(COALESCE(c.pinned_by, ARRAY[]::integer[]))
           THEN true
           ELSE false
         END AS is_pinned,
-
         CASE
-          WHEN $1 = ANY(COALESCE(c.muted_by, '{}'))
-          THEN true
+          WHEN COALESCE(c.muted_by, '{}'::jsonb) ? $1::text
+          THEN COALESCE((c.muted_by ->> $1::text)::boolean, false)
           ELSE false
         END AS is_muted,
-
         other_user.id AS other_user_id,
         other_user.username AS other_username,
         other_user.name AS other_name,
         other_user.display_name AS other_display_name,
         other_user.profile_url AS other_profile_url,
         other_user.is_verified AS other_is_verified,
-
         COALESCE(unread.unread_count, 0) AS unread_count
-
       FROM chats c
-
-      JOIN chat_participants me
+      INNER JOIN chat_participants me
         ON me.chat_id = c.id
        AND me.user_id = $1
-
       LEFT JOIN LATERAL (
-        SELECT u.*
+        SELECT
+          u.id,
+          u.username,
+          u.name,
+          u.display_name,
+          u.profile_url,
+          u.is_verified
         FROM chat_participants cp
-        JOIN users u ON u.id = cp.user_id
+        INNER JOIN users u
+          ON u.id = cp.user_id
         WHERE cp.chat_id = c.id
           AND cp.user_id <> $1
-        ORDER BY cp.created_at
+        ORDER BY cp.created_at ASC
         LIMIT 1
       ) other_user ON true
-
       LEFT JOIN LATERAL (
         SELECT COUNT(*)::integer AS unread_count
         FROM messages m
         LEFT JOIN chat_read_states rs
           ON rs.chat_id = c.id
          AND rs.user_id = $1
-        WHERE m.chat_id = c.id
+        WHERE m.chat_id = c.id::text
           AND m.sender_id <> $1
           AND (
             rs.last_read_at IS NULL
             OR COALESCE(m.timestamp, m.created_at) > rs.last_read_at
           )
       ) unread ON true
-
       WHERE c.is_archived = false
-
       ORDER BY
         CASE
-          WHEN $1 = ANY(c.pinned_by) THEN 0
+          WHEN $1 = ANY(COALESCE(c.pinned_by, ARRAY[]::integer[]))
+          THEN 0
           ELSE 1
         END,
         c.last_message_at DESC NULLS LAST,
@@ -8287,13 +8278,35 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
       `,
       [userId]
     );
-
-    res.json(result.rows);
-
+    const chats = result.rows.map((chat) => ({
+      ...chat,
+      // Frontend-friendly names
+      pinned: Boolean(chat.is_pinned),
+      muted: Boolean(chat.is_muted),
+      archived: Boolean(chat.is_archived),
+      unreadCount: Number(chat.unread_count || 0),
+      unread: Number(chat.unread_count || 0) > 0,
+      otherUserId: chat.other_user_id,
+      // Keep both names available
+      otherUser: chat.other_user_id
+        ? {
+            id: chat.other_user_id,
+            username: chat.other_username,
+            name: chat.other_name,
+            displayName: chat.other_display_name,
+            profileUrl: chat.other_profile_url,
+            isVerified: chat.other_is_verified
+          }
+        : null
+    }));
+    res.json(chats);
   } catch (err) {
     console.error("GET /api/chats:", err);
     res.status(500).json({
-      error: "Failed to load chats"
+      error: "Failed to load chats",
+      details: process.env.NODE_ENV === "production"
+        ? undefined
+        : err.message
     });
   }
 });
