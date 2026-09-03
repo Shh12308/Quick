@@ -8197,9 +8197,20 @@ app.get("/api/messages/search", async (req, res) => {
   }
 });
 
-app.get("/api/chats", async (req, res) => {
+app.get("/api/chats", auth, async (req, res) => {
+  //                      ^^^ ⚠️ use the SAME middleware name your other chat
+  //                          routes use (auth / authenticate / verifyToken…).
+  //                          Check how /api/chats/:id/messages is declared
+  //                          and copy it exactly.
+
   try {
-    const userId = req.user.id;
+    const userId = req.user?.id;
+
+    // defensive: if auth ever gets dropped from this route again,
+    // return 401 instead of crashing with a 500
+    if (userId == null) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
 
     const result = await pool.query(
       `
@@ -8220,14 +8231,7 @@ app.get("/api/chats", async (req, res) => {
         END AS is_pinned,
 
         CASE
-          WHEN EXISTS (
-            SELECT 1
-            FROM jsonb_each_text(
-              COALESCE(c.muted_by::jsonb, '{}'::jsonb)
-            ) AS m(key, value)
-            WHERE m.key = $1::text
-              AND m.value = 'true'
-          )
+          WHEN $1 = ANY(COALESCE(c.muted_by, '{}'))
           THEN true
           ELSE false
         END AS is_muted,
