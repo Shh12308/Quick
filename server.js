@@ -8344,6 +8344,241 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
   }
 });
 
+app.get("/api/me/restrictions", authenticateToken, async (req, res) => {
+  try {
+    const userId = Number(req.userId);
+
+    if (!Number.isInteger(userId)) {
+      return res.status(401).json({
+        error: "Invalid authenticated user"
+      });
+    }
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        status,
+        suspend_until,
+        suspension_reason,
+        warning_count
+      FROM users
+      WHERE id = $1
+      `,
+      [userId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        error: "User not found"
+      });
+    }
+
+    const user = rows[0];
+
+    const isBanned = user.status === "banned";
+    const isSuspended =
+      user.status === "suspended" &&
+      (
+        !user.suspend_until ||
+        new Date(user.suspend_until) > new Date()
+      );
+
+    return res.json({
+      isBanned,
+      isSuspended,
+      suspendUntil: user.suspend_until || null,
+      suspensionReason: user.suspension_reason || null,
+      warningCount: Number(user.warning_count || 0)
+    });
+
+  } catch (err) {
+    console.error("GET /api/me/restrictions:", err);
+
+    return res.status(500).json({
+      error: "Failed to load restrictions"
+    });
+  }
+});
+
+app.patch("/api/chats/:id", authenticateToken, async (req, res) => {
+  try {
+    const userId = Number(req.userId);
+    const chatId = req.params.id;
+
+    if (!Number.isInteger(userId)) {
+      return res.status(401).json({
+        error: "Invalid authenticated user"
+      });
+    }
+
+    if (!chatId) {
+      return res.status(400).json({
+        error: "Chat ID is required"
+      });
+    }
+
+    // Make sure the authenticated user belongs to this chat.
+    const participant = await pool.query(
+      `
+      SELECT 1
+      FROM chat_participants
+      WHERE chat_id = $1
+        AND user_id = $2
+      LIMIT 1
+      `,
+      [chatId, userId]
+    );
+
+    if (!participant.rowCount) {
+      return res.status(403).json({
+        error: "You are not a participant in this chat"
+      });
+    }
+
+    const allowedFields = [
+      "pinned",
+      "muted",
+      "archived",
+      "favourite"
+    ];
+
+    const updates = Object.keys(req.body || {})
+      .filter((key) => allowedFields.includes(key));
+
+    if (!updates.length) {
+      return res.status(400).json({
+        error: "No valid chat setting supplied"
+      });
+    }
+
+    for (const field of updates) {
+      const value = Boolean(req.body[field]);
+
+      if (field === "pinned") {
+        if (value) {
+          await pool.query(
+            `
+            UPDATE chats
+            SET pinned_by = array_append(
+              COALESCE(pinned_by, ARRAY[]::integer[]),
+              $1
+            )
+            WHERE id = $2
+              AND NOT (
+                $1 = ANY(COALESCE(pinned_by, ARRAY[]::integer[]))
+              )
+            `,
+            [userId, chatId]
+          );
+        } else {
+          await pool.query(
+            `
+            UPDATE chats
+            SET pinned_by = array_remove(
+              COALESCE(pinned_by, ARRAY[]::integer[]),
+              $1
+            )
+            WHERE id = $2
+            `,
+            [userId, chatId]
+          );
+        }
+      }
+
+      else if (field === "muted") {
+        await pool.query(
+          `
+          UPDATE chats
+          SET muted_by =
+            CASE
+              WHEN $1 = true THEN
+                jsonb_set(
+                  COALESCE(muted_by, '{}'::jsonb),
+                  ARRAY[$2::text],
+                  'true'::jsonb,
+                  true
+                )
+              ELSE
+                COALESCE(muted_by, '{}'::jsonb) - $2::text
+            END
+          WHERE id = $3
+          `,
+          [value, String(userId), chatId]
+        );
+      }
+
+      else if (field === "archived") {
+        await pool.query(
+          `
+          UPDATE chats
+          SET is_archived = $1
+          WHERE id = $2
+          `,
+          [value, chatId]
+        );
+      }
+
+      else if (field === "favourite") {
+        // Your current chats table does not contain a favourite/favourites
+        // column, so this cannot be persisted here yet.
+        return res.status(400).json({
+          error: "Favourite chat setting is not supported by the current database schema"
+        });
+      }
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        type,
+        name,
+        avatar,
+        last_message,
+        last_message_id,
+        last_message_at,
+        is_archived,
+        pinned_by,
+        muted_by
+      FROM chats
+      WHERE id = $1
+      `,
+      [chatId]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({
+        error: "Chat not found"
+      });
+    }
+
+    const chat = result.rows[0];
+
+    return res.json({
+      success: true,
+      chat: {
+        ...chat,
+        pinned: (chat.pinned_by || []).includes(userId),
+        muted: Boolean(
+          chat.muted_by &&
+          chat.muted_by[String(userId)] === true
+        ),
+        archived: Boolean(chat.is_archived)
+      }
+    });
+
+  } catch (err) {
+    console.error("PATCH /api/chats/:id:", err);
+
+    return res.status(500).json({
+      error: "Failed to update chat"
+    });
+  }
+});
+
+
+
+
 // DELETE /api/notifications/read - Delete all read notifications
 app.delete('/api/notifications/read', authenticateToken, async (req, res) => {
   try {
