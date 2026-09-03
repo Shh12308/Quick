@@ -8197,7 +8197,7 @@ app.get("/api/messages/search", async (req, res) => {
   }
 });
 
-app.get("/api/chats", auth, async (req, res) => {
+app.get("/api/chats", authenticateToken, async (req, res) => {
   //                      ^^^ ⚠️ use the SAME middleware name your other chat
   //                          routes use (auth / authenticate / verifyToken…).
   //                          Check how /api/chats/:id/messages is declared
