@@ -8197,14 +8197,25 @@ app.get("/api/messages/search", async (req, res) => {
   }
 });
 
-app.get("/api/chats", async (req, res) => {
+app.get("/api/chats", authenticateToken, async (req, res) => {
   try {
-    const userId = Number(req.user.id);
+    // authenticateToken sets req.userId = user.id
+    const userId = Number(req.userId);
+
+    console.log("[CHATS] Authenticated user:", {
+      reqUserId: req.userId,
+      reqUser: req.user ? {
+        id: req.user.id,
+        username: req.user.username
+      } : null
+    });
+
     if (!Number.isInteger(userId)) {
       return res.status(401).json({
         error: "Invalid authenticated user"
       });
     }
+
     const result = await pool.query(
       `
       SELECT
@@ -8216,27 +8227,37 @@ app.get("/api/chats", async (req, res) => {
         c.last_message_id,
         c.last_message_at,
         c.is_archived,
+
         CASE
           WHEN $1 = ANY(COALESCE(c.pinned_by, ARRAY[]::integer[]))
           THEN true
           ELSE false
         END AS is_pinned,
+
         CASE
           WHEN COALESCE(c.muted_by, '{}'::jsonb) ? $1::text
-          THEN COALESCE((c.muted_by ->> $1::text)::boolean, false)
+          THEN COALESCE(
+            (c.muted_by ->> $1::text)::boolean,
+            false
+          )
           ELSE false
         END AS is_muted,
+
         other_user.id AS other_user_id,
         other_user.username AS other_username,
         other_user.name AS other_name,
         other_user.display_name AS other_display_name,
         other_user.profile_url AS other_profile_url,
         other_user.is_verified AS other_is_verified,
+
         COALESCE(unread.unread_count, 0) AS unread_count
+
       FROM chats c
+
       INNER JOIN chat_participants me
         ON me.chat_id = c.id
        AND me.user_id = $1
+
       LEFT JOIN LATERAL (
         SELECT
           u.id,
@@ -8253,6 +8274,7 @@ app.get("/api/chats", async (req, res) => {
         ORDER BY cp.created_at ASC
         LIMIT 1
       ) other_user ON true
+
       LEFT JOIN LATERAL (
         SELECT COUNT(*)::integer AS unread_count
         FROM messages m
@@ -8266,7 +8288,9 @@ app.get("/api/chats", async (req, res) => {
             OR COALESCE(m.timestamp, m.created_at) > rs.last_read_at
           )
       ) unread ON true
+
       WHERE c.is_archived = false
+
       ORDER BY
         CASE
           WHEN $1 = ANY(COALESCE(c.pinned_by, ARRAY[]::integer[]))
@@ -8278,16 +8302,19 @@ app.get("/api/chats", async (req, res) => {
       `,
       [userId]
     );
+
     const chats = result.rows.map((chat) => ({
       ...chat,
-      // Frontend-friendly names
+
       pinned: Boolean(chat.is_pinned),
       muted: Boolean(chat.is_muted),
       archived: Boolean(chat.is_archived),
+
       unreadCount: Number(chat.unread_count || 0),
       unread: Number(chat.unread_count || 0) > 0,
+
       otherUserId: chat.other_user_id,
-      // Keep both names available
+
       otherUser: chat.other_user_id
         ? {
             id: chat.other_user_id,
@@ -8299,14 +8326,20 @@ app.get("/api/chats", async (req, res) => {
           }
         : null
     }));
-    res.json(chats);
+
+    console.log(`[CHATS] Returning ${chats.length} chats for user ${userId}`);
+
+    return res.json(chats);
+
   } catch (err) {
     console.error("GET /api/chats:", err);
-    res.status(500).json({
+
+    return res.status(500).json({
       error: "Failed to load chats",
-      details: process.env.NODE_ENV === "production"
-        ? undefined
-        : err.message
+      details:
+        process.env.NODE_ENV === "production"
+          ? undefined
+          : err.message
     });
   }
 });
