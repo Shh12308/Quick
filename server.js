@@ -6267,16 +6267,21 @@ app.post("/api/agora/token", authenticateToken, async (req, res) => {
     const { channelName } = req.body;
 
     if (!channelName) {
-      return res.status(400).json({ error: "Channel name is required" });
+      return res.status(400).json({
+        error: "Channel name is required"
+      });
     }
 
     if (!AGORA_APP_ID || !AGORA_APP_CERTIFICATE) {
-      return res.status(500).json({ error: "Agora not configured" });
+      return res.status(500).json({
+        error: "Agora not configured"
+      });
     }
 
     const expirationTimeInSeconds = 86400;
     const currentTimestamp = Math.floor(Date.now() / 1000);
-    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+    const privilegeExpiredTs =
+      currentTimestamp + expirationTimeInSeconds;
 
     const token = RtcTokenBuilder.buildTokenWithUid(
       AGORA_APP_ID,
@@ -6297,7 +6302,10 @@ app.post("/api/agora/token", authenticateToken, async (req, res) => {
 
   } catch (err) {
     console.error("Agora token error:", err);
-    res.status(500).json({ error: "Failed to generate Agora token" });
+
+    res.status(500).json({
+      error: "Failed to generate Agora token"
+    });
   }
 });
 
