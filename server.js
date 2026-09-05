@@ -5636,25 +5636,67 @@ app.post("/api/chats/direct", authenticateREST, async (req, res) => {
 // USER PROFILE & "MY CONTENT" ROUTES
 // ==========================================
 
-// Get current user's profile
-// Get current user's profile
 app.get('/api/users/profile', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Not authenticated' });
 
-    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!token) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    let decoded;
+
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (err) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
 
     const { rows } = await pool.query(
-      `SELECT 
-        id, username, email, display_name, bio, location, website,
-        profile_url, cover_url, is_verified, role,
-        followers_count, following_count,
-        privacy_settings, created_at,
-        (SELECT COUNT(*) FROM videos WHERE user_id = users.id AND is_short = false AND is_public = true) as video_count,
-        (SELECT COUNT(*) FROM videos WHERE user_id = users.id AND is_short = true AND is_public = true) as short_count
-       FROM users 
-       WHERE id = $1`,
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.email,
+        u.display_name,
+        u.bio,
+        u.location,
+        u.website,
+        u.profile_url,
+        u.cover_url,
+        u.is_verified,
+        u.role,
+        u.followers_count,
+        u.following_count,
+        u.privacy_settings,
+        u.created_at,
+
+        (
+          SELECT COUNT(*)
+          FROM videos v
+          WHERE v.user_id = u.id
+            AND v.is_short = false
+            AND v.is_public = true
+        ) AS video_count,
+
+        (
+          SELECT COUNT(*)
+          FROM videos v
+          WHERE v.user_id = u.id
+            AND v.is_short = true
+            AND v.is_public = true
+        ) AS short_count,
+
+        (
+          SELECT COALESCE(SUM(v.views), 0)
+          FROM videos v
+          WHERE v.user_id = u.id
+            AND v.is_public = true
+        ) AS total_views
+
+      FROM users u
+      WHERE u.id = $1
+      `,
       [decoded.id]
     );
 
@@ -5664,34 +5706,40 @@ app.get('/api/users/profile', async (req, res) => {
 
     const user = rows[0];
 
-    // Parse privacy_settings to derive is_private
     let isPrivate = false;
+
     try {
-      const ps = typeof user.privacy_settings === 'string' 
-        ? JSON.parse(user.privacy_settings) 
-        : (user.privacy_settings || {});
+      const ps =
+        typeof user.privacy_settings === 'string'
+          ? JSON.parse(user.privacy_settings)
+          : user.privacy_settings || {};
+
       isPrivate = ps.privateAccount === true;
-    } catch {}
+    } catch {
+      isPrivate = false;
+    }
 
     res.json({
       id: user.id,
       username: user.username,
       email: user.email,
-      display_name: user.display_name,
-      bio: user.bio,
-      location: user.location,
-      website: user.website,
-      profile_url: user.profile_url,
-      cover_url: user.cover_url,
-      is_verified: user.is_verified,
-      role: user.role,
-      // ✅ Fixed column names
-      subscribers_count: user.followers_count || 0,
-      total_views: 0,  // No column exists — compute if needed (see below)
-      following_count: user.following_count || 0,
+      display_name: user.display_name || user.username,
+      bio: user.bio || '',
+      location: user.location || '',
+      website: user.website || '',
+      profile_url: user.profile_url || null,
+      cover_url: user.cover_url || null,
+      is_verified: Boolean(user.is_verified),
+      role: user.role || 'user',
+
+      subscribers_count: Number(user.followers_count) || 0,
+      following_count: Number(user.following_count) || 0,
+
+      video_count: Number(user.video_count) || 0,
+      short_count: Number(user.short_count) || 0,
+      total_views: Number(user.total_views) || 0,
+
       is_private: isPrivate,
-      video_count: user.video_count || 0,
-      short_count: user.short_count || 0,
       created_at: user.created_at,
     });
   } catch (err) {
@@ -5700,14 +5748,49 @@ app.get('/api/users/profile', async (req, res) => {
   }
 });
 
-// Update current user's profile
 app.put('/api/users/profile', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Not authenticated' });
 
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const { display_name, bio, location, website } = req.body;
+    if (!token) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    let decoded;
+
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    let { display_name, bio, location, website } = req.body;
+
+    if (display_name !== undefined) {
+      display_name = String(display_name).trim();
+
+      if (!display_name) {
+        return res.status(400).json({
+          error: 'Display name cannot be empty',
+        });
+      }
+    }
+
+    if (bio !== undefined) {
+      bio = String(bio).trim();
+    }
+
+    if (location !== undefined) {
+      location = String(location).trim();
+    }
+
+    if (website !== undefined) {
+      website = String(website).trim();
+
+      if (website && !/^https?:\/\//i.test(website)) {
+        website = `https://${website}`;
+      }
+    }
 
     const updates = [];
     const params = [];
@@ -5717,40 +5800,81 @@ app.put('/api/users/profile', async (req, res) => {
       updates.push(`display_name = $${paramIndex++}`);
       params.push(display_name);
     }
+
     if (bio !== undefined) {
       updates.push(`bio = $${paramIndex++}`);
       params.push(bio);
     }
+
     if (location !== undefined) {
       updates.push(`location = $${paramIndex++}`);
       params.push(location);
     }
+
     if (website !== undefined) {
       updates.push(`website = $${paramIndex++}`);
-      params.push(website);
+      params.push(website || null);
     }
 
-    if (updates.length === 0) {
-      return res.status(400).json({ error: 'Nothing to update' });
+    if (!updates.length) {
+      return res.status(400).json({
+        error: 'Nothing to update',
+      });
     }
 
-    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
-    const { rows } = await pool.query(query, [...params, decoded.id]);
+    const query = `
+      UPDATE users
+      SET ${updates.join(', ')}
+      WHERE id = $${paramIndex}
+      RETURNING
+        id,
+        username,
+        email,
+        display_name,
+        bio,
+        location,
+        website,
+        profile_url,
+        cover_url,
+        is_verified,
+        role
+    `;
+
+    const { rows } = await pool.query(query, [
+      ...params,
+      decoded.id,
+    ]);
 
     if (!rows.length) {
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(404).json({
+        error: 'User not found',
+      });
     }
+
+    const user = rows[0];
 
     res.json({
       success: true,
-      display_name: rows[0].display_name,
-      bio: rows[0].bio,
-      location: rows[0].location,
-      website: rows[0].website,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        display_name: user.display_name,
+        bio: user.bio || '',
+        location: user.location || '',
+        website: user.website || '',
+        profile_url: user.profile_url || null,
+        cover_url: user.cover_url || null,
+        is_verified: Boolean(user.is_verified),
+        role: user.role || 'user',
+      },
     });
   } catch (err) {
     console.error('Update profile error:', err);
-    res.status(500).json({ error: 'Failed to update profile' });
+
+    res.status(500).json({
+      error: 'Failed to update profile',
+    });
   }
 });
 
