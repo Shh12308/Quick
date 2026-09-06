@@ -8518,77 +8518,90 @@ app.get("/api/me/restrictions", authenticateToken, async (req, res) => {
 });
 
 // 1. Save the current user's public key
-app.post('/api/users/me/keys', authenticateToken, async (req, res) => {
+app.post('/api/users/me/keys', authenticateMiddleware, async (req, res) => {
   try {
+    const myId = req.user.id;
     const { publicKey } = req.body;
-    // Save this publicKey to the logged-in user's database record
-    await User.update({ 
-      e2e_public_key: JSON.stringify(publicKey) 
-    }, { where: { id: req.user.id } });
-    
+
+    // Save the public key to the user's record
+    await pool.query(
+      'UPDATE users SET e2e_public_key = $1 WHERE id = $2',
+      [JSON.stringify(publicKey), myId]
+    );
+
     res.status(200).json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: "Failed to save key" });
+    console.error("SAVE KEY ERROR:", err.message);
+    res.status(500).json({ error: "Failed to save keys" });
   }
 });
 
 // 2. Get the public key of the other user in a specific chat
-app.get('/api/chats/:chatId/keys', authenticateToken, async (req, res) => {
+app.get('/api/chats/:chatId/keys', authenticateMiddleware, async (req, res) => {
   try {
     const { chatId } = req.params;
+    const myId = req.user.id;
+
+    // 1. Get the chat to find the participants array
+    const chatRes = await pool.query('SELECT participants FROM chats WHERE id = $1', [chatId]);
+    if (chatRes.rows.length === 0) return res.status(404).json({ error: "Chat not found" });
+
+    const participants = chatRes.rows[0].participants || [];
     
-    // Find the chat, and get the OTHER participant's ID
-    const chat = await Chat.findById(chatId);
-    const otherUserId = chat.participants.find(id => id !== req.user.id);
-    
-    // Fetch that user's public key
-    const otherUser = await User.findById(otherUserId);
-    
-    if (!otherUser || !otherUser.e2e_public_key) {
+    // 2. Find the ID of the OTHER user in the chat
+    const otherUserId = participants.find(id => Number(id) !== Number(myId));
+    if (!otherUserId) return res.status(404).json({ error: "Peer not found" });
+
+    // 3. Fetch that user's public key
+    const userRes = await pool.query('SELECT e2e_public_key FROM users WHERE id = $1', [otherUserId]);
+    if (userRes.rows.length === 0 || !userRes.rows[0].e2e_public_key) {
       return res.status(404).json({ error: "Peer key not published yet" });
     }
-    
+
+    // 4. Return the key
     res.status(200).json({ 
-      publicKey: JSON.parse(otherUser.e2e_public_key) 
+      publicKey: userRes.rows[0].e2e_public_key 
     });
   } catch (err) {
+    console.error("FETCH KEY ERROR:", err.message);
     res.status(500).json({ error: "Failed to fetch keys" });
   }
 });
 
 // Block a user
-app.post('/api/users/:userId/block', authenticateToken, async (req, res) => {
+app.post('/api/users/:userId/block', authenticateMiddleware, async (req, res) => {
   try {
-    const { userId } = req.params; // The ID of the user being blocked
-    
-    // Add userId to the current user's block list in your database
-    // Example using a hypothetical BlockedUser model:
-    await BlockedUser.create({
-      blockerId: req.user.id,
-      blockedId: userId
-    });
-    
+    const blockerId = req.user.id;
+    const blockedId = parseInt(req.params.userId);
+
+    // Insert into blocked_users table. 
+    // I included user_id because it's in your schema, setting it to blockerId.
+    await pool.query(
+      'INSERT INTO blocked_users (blocker_id, blocked_id, user_id) VALUES ($1, $2, $1) ON CONFLICT DO NOTHING',
+      [blockerId, blockedId, blockerId]
+    );
+
     res.status(200).json({ success: true, message: "User blocked" });
   } catch (err) {
+    console.error("BLOCK ERROR:", err.message);
     res.status(500).json({ error: "Failed to block user" });
   }
 });
 
 // Unblock a user
-app.post('/api/users/:userId/unblock', authenticateToken, async (req, res) => {
+app.post('/api/users/:userId/unblock', authenticateMiddleware, async (req, res) => {
   try {
-    const { userId } = req.params;
-    
-    // Remove userId from the current user's block list
-    await BlockedUser.destroy({
-      where: {
-        blockerId: req.user.id,
-        blockedId: userId
-      }
-    });
-    
+    const blockerId = req.user.id;
+    const blockedId = parseInt(req.params.userId);
+
+    await pool.query(
+      'DELETE FROM blocked_users WHERE blocker_id = $1 AND blocked_id = $2',
+      [blockerId, blockedId]
+    );
+
     res.status(200).json({ success: true, message: "User unblocked" });
   } catch (err) {
+    console.error("UNBLOCK ERROR:", err.message);
     res.status(500).json({ error: "Failed to unblock user" });
   }
 });
