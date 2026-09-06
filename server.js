@@ -5639,111 +5639,33 @@ app.post("/api/chats/direct", authenticateREST, async (req, res) => {
 app.get('/api/users/profile', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
-
-    if (!token) {
-      return res.status(401).json({ error: 'Not authenticated' });
-    }
+    if (!token) return res.status(401).json({ error: 'Not authenticated' });
 
     let decoded;
-
     try {
       decoded = jwt.verify(token, JWT_SECRET);
     } catch (err) {
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
 
-    const { rows } = await pool.query(
-      `
-      SELECT
-        u.id,
-        u.username,
-        u.email,
-        u.display_name,
-        u.bio,
-        u.location,
-        u.website,
-        u.profile_url,
-        u.cover_url,
-        u.is_verified,
-        u.role,
-        u.followers_count,
-        u.following_count,
-        u.privacy_settings,
-        u.created_at,
+    // 1. Log what the backend extracted from the token
+    console.log("🔍 DEBUG: Backend extracted ID:", decoded.id, "(Type:", typeof decoded.id + ")");
 
-        (
-          SELECT COUNT(*)
-          FROM videos v
-          WHERE v.user_id = u.id
-            AND v.is_short = false
-            AND v.is_public = true
-        ) AS video_count,
+    // 2. Run the simplest possible query
+    const { rows } = await pool.query('SELECT id, username FROM users WHERE id = $1', [decoded.id]);
 
-        (
-          SELECT COUNT(*)
-          FROM videos v
-          WHERE v.user_id = u.id
-            AND v.is_short = true
-            AND v.is_public = true
-        ) AS short_count,
+    // 3. Log what the database returned
+    console.log("🔍 DEBUG: Database returned rows:", rows.length);
 
-        (
-          SELECT COALESCE(SUM(v.views), 0)
-          FROM videos v
-          WHERE v.user_id = u.id
-            AND v.is_public = true
-        ) AS total_views
-
-      FROM users u
-      WHERE u.id = $1
-      `,
-      [decoded.id]
-    );
-
-    if (!rows.length) {
+    if (rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const user = rows[0];
+    // Return minimal success response
+    res.json({ message: "Success!", user: rows[0] });
 
-    let isPrivate = false;
-
-    try {
-      const ps =
-        typeof user.privacy_settings === 'string'
-          ? JSON.parse(user.privacy_settings)
-          : user.privacy_settings || {};
-
-      isPrivate = ps.privateAccount === true;
-    } catch {
-      isPrivate = false;
-    }
-
-    res.json({
-      id: user.id,
-      username: user.username,
-      email: user.email,
-      display_name: user.display_name || user.username,
-      bio: user.bio || '',
-      location: user.location || '',
-      website: user.website || '',
-      profile_url: user.profile_url || null,
-      cover_url: user.cover_url || null,
-      is_verified: Boolean(user.is_verified),
-      role: user.role || 'user',
-
-      subscribers_count: Number(user.followers_count) || 0,
-      following_count: Number(user.following_count) || 0,
-
-      video_count: Number(user.video_count) || 0,
-      short_count: Number(user.short_count) || 0,
-      total_views: Number(user.total_views) || 0,
-
-      is_private: isPrivate,
-      created_at: user.created_at,
-    });
   } catch (err) {
-    console.error('Get profile error:', err);
+    console.error('🔥 DEBUG CATCH ERROR:', err.message);
     res.status(500).json({ error: 'Failed to fetch profile' });
   }
 });
