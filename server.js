@@ -8518,7 +8518,7 @@ app.get("/api/me/restrictions", authenticateToken, async (req, res) => {
 });
 
 // 1. Save the current user's public key
-app.post('/api/users/me/keys', authenticateMiddleware, async (req, res) => {
+app.post('/api/users/me/keys', authenticateToken, async (req, res) => {
   try {
     const { publicKey } = req.body;
     // Save this publicKey to the logged-in user's database record
@@ -8533,7 +8533,7 @@ app.post('/api/users/me/keys', authenticateMiddleware, async (req, res) => {
 });
 
 // 2. Get the public key of the other user in a specific chat
-app.get('/api/chats/:chatId/keys', authenticateMiddleware, async (req, res) => {
+app.get('/api/chats/:chatId/keys', authenticateToken, async (req, res) => {
   try {
     const { chatId } = req.params;
     
@@ -8557,7 +8557,7 @@ app.get('/api/chats/:chatId/keys', authenticateMiddleware, async (req, res) => {
 });
 
 // Block a user
-app.post('/api/users/:userId/block', authenticateMiddleware, async (req, res) => {
+app.post('/api/users/:userId/block', authenticateToken, async (req, res) => {
   try {
     const { userId } = req.params; // The ID of the user being blocked
     
@@ -8575,7 +8575,7 @@ app.post('/api/users/:userId/block', authenticateMiddleware, async (req, res) =>
 });
 
 // Unblock a user
-app.post('/api/users/:userId/unblock', authenticateMiddleware, async (req, res) => {
+app.post('/api/users/:userId/unblock', authenticateToken, async (req, res) => {
   try {
     const { userId } = req.params;
     
