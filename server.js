@@ -8517,6 +8517,82 @@ app.get("/api/me/restrictions", authenticateToken, async (req, res) => {
   }
 });
 
+// 1. Save the current user's public key
+app.post('/api/users/me/keys', authenticateMiddleware, async (req, res) => {
+  try {
+    const { publicKey } = req.body;
+    // Save this publicKey to the logged-in user's database record
+    await User.update({ 
+      e2e_public_key: JSON.stringify(publicKey) 
+    }, { where: { id: req.user.id } });
+    
+    res.status(200).json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to save key" });
+  }
+});
+
+// 2. Get the public key of the other user in a specific chat
+app.get('/api/chats/:chatId/keys', authenticateMiddleware, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    
+    // Find the chat, and get the OTHER participant's ID
+    const chat = await Chat.findById(chatId);
+    const otherUserId = chat.participants.find(id => id !== req.user.id);
+    
+    // Fetch that user's public key
+    const otherUser = await User.findById(otherUserId);
+    
+    if (!otherUser || !otherUser.e2e_public_key) {
+      return res.status(404).json({ error: "Peer key not published yet" });
+    }
+    
+    res.status(200).json({ 
+      publicKey: JSON.parse(otherUser.e2e_public_key) 
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch keys" });
+  }
+});
+
+// Block a user
+app.post('/api/users/:userId/block', authenticateMiddleware, async (req, res) => {
+  try {
+    const { userId } = req.params; // The ID of the user being blocked
+    
+    // Add userId to the current user's block list in your database
+    // Example using a hypothetical BlockedUser model:
+    await BlockedUser.create({
+      blockerId: req.user.id,
+      blockedId: userId
+    });
+    
+    res.status(200).json({ success: true, message: "User blocked" });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to block user" });
+  }
+});
+
+// Unblock a user
+app.post('/api/users/:userId/unblock', authenticateMiddleware, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // Remove userId from the current user's block list
+    await BlockedUser.destroy({
+      where: {
+        blockerId: req.user.id,
+        blockedId: userId
+      }
+    });
+    
+    res.status(200).json({ success: true, message: "User unblocked" });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to unblock user" });
+  }
+});
+
 app.patch("/api/chats/:id", authenticateToken, async (req, res) => {
   try {
     const userId = Number(req.userId);
