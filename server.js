@@ -8786,162 +8786,570 @@ app.patch("/api/chats/:id", authenticateToken, async (req, res) => {
 
 
 // DELETE /api/notifications/read - Delete all read notifications
+// ==========================================
+// NOTIFICATION SYSTEM
+// ==========================================
+
+// Helper: Get notification link based on type
+function getNotificationLink(type, data = {}) {
+  switch (type) {
+    case 'like':
+    case 'comment':
+    case 'mention':
+      return data?.videoId ? `/watch/${data.videoId}` : null;
+
+    case 'follow':
+      return data?.followerId
+        ? `/viewprofile/${data.followerId}`
+        : null;
+
+    case 'login':
+    case 'Login':
+      return null;
+
+    case 'warning':
+    case 'Warning':
+      return null;
+
+    case 'app_update':
+    case 'App Update':
+      return null;
+
+    case 'subscription':
+      return '/profile';
+
+    case 'merch_order':
+      return data?.orderId
+        ? `/orders/${data.orderId}`
+        : '/shop';
+
+    case 'tip_received':
+      return data?.streamId
+        ? `/live/${data.streamId}`
+        : '/earnings';
+
+    case 'call_missed':
+      return '/messages';
+
+    default:
+      return null;
+  }
+}
+
+
+// ==========================================
+// CREATE NOTIFICATION
+// ==========================================
+
+async function createNotification(
+  userId,
+  senderId,
+  type,
+  title,
+  message,
+  data = {}
+) {
+  try {
+    if (!userId) {
+      console.warn("createNotification called without userId");
+      return null;
+    }
+
+    // Make sure data is always an object
+    const notificationData =
+      data && typeof data === 'object'
+        ? data
+        : {};
+
+    const { rows } = await pool.query(
+      `
+      INSERT INTO notifications
+        (
+          user_id,
+          sender_id,
+          type,
+          title,
+          message,
+          data,
+          is_read,
+          created_at
+        )
+      VALUES
+        ($1, $2, $3, $4, $5, $6::jsonb, false, NOW())
+      RETURNING *
+      `,
+      [
+        userId,
+        senderId || null,
+        type,
+        title,
+        message,
+        JSON.stringify(notificationData)
+      ]
+    );
+
+    const notification = rows[0];
+
+    // Build link
+    const link = getNotificationLink(
+      notification.type,
+      notificationData
+    );
+
+    // Send real-time notification
+    if (typeof io !== 'undefined') {
+      io.to(`user-${userId}`).emit("notification", {
+        ...notification,
+        data: notificationData,
+        link
+      });
+    }
+
+    return {
+      ...notification,
+      data: notificationData,
+      link
+    };
+
+  } catch (err) {
+    console.error("Create notification error:", err);
+    return null;
+  }
+}
+
+
+// ==========================================
+// GET NOTIFICATIONS
+// ==========================================
+
+app.get('/api/notifications', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        n.id,
+        n.user_id,
+        n.sender_id,
+        n.type,
+        n.title,
+        n.message,
+        n.data,
+        n.is_read,
+        n.created_at,
+
+        u.username AS sender_username,
+        u.profile_url AS sender_avatar
+
+      FROM notifications n
+
+      LEFT JOIN users u
+        ON u.id = n.sender_id
+
+      WHERE n.user_id = $1
+
+      ORDER BY n.created_at DESC
+
+      LIMIT 100
+      `,
+      [userId]
+    );
+
+    const notifications = rows.map(n => {
+      let data = {};
+
+      try {
+        if (typeof n.data === 'string') {
+          data = JSON.parse(n.data || '{}');
+        } else {
+          data = n.data || {};
+        }
+      } catch (e) {
+        data = {};
+      }
+
+      const type = n.type;
+
+      return {
+        id: n.id,
+
+        user_id: n.user_id,
+        sender_id: n.sender_id,
+
+        type,
+
+        title: n.title,
+        message: n.message,
+
+        // Fields your React UI uses
+        user: n.sender_username || 'MintZa',
+        avatar: n.sender_avatar || null,
+        text: n.message,
+
+        // Common data shortcuts
+        videoId: data.videoId || null,
+        followerId: data.followerId || null,
+        subscriberId: data.subscriberId || null,
+        streamId: data.streamId || null,
+        orderId: data.orderId || null,
+
+        // Login data
+        ip: data.ip || null,
+        device: data.device || null,
+        browser: data.browser || null,
+        location: data.location || null,
+        user_agent: data.user_agent || null,
+
+        // Warning data
+        reason: data.reason || null,
+        actionType: data.actionType || null,
+        category: data.category || null,
+        issuedBy: data.issuedBy || null,
+
+        // App update data
+        version: data.version || null,
+        changelog: data.changelog || null,
+        summary: data.summary || null,
+
+        data,
+
+        is_read: n.is_read,
+        read: n.is_read,
+
+        created_at: n.created_at,
+        time: n.created_at,
+
+        link: getNotificationLink(type, data)
+      };
+    });
+
+    const unreadResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM notifications
+      WHERE user_id = $1
+        AND is_read = false
+      `,
+      [userId]
+    );
+
+    const unreadCount = unreadResult.rows[0].count;
+
+    res.json({
+      success: true,
+      notifications,
+      unreadCount
+    });
+
+  } catch (err) {
+    console.error("Get notifications error:", err);
+
+    res.status(500).json({
+      success: false,
+      error: "Failed to get notifications",
+      notifications: [],
+      unreadCount: 0
+    });
+  }
+});
+
+
+// ==========================================
+// MARK ONE NOTIFICATION READ
+// ==========================================
+
+app.post('/api/notifications/:id/read', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const notificationId = parseInt(req.params.id);
+
+    if (!Number.isInteger(notificationId)) {
+      return res.status(400).json({
+        error: "Invalid notification ID"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE notifications
+      SET is_read = true
+      WHERE id = $1
+        AND user_id = $2
+      `,
+      [notificationId, userId]
+    );
+
+    res.json({
+      success: true,
+      updatedCount: result.rowCount
+    });
+
+  } catch (err) {
+    console.error("Mark notification read error:", err);
+
+    res.status(500).json({
+      error: "Failed to mark notification as read"
+    });
+  }
+});
+
+
+// ==========================================
+// MARK ALL NOTIFICATIONS READ
+// ==========================================
+
+app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const result = await pool.query(
+      `
+      UPDATE notifications
+      SET is_read = true
+      WHERE user_id = $1
+        AND is_read = false
+      `,
+      [userId]
+    );
+
+    res.json({
+      success: true,
+      updatedCount: result.rowCount
+    });
+
+  } catch (err) {
+    console.error("Mark all notifications read error:", err);
+
+    res.status(500).json({
+      error: "Failed to mark notifications as read"
+    });
+  }
+});
+
+
+// ==========================================
+// DELETE ONE NOTIFICATION
+// ==========================================
+
+app.delete('/api/notifications/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const notificationId = parseInt(req.params.id);
+
+    if (!Number.isInteger(notificationId)) {
+      return res.status(400).json({
+        error: "Invalid notification ID"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      DELETE FROM notifications
+      WHERE id = $1
+        AND user_id = $2
+      `,
+      [notificationId, userId]
+    );
+
+    res.json({
+      success: true,
+      deletedCount: result.rowCount
+    });
+
+  } catch (err) {
+    console.error("Delete notification error:", err);
+
+    res.status(500).json({
+      error: "Failed to delete notification"
+    });
+  }
+});
+
+
+// ==========================================
+// DELETE ALL READ NOTIFICATIONS
+// ==========================================
+
 app.delete('/api/notifications/read', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
     const { rowCount } = await pool.query(
-      `DELETE FROM notifications 
-       WHERE user_id = $1 AND is_read = true`,
+      `
+      DELETE FROM notifications
+      WHERE user_id = $1
+        AND is_read = true
+      `,
       [userId]
     );
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: `Deleted ${rowCount} read notifications`,
       deletedCount: rowCount
     });
 
   } catch (err) {
     console.error("Delete read notifications error:", err);
-    res.status(500).json({ error: "Failed to delete read notifications" });
+
+    res.status(500).json({
+      error: "Failed to delete read notifications"
+    });
   }
 });
 
+
 // ==========================================
-// NOTIFICATION HELPERS FOR OTHER FEATURES
+// NOTIFICATION HELPERS
 // ==========================================
 
-// Helper: Get notification link based on type
-function getNotificationLink(type, data) {
-  switch (type) {
-    case 'like':
-    case 'comment':
-      return data?.videoId ? `/watch/${data.videoId}` : null;
-    case 'follow':
-      return data?.followerId ? `/viewprofile/${data.followerId}` : null;
-    case 'mention':
-      return data?.videoId ? `/watch/${data.videoId}` : null;
-    case 'login':
-    case 'Login':
-      return null; // Opens modal, no navigation
-    case 'warning':
-    case 'Warning':
-      return null; // Opens modal, no navigation
-    case 'app_update':
-    case 'App Update':
-      return null; // Opens modal, no navigation
-    case 'subscription':
-      return '/profile';
-    case 'merch_order':
-      return data?.orderId ? `/orders/${data.orderId}` : '/shop';
-    case 'tip_received':
-      return data?.streamId ? `/live/${data.streamId}` : '/earnings';
-    case 'call_missed':
-      return data?.callerId ? `/messages` : null;
-    default:
-      return null;
-  }
-}
 
-// Helper: Create like notification
+// LIKE
 async function notifyLike(videoOwnerId, likerId, videoId) {
-  if (videoOwnerId === likerId) return; // Don't notify self
-  
+  if (!videoOwnerId || !likerId) return;
+  if (videoOwnerId === likerId) return;
+
   await createNotification(
     videoOwnerId,
     likerId,
     'like',
     'New Like',
     'liked your video',
-    { videoId }
+    {
+      videoId,
+      likerId
+    }
   );
 }
 
-// Helper: Create comment notification
-async function notifyComment(videoOwnerId, commenterId, videoId, commentText) {
+
+// COMMENT
+async function notifyComment(
+  videoOwnerId,
+  commenterId,
+  videoId,
+  commentText
+) {
+  if (!videoOwnerId || !commenterId) return;
   if (videoOwnerId === commenterId) return;
-  
+
+  const text = String(commentText || '');
+
   await createNotification(
     videoOwnerId,
     commenterId,
     'comment',
     'New Comment',
-    `commented: ${commentText?.substring(0, 100)}${commentText?.length > 100 ? '...' : ''}`,
-    { videoId, commentText }
+    `commented: ${text.substring(0, 100)}${text.length > 100 ? '...' : ''}`,
+    {
+      videoId,
+      commentText: text
+    }
   );
 }
 
-// Helper: Create follow notification
+
+// FOLLOW
 async function notifyFollow(followingId, followerId) {
+  if (!followingId || !followerId) return;
+  if (followingId === followerId) return;
+
   await createNotification(
     followingId,
     followerId,
     'follow',
     'New Follower',
     'started following you',
-    { followerId }
+    {
+      followerId
+    }
   );
 }
 
-// Helper: Create mention notification
-async function notifyMention(mentionedUserId, mentionerId, videoId) {
+
+// MENTION
+async function notifyMention(
+  mentionedUserId,
+  mentionerId,
+  videoId
+) {
+  if (!mentionedUserId || !mentionerId) return;
   if (mentionedUserId === mentionerId) return;
-  
+
   await createNotification(
     mentionedUserId,
     mentionerId,
     'mention',
     'You were mentioned',
     'mentioned you in a video',
-    { videoId }
-  );
-}
-
-// Helper: Create login notification (for security)
-async function notifyLogin(userId, loginData) {
-  await createNotification(
-    userId,
-    null, // System notification
-    'Login',
-    'New Login Detected',
-    'A new login was detected on your account',
     {
-      ip: loginData.ip,
-      device: loginData.device,
-      browser: loginData.browser,
-      location: loginData.location,
-      user_agent: loginData.userAgent
+      videoId
     }
   );
 }
 
-// Helper: Create warning notification (for moderation)
-async function notifyWarning(userId, warningData) {
+
+// LOGIN
+async function notifyLogin(userId, loginData = {}) {
+  if (!userId) return;
+
   await createNotification(
     userId,
-    null, // System notification
+    null,
+    'Login',
+    'New Login Detected',
+    'A new login was detected on your account',
+    {
+      ip: loginData.ip || null,
+      device: loginData.device || 'Unknown',
+      browser: loginData.browser || 'Unknown',
+      location: loginData.location || 'Unknown',
+      user_agent: loginData.userAgent || null
+    }
+  );
+}
+
+
+// WARNING
+async function notifyWarning(userId, warningData = {}) {
+  if (!userId) return;
+
+  await createNotification(
+    userId,
+    null,
     'Warning',
     'Account Warning',
-    warningData.reason,
+    warningData.reason || 'Your account received a warning',
     {
-      reason: warningData.reason,
-      actionType: warningData.actionType,
-      category: warningData.category,
+      reason: warningData.reason || 'Unknown',
+      actionType: warningData.actionType || null,
+      category: warningData.category || null,
       issuedBy: warningData.issuedBy || 'System'
     }
   );
 }
 
-// Helper: Create app update notification (admin only - sends to all users)
-async function notifyAppUpdate(version, changelog, summary) {
+
+// APP UPDATE
+async function notifyAppUpdate(
+  version,
+  changelog,
+  summary
+) {
   try {
-    const { rows } = await pool.query("SELECT id FROM users WHERE status = 'active'");
-    
+    const { rows } = await pool.query(
+      `
+      SELECT id
+      FROM users
+      WHERE status = 'active'
+      `
+    );
+
     for (const user of rows) {
       await createNotification(
         user.id,
-        null, // System notification
+        null,
         'App Update',
         'App Update Available',
         `Version ${version} is now available`,
@@ -8952,47 +9360,125 @@ async function notifyAppUpdate(version, changelog, summary) {
         }
       );
     }
+
   } catch (err) {
     console.error("Notify app update error:", err);
   }
 }
 
-// Helper: Create tip received notification
-async function notifyTipReceived(creatorId, senderId, amount, streamId = null) {
+
+// TIP
+async function notifyTipReceived(
+  creatorId,
+  senderId,
+  amount,
+  streamId = null
+) {
+  if (!creatorId) return;
+
   await createNotification(
     creatorId,
     senderId,
     'tip_received',
     'Tip Received',
     `sent you a $${amount} tip`,
-    { amount, streamId, senderId }
+    {
+      amount,
+      streamId,
+      senderId
+    }
   );
 }
 
-// Helper: Create subscription notification
-async function notifySubscription(creatorId, subscriberId, tierName) {
+
+// SUBSCRIPTION
+async function notifySubscription(
+  creatorId,
+  subscriberId,
+  tierName
+) {
+  if (!creatorId || !subscriberId) return;
+  if (creatorId === subscriberId) return;
+
   await createNotification(
     creatorId,
     subscriberId,
     'subscription',
     'New Subscriber',
     `subscribed to your ${tierName} tier`,
-    { subscriberId, tierName }
+    {
+      subscriberId,
+      tierName
+    }
   );
 }
 
 // ==========================================
-// FOLLOW SYSTEM ENDPOINTS
+// UNFOLLOW USER
 // ==========================================
 
-// Initialize follows table if not exists
-await pool.query(`CREATE TABLE IF NOT EXISTS follows (
-  id SERIAL PRIMARY KEY,
-  follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  created_at TIMESTAMP DEFAULT NOW(),
-  UNIQUE(follower_id, following_id)
-)`);
+app.delete(
+  '/api/users/:userId/follow',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const targetUserId = parseInt(req.params.userId);
+      const currentUserId = req.user.id;
+
+      if (!Number.isInteger(targetUserId)) {
+        return res.status(400).json({
+          error: "Invalid user ID"
+        });
+      }
+
+      const result = await pool.query(
+        `
+        DELETE FROM follows
+        WHERE follower_id = $1
+          AND following_id = $2
+        `,
+        [
+          currentUserId,
+          targetUserId
+        ]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(400).json({
+          error: "Not following"
+        });
+      }
+
+
+      // Update follower count
+      await pool.query(
+        `
+        UPDATE users
+        SET total_follows = (
+          SELECT COUNT(*)
+          FROM follows
+          WHERE following_id = $1
+        )
+        WHERE id = $1
+        `,
+        [targetUserId]
+      );
+
+
+      res.json({
+        success: true,
+        following: false
+      });
+
+    } catch (err) {
+      console.error("Unfollow error:", err);
+
+      res.status(500).json({
+        error: "Failed to unfollow user"
+      });
+    }
+  }
+);
 
 // Follow a user
 app.post('/api/users/:userId/follow', authenticateToken, async (req, res) => {
