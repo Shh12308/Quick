@@ -5675,6 +5675,18 @@ app.get('/api/users/profile', async (req, res) => {
   }
 });
 
+// A hardcoded test to prove the database connection works
+app.get('/api/test-db', async (req, res) => {
+  try {
+    // We are hardcoding ID 9 here
+    const { rows } = await pool.query('SELECT id, username FROM users WHERE id = 9');
+    console.log("TEST DB ROWS:", rows);
+    res.json({ rows_found: rows.length, data: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.put('/api/users/profile', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
