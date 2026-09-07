@@ -8841,19 +8841,6 @@ function getNotificationLink(type, data = {}) {
 // CREATE NOTIFICATION
 // ==========================================
 
-async function createNotification(
-  userId,
-  senderId,
-  type,
-  title,
-  message,
-  data = {}
-) {
-  try {
-    if (!userId) {
-      console.warn("createNotification called without userId");
-      return null;
-    }
 
     // Make sure data is always an object
     const notificationData =
