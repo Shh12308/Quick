@@ -4098,8 +4098,13 @@ app.options('/api/video-proxy', (req, res) => {
 
 // 3. GET /api/videos/:id - Get single video details (Increment View)
 app.get('/api/videos/:id', async (req, res) => {
-  const { id } = req.params;
+  // ✅ GUARD: Convert to number and validate to prevent Postgres crashes
+  const id = Number(req.params.id);
   
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: true, msg: "Invalid video ID" });
+  }
+
   try {
     // Increment view count
     await pool.query("UPDATE videos SET views = views + 1 WHERE id = $1", [id]);
@@ -4143,6 +4148,7 @@ app.get('/api/videos/:id', async (req, res) => {
     res.status(500).json({ error: true, msg: "Server error" });
   }
 });
+
 // ==========================================
 // COMMENTS ROUTES
 // ==========================================
