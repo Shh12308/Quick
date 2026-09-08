@@ -5648,26 +5648,21 @@ app.get('/api/users/profile', async (req, res) => {
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
 
-    // Make sure the token actually contains an ID
-    if (!decoded.id) {
-      return res.status(401).json({ error: 'Invalid token payload' });
-    }
+    // 👇 TEMPORARY DEBUG RESPONSE
+    return res.json({
+      debug_message: "Token decoded successfully!",
+      decoded_payload: decoded, // This will show us EXACTLY what is in the token
+      extracted_id: decoded.id,
+      id_type: typeof decoded.id
+    });
 
-    // Fetch the full profile
-    const { rows } = await pool.query(
-      `SELECT id, username, email, display_name, bio, location, website, 
-              profile_url, cover_url, is_verified, role 
-       FROM users WHERE id = $1`, 
-      [decoded.id]
-    );
-
+    /* 👇 COMMENT OUT THE REST FOR NOW
+    const { rows } = await pool.query('SELECT id, username FROM users WHERE id = $1', [decoded.id]);
     if (rows.length === 0) {
-      // User doesn't exist in DB anymore
       return res.status(404).json({ error: 'User not found' });
     }
-
-    // Return the user object directly so frontend normalizeProfile() works
-    res.json(rows[0]);
+    res.json({ message: "Success!", user: rows[0] });
+    */
 
   } catch (err) {
     console.error('🔥 DEBUG CATCH ERROR:', err.message);
