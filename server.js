@@ -3186,9 +3186,9 @@ app.post("/api/uploadv", authenticateToken, async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO videos (
         user_id, title, description, tags, category,
-        s3_key, file_url, thumbnail_url, thumbnail_key,
+        s3_key, file_url, thumbnail_url, thumbnail_key, thumbnail_s3_key,
         is_short, is_public, age_restriction, status, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
       RETURNING id, title, created_at`,
       [
         userId,
@@ -3200,14 +3200,14 @@ app.post("/api/uploadv", authenticateToken, async (req, res) => {
         fileUrl,
         thumbnailUrl,
         thumbnailKey,
-        false, // is_short
+        thumbnailKey, // ✅ Added thumbnail_s3_key here
+        false, 
         isPublic === true || isPublic === "true",
         ageRestriction,
-        "processing", // status — will be updated by processing worker
+        "processing", 
       ]
     );
 
-    // Clear any user video cache
     cache.del(`user-videos:${userId}`);
 
     res.status(201).json({
