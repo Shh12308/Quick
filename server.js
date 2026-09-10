@@ -9315,6 +9315,135 @@ app.post('/api/chats/direct', authenticateToken, async (req, res) => {
   }
 });
 
+// ======================================================
+// CREATE PRODUCT
+// ======================================================
+
+// POST /api/products
+app.post("/api/products", async (req, res) => {
+  try {
+    const {
+      name,
+      description,
+      price,
+      type,
+      stock,
+      tags,
+      sizes,
+      colors,
+    } = req.body;
+
+    // --------------------------------------------------
+    // Validation
+    // --------------------------------------------------
+    if (!name || !price || !type) {
+      return res.status(400).json({
+        error: "Name, price and type are required",
+      });
+    }
+
+    if (!["physical", "digital"].includes(type)) {
+      return res.status(400).json({
+        error: "Type must be physical or digital",
+      });
+    }
+
+    // --------------------------------------------------
+    // Parse JSON fields sent by FormData
+    // --------------------------------------------------
+    let parsedTags = [];
+    let parsedSizes = [];
+    let parsedColors = [];
+
+    try {
+      parsedTags = tags ? JSON.parse(tags) : [];
+      parsedSizes = sizes ? JSON.parse(sizes) : [];
+      parsedColors = colors ? JSON.parse(colors) : [];
+    } catch (error) {
+      return res.status(400).json({
+        error: "Invalid tags, sizes, or colors",
+      });
+    }
+
+    // --------------------------------------------------
+    // Get logged-in user's ID
+    // --------------------------------------------------
+    // Change this if your auth middleware uses a
+    // different property, such as req.userId.
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({
+        error: "Authentication required",
+      });
+    }
+
+    // --------------------------------------------------
+    // Images
+    // --------------------------------------------------
+    // Your current CreateProduct sends files using
+    // FormData, but this route does not upload them yet.
+    //
+    // Until you connect S3/Cloudinary/etc., store an
+    // empty array.
+    const imageUrls = [];
+
+    // --------------------------------------------------
+    // Insert product
+    // --------------------------------------------------
+    const result = await pool.query(
+      `
+      INSERT INTO products (
+        user_id,
+        name,
+        description,
+        price,
+        type,
+        images,
+        stock,
+        tags,
+        sizes,
+        colors
+      )
+      VALUES (
+        $1, $2, $3, $4, $5,
+        $6::jsonb,
+        $7,
+        $8::jsonb,
+        $9::jsonb,
+        $10::jsonb
+      )
+      RETURNING *
+      `,
+      [
+        userId,
+        name.trim(),
+        description?.trim() || null,
+        Number(price),
+        type,
+        JSON.stringify(imageUrls),
+        type === "physical" ? Number(stock || 0) : 0,
+        JSON.stringify(parsedTags),
+        JSON.stringify(parsedSizes),
+        JSON.stringify(parsedColors),
+      ]
+    );
+
+    return res.status(201).json({
+      message: "Product created successfully",
+      product: result.rows[0],
+    });
+
+  } catch (error) {
+    console.error("POST /api/products error:", error);
+
+    return res.status(500).json({
+      error: "Failed to create product",
+      message: error.message,
+    });
+  }
+});
+
 // User search for finding users to follow/message
 app.get('/api/users/search', authenticateToken, async (req, res) => {
   try {
