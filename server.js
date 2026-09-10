@@ -9746,52 +9746,91 @@ app.use((error, req, res, next) => {
 // ===============================
 
 // GET /api/products
+// ======================================================
+// PRODUCTS API
+// ======================================================
+
+// GET /api/products
+// Supports:
+//   /api/products
+//   /api/products?type=physical
+//   /api/products?type=digital
+//   /api/products?search=shirt
+//   /api/products?type=physical&search=shirt
 app.get("/api/products", async (req, res) => {
   try {
     const { type, search } = req.query;
 
     let query = `
       SELECT
-        p.*,
-        u.name AS creator_name
+        p.id,
+        p.user_id,
+        p.name,
+        p.description,
+        p.price,
+        p.type,
+        p.images,
+        p.stock,
+        p.tags,
+        p.sizes,
+        p.colors,
+        p.crypto,
+        p.category,
+        p.views,
+        p.created_at,
+
+        u.username,
+        u.name AS creator_name,
+        u.display_name AS creator_display_name,
+        u.profile_url AS creator_profile_url
+
       FROM products p
-      LEFT JOIN users u ON u.id = p.creator_id
+
+      LEFT JOIN users u
+        ON u.id = p.user_id
+
+      WHERE 1 = 1
     `;
 
-    const conditions = [];
     const values = [];
 
-    // Filter by product type
-    if (type) {
+    // --------------------------------------------------
+    // Product type filter
+    // --------------------------------------------------
+    if (type && ["physical", "digital"].includes(type.toLowerCase())) {
       values.push(type.toLowerCase());
-      conditions.push(`LOWER(p.type) = $${values.length}`);
+      query += ` AND LOWER(p.type) = $${values.length}`;
     }
 
-    // Search by product name or description
-    if (search) {
-      values.push(`%${search.toLowerCase()}%`);
+    // --------------------------------------------------
+    // Search filter
+    // Searches product name, description and category
+    // --------------------------------------------------
+    if (search && search.trim()) {
+      values.push(`%${search.trim().toLowerCase()}%`);
 
-      conditions.push(`
-        (
+      query += `
+        AND (
           LOWER(p.name) LIKE $${values.length}
           OR LOWER(COALESCE(p.description, '')) LIKE $${values.length}
+          OR LOWER(COALESCE(p.category, '')) LIKE $${values.length}
         )
-      `);
+      `;
     }
 
-    if (conditions.length > 0) {
-      query += ` WHERE ${conditions.join(" AND ")}`;
-    }
-
-    query += ` ORDER BY p.id DESC`;
+    // Newest products first
+    query += `
+      ORDER BY p.created_at DESC, p.id DESC
+    `;
 
     const result = await pool.query(query, values);
 
-    res.json(result.rows);
+    return res.status(200).json(result.rows);
+
   } catch (error) {
     console.error("GET /api/products error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       error: "Failed to load products",
       message: error.message,
     });
