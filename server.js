@@ -9741,6 +9741,63 @@ app.use((error, req, res, next) => {
 
 });
 
+// ===============================
+// PRODUCTS API
+// ===============================
+
+// GET /api/products
+app.get("/api/products", async (req, res) => {
+  try {
+    const { type, search } = req.query;
+
+    let query = `
+      SELECT
+        p.*,
+        u.name AS creator_name
+      FROM products p
+      LEFT JOIN users u ON u.id = p.creator_id
+    `;
+
+    const conditions = [];
+    const values = [];
+
+    // Filter by product type
+    if (type) {
+      values.push(type.toLowerCase());
+      conditions.push(`LOWER(p.type) = $${values.length}`);
+    }
+
+    // Search by product name or description
+    if (search) {
+      values.push(`%${search.toLowerCase()}%`);
+
+      conditions.push(`
+        (
+          LOWER(p.name) LIKE $${values.length}
+          OR LOWER(COALESCE(p.description, '')) LIKE $${values.length}
+        )
+      `);
+    }
+
+    if (conditions.length > 0) {
+      query += ` WHERE ${conditions.join(" AND ")}`;
+    }
+
+    query += ` ORDER BY p.id DESC`;
+
+    const result = await pool.query(query, values);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("GET /api/products error:", error);
+
+    res.status(500).json({
+      error: "Failed to load products",
+      message: error.message,
+    });
+  }
+});
+
 // ==========================================
 // ADMIN ENDPOINT: Send notification to single user
 // ==========================================
