@@ -5648,97 +5648,39 @@ app.get('/api/users/profile', async (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
 
     if (!token) {
-      return res.status(401).json({
-        error: 'Not authenticated'
-      });
+      return res.status(401).json({ error: 'Not authenticated' });
     }
 
-    let decoded;
+    const decoded = jwt.verify(token, JWT_SECRET);
 
-    try {
-      decoded = jwt.verify(token, JWT_SECRET);
-    } catch (err) {
-      console.error('❌ JWT verification failed:', err.message);
+    console.log('================================');
+    console.log('PROFILE DEBUG');
+    console.log('decoded:', decoded);
+    console.log('decoded.id:', decoded.id);
+    console.log('================================');
 
-      return res.status(401).json({
-        error: 'Invalid or expired token'
-      });
-    }
-
-    const userId = decoded.id;
-
-    console.log('🔐 Profile request for user ID:', userId);
-    console.log('🔐 User ID type:', typeof userId);
-
-    if (!userId) {
-      return res.status(401).json({
-        error: 'Token does not contain a user ID'
-      });
-    }
-
-    const { rows } = await pool.query(
-      `
-      SELECT
-        id,
-        username,
-        email,
-        display_name,
-        bio,
-        location,
-        website,
-        profile_url,
-        cover_url,
-        is_verified,
-        role,
-        created_at
-      FROM users
-      WHERE id = $1
-      LIMIT 1
-      `,
-      [userId]
+    const result = await pool.query(
+      'SELECT id, username, email FROM users WHERE id = $1',
+      [decoded.id]
     );
 
-    console.log('👤 Profile DB rows:', rows.length);
-
-    if (rows.length === 0) {
-      console.error(`❌ User ${userId} does not exist in users table`);
-
-      return res.status(404).json({
-        error: 'User not found'
-      });
-    }
-
-    const user = rows[0];
-
-    console.log('✅ Profile found:', user.username);
+    console.log('DATABASE RESULT:', result.rows);
 
     return res.json({
-      success: true,
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        display_name: user.display_name || '',
-        bio: user.bio || '',
-        location: user.location || '',
-        website: user.website || '',
-        profile_url: user.profile_url || null,
-        cover_url: user.cover_url || null,
-        is_verified: Boolean(user.is_verified),
-        role: user.role || 'user',
-        created_at: user.created_at || null
-      }
+      endpoint_working: true,
+      decoded_id: decoded.id,
+      decoded_id_type: typeof decoded.id,
+      database_rows: result.rows
     });
 
   } catch (err) {
-    console.error('🔥 Failed to load profile:', err);
+    console.error('PROFILE DEBUG ERROR:', err);
 
     return res.status(500).json({
-      error: 'Failed to fetch profile'
+      error: err.message
     });
   }
 });
-
 // A hardcoded test to prove the database connection works
 app.get('/api/test-db', async (req, res) => {
   try {
