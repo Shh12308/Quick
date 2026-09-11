@@ -5642,45 +5642,246 @@ app.post("/api/chats/direct", authenticateREST, async (req, res) => {
 // USER PROFILE & "MY CONTENT" ROUTES
 // ==========================================
 
-// Get current user's profile
+// ============================================================
+// GET CURRENT USER PROFILE
+// Used by /myprofile
+// Returns the same general structure as GET /api/users/:username
+// ============================================================
 app.get('/api/users/profile', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
 
     if (!token) {
-      return res.status(401).json({ error: 'Not authenticated' });
+      return res.status(401).json({
+        error: 'Not authenticated'
+      });
     }
 
-    const decoded = jwt.verify(token, JWT_SECRET);
+    let decoded;
 
-    console.log('================================');
-    console.log('PROFILE DEBUG');
-    console.log('decoded:', decoded);
-    console.log('decoded.id:', decoded.id);
-    console.log('================================');
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (err) {
+      console.error('❌ Profile JWT error:', err.message);
 
-    const result = await pool.query(
-      'SELECT id, username, email FROM users WHERE id = $1',
-      [decoded.id]
+      return res.status(401).json({
+        error: 'Invalid or expired token'
+      });
+    }
+
+    const userId = Number(decoded.id);
+
+    if (!userId || Number.isNaN(userId)) {
+      return res.status(401).json({
+        error: 'Invalid user ID in token'
+      });
+    }
+
+    console.log('👤 Loading own profile for user ID:', userId);
+
+    // ------------------------------------------------------------
+    // USER
+    // ------------------------------------------------------------
+    const userResult = await pool.query(
+      `
+      SELECT
+        id,
+        username,
+        email,
+        display_name,
+        bio,
+        location,
+        website,
+        profile_url,
+        cover_url,
+        is_verified,
+        role,
+        created_at
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [userId]
     );
 
-    console.log('DATABASE RESULT:', result.rows);
+    if (userResult.rows.length === 0) {
+      console.error('❌ User does not exist:', userId);
 
+      return res.status(404).json({
+        error: 'User not found'
+      });
+    }
+
+    const dbUser = userResult.rows[0];
+
+    // ------------------------------------------------------------
+    // VIDEOS
+    // ------------------------------------------------------------
+    const videosResult = await pool.query(
+      `
+      SELECT *
+      FROM videos
+      WHERE user_id = $1
+        AND is_short = false
+        AND is_public = true
+      ORDER BY created_at DESC
+      `,
+      [userId]
+    );
+
+    // ------------------------------------------------------------
+    // SHORTS
+    // ------------------------------------------------------------
+    const shortsResult = await pool.query(
+      `
+      SELECT *
+      FROM videos
+      WHERE user_id = $1
+        AND is_short = true
+        AND is_public = true
+      ORDER BY created_at DESC
+      `,
+      [userId]
+    );
+
+    // ------------------------------------------------------------
+    // FOLLOWER / FOLLOWING COUNTS
+    //
+    // IMPORTANT:
+    // This section assumes your follow table is called `follows`
+    // and contains:
+    //   follower_id
+    //   following_id
+    //
+    // If your table has a different name, tell me and I'll change it.
+    // ------------------------------------------------------------
+    let followersCount = 0;
+    let followingCount = 0;
+
+    try {
+      const followersResult = await pool.query(
+        `
+        SELECT COUNT(*)::int AS count
+        FROM follows
+        WHERE following_id = $1
+        `,
+        [userId]
+      );
+
+      followersCount = followersResult.rows[0]?.count || 0;
+    } catch (err) {
+      console.warn(
+        '⚠️ Could not load followers count:',
+        err.message
+      );
+    }
+
+    try {
+      const followingResult = await pool.query(
+        `
+        SELECT COUNT(*)::int AS count
+        FROM follows
+        WHERE follower_id = $1
+        `,
+        [userId]
+      );
+
+      followingCount = followingResult.rows[0]?.count || 0;
+    } catch (err) {
+      console.warn(
+        '⚠️ Could not load following count:',
+        err.message
+      );
+    }
+
+    // ------------------------------------------------------------
+    // USER OBJECT
+    // Match the structure used by ViewProfilePage
+    // ------------------------------------------------------------
+    const user = {
+      id: dbUser.id,
+      user_id: dbUser.id,
+
+      username: dbUser.username,
+
+      email: dbUser.email,
+
+      display_name: dbUser.display_name || '',
+      displayName: dbUser.display_name || '',
+
+      bio: dbUser.bio || '',
+
+      location: dbUser.location || '',
+
+      website: dbUser.website || '',
+
+      profile_url: dbUser.profile_url || null,
+      profilePicture: dbUser.profile_url || null,
+
+      cover_url: dbUser.cover_url || null,
+      coverPhoto: dbUser.cover_url || null,
+
+      is_verified: Boolean(dbUser.is_verified),
+      verified: Boolean(dbUser.is_verified),
+
+      role: dbUser.role || 'user',
+
+      created_at: dbUser.created_at || null,
+
+      followersCount: followersCount,
+      followers_count: followersCount,
+
+      followingCount: followingCount,
+      following_count: followingCount,
+
+      // This is YOUR profile
+      isSelf: true,
+
+      // Useful defaults for the ViewProfile-style UI
+      isPrivate: false,
+      isFollowing: false,
+      banned: false,
+      blockedByViewer: false,
+      viewerBlockedUser: false,
+
+      isContentCreator:
+        dbUser.role === 'creator' ||
+        dbUser.role === 'admin',
+
+      isMusician:
+        dbUser.role === 'musician' ||
+        dbUser.role === 'artist'
+    };
+
+    // ------------------------------------------------------------
+    // RESPONSE
+    //
+    // This deliberately puts content arrays at ROOT LEVEL,
+    // just like your ViewProfilePage expects.
+    // ------------------------------------------------------------
     return res.json({
-      endpoint_working: true,
-      decoded_id: decoded.id,
-      decoded_id_type: typeof decoded.id,
-      database_rows: result.rows
+      user,
+
+      stories: [],
+      highlights: [],
+
+      videos: videosResult.rows || [],
+      shorts: shortsResult.rows || [],
+
+      music: [],
+      reposts: [],
+      likes: []
     });
 
   } catch (err) {
-    console.error('PROFILE DEBUG ERROR:', err);
+    console.error('🔥 Failed to load own profile:', err);
 
     return res.status(500).json({
-      error: err.message
+      error: 'Failed to fetch profile'
     });
   }
 });
+
 // A hardcoded test to prove the database connection works
 app.get('/api/test-db', async (req, res) => {
   try {
