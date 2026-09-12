@@ -3057,34 +3057,6 @@ app.get('/api/videos', async (req, res) => {
 });
 
 // ==========================================
-// AUTH MIDDLEWARE
-// ==========================================
-const authenticate = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ error: "No token provided" });
-  try {
-    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-    req.userId = decoded.id;
-    req.username = decoded.username;
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: "Invalid or expired token" });
-  }
-};
-
-const optionalAuth = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (authHeader?.startsWith('Bearer ')) {
-    try {
-      const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-      req.userId = decoded.id;
-      req.username = decoded.username;
-    } catch (err) {}
-  }
-  next();
-};
-
-// ==========================================
 // 1. GET /api/users/me
 // ==========================================
 app.get('/api/users/me', authenticate, async (req, res) => {
@@ -7698,7 +7670,7 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
 
 app.get(
   "/api/users/:id/follow-status",
-  authMiddleware,
+  authenticateToken,
   async (req, res) => {
     try {
       const viewerId = req.user.id;
@@ -7750,7 +7722,7 @@ app.get(
 
 app.post(
   "/api/users/:id/follow",
-  authMiddleware,
+  authenticateToken,
   async (req, res) => {
     try {
       const viewerId = req.user.id;
@@ -7888,7 +7860,7 @@ app.post(
 
 app.delete(
   "/api/users/:id/follow",
-  authMiddleware,
+  authenticateToken,
   async (req, res) => {
     try {
       const viewerId = req.user.id;
@@ -7965,7 +7937,7 @@ app.delete(
 );
 
 // ═══════ GET /api/users/me/follow-requests ═══════
-app.get("/api/users/me/follow-requests", authMiddleware, async (req, res) => {
+app.get("/api/users/me/follow-requests", authenticateToken, async (req, res) => {
   try {
     const viewerId = req.user?.id;
     if (!viewerId) {
@@ -8001,7 +7973,7 @@ app.get("/api/users/me/follow-requests", authMiddleware, async (req, res) => {
 
 
 // ═══════ POST /api/users/me/follow-requests/:requestId/accept ═══════
-app.post("/api/users/me/follow-requests/:requestId/accept", authMiddleware, async (req, res) => {
+app.post("/api/users/me/follow-requests/:requestId/accept", authenticateToken, async (req, res) => {
   try {
     const viewerId = req.user?.id;
     const requestId = parseInt(req.params.requestId);
@@ -8058,7 +8030,7 @@ app.post("/api/users/me/follow-requests/:requestId/accept", authMiddleware, asyn
 
 
 // ═══════ POST /api/users/me/follow-requests/:requestId/reject ═══════
-app.post("/api/users/me/follow-requests/:requestId/reject", authMiddleware, async (req, res) => {
+app.post("/api/users/me/follow-requests/:requestId/reject", authenticateToken, async (req, res) => {
   try {
     const viewerId = req.user?.id;
     const requestId = parseInt(req.params.requestId);
@@ -10226,7 +10198,7 @@ export {
 // ==========================================================
 // ENDPOINT 1: SEARCH USERS
 // ==========================================================
-app.get("/api/users/search", authMiddleware, async (req, res) => {
+app.get("/api/users/search", authenticateToken, async (req, res) => {
   try {
     const q = req.query.q;
     const limit = parseInt(req.query.limit) || 10;
@@ -10259,7 +10231,7 @@ app.get("/api/users/search", authMiddleware, async (req, res) => {
 // ==========================================================
 // ENDPOINT 2: SUGGESTED USERS
 // ==========================================================
-app.get("/api/users/suggested", authMiddleware, async (req, res) => {
+app.get("/api/users/suggested", authenticateToken, async (req, res) => {
   try {
     // Find 10 users, excluding the currently logged-in user
     const users = await User.find({
@@ -10519,7 +10491,7 @@ app.get("/api/auth/github/callback", passport.authenticate("github", { failureRe
   res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); 
 });
 
-app.get("/api/auth/me", authMiddleware, async (req, res) => {
+app.get("/api/auth/me", authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`SELECT id, username, email, profile_url, cover_url, bio, is_musician, is_creator, is_verified, role, subscription_plan, preferences, notification_style, status, suspend_until, warning_count, dob, device_id FROM users WHERE id = $1`, [req.user.id]);
     if (!rows.length) return res.status(404).json({ error: "User not found" });
@@ -10585,19 +10557,16 @@ app.post('/api/users/:userId/follow', async (req, res) => {
 });
 
 // ═══════ GET /api/users/profile ═══════
-app.get("/api/users/profile", async (req, res) => {
+app.get("/api/users/profile", authenticateToken, async (req, res) => {
   try {
-    const userId = req.user?.id;
-    if (!userId) {
-      return res.status(401).json({ error: "Not authenticated" });
-    }
+    const userId = req.userId;
 
     const result = await pool.query(
       `SELECT id, username, display_name, email, bio, location, website,
               profile_url, cover_url, is_verified, is_musician, is_creator,
               status, role, privacy_settings, subscribers_count, total_views,
               followers_count, updated_at
-       FROM users 
+       FROM users
        WHERE id = $1`,
       [userId]
     );
@@ -10607,7 +10576,7 @@ app.get("/api/users/profile", async (req, res) => {
     }
 
     const user = result.rows[0];
-    
+
     return res.json({
       id: user.id,
       username: user.username,
@@ -10632,15 +10601,17 @@ app.get("/api/users/profile", async (req, res) => {
 
   } catch (err) {
     console.error("Fetch profile error:", err);
-    return res.status(500).json({ error: "Failed to fetch profile" });
+    return res.status(500).json({
+      error: "Failed to fetch profile"
+    });
   }
 });
 
 
 // ═══════ PUT /api/users/profile ═══════
-app.put("/api/users/profile", async (req, res) => {
+app.put("/api/users/profile", authenticateToken, async (req, res) => {
   try {
-    const userId = req.user?.id;
+    const userId = req.userId;
     if (!userId) {
       return res.status(401).json({ error: "Not authenticated" });
     }
@@ -10777,7 +10748,7 @@ app.post("/api/reset-password", async (req, res) => {
 // STATIC /me ROUTES
 // ============================================================
 
-app.get("/api/users/me", authMiddleware, async (req, res) => {
+app.get("/api/users/me", authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`SELECT id, username, email, profile_url, cover_url, bio, is_musician, is_creator, is_verified, role, subscription_plan, preferences, notification_style FROM users WHERE id = $1`, [req.user.id]);
     if (!rows.length) return res.status(404).json({ error: "User not found" });
@@ -10834,7 +10805,7 @@ app.put("/api/users/me", authMiddleware, upload.fields([{ name: 'profile', maxCo
 // ============================================================
 
 // Get user's channel points
-app.get("/api/channel-points", authMiddleware, async (req, res) => {
+app.get("/api/channel-points", authenticateToken, async (req, res) => {
   try {
     const points = await getUserChannelPoints(req.user.id);
     const { rows } = await pool.query(
@@ -10853,7 +10824,7 @@ app.get("/api/channel-points", authMiddleware, async (req, res) => {
 });
 
 // Create stream reward
-app.post("/api/channel-rewards", authMiddleware, async (req, res) => {
+app.post("/api/channel-rewards", authenticateToken, async (req, res) => {
   try {
     const { streamId, name, description, cost, cooldown, maxPerStream } = req.body;
     
@@ -10906,7 +10877,7 @@ app.get("/api/ads/music", async (req, res) => {
 });
 
 // POST /api/ads/impression — Track ad view
-app.post("/api/ads/impression", authMiddleware, async (req, res) => {
+app.post("/api/ads/impression", authenticateToken, async (req, res) => {
   try {
     const { adId, placement, trackId } = req.body;
     await pool.query(`
@@ -10922,7 +10893,7 @@ app.post("/api/ads/impression", authMiddleware, async (req, res) => {
 });
 
 // POST /api/ads/click — Track ad click
-app.post("/api/ads/click", authMiddleware, async (req, res) => {
+app.post("/api/ads/click", authenticateToken, async (req, res) => {
   try {
     const { adId, placement, trackId } = req.body;
     await pool.query(`
@@ -11207,7 +11178,7 @@ app.post("/api/uploadm", musicUpload.fields([
 });
 
 // Create clip
-app.post("/api/clips/create", authMiddleware, async (req, res) => {
+app.post("/api/clips/create", authenticateToken, async (req, res) => {
   try {
     const { streamId, streamerId, startTime, endTime, title, duration } = req.body;
     
@@ -11316,7 +11287,7 @@ app.get("/api/livestreams/:id", async (req, res) => {
 });
 
 // Get single livestream with full details
-app.post("/api/livestreams/end/:id", authMiddleware, async (req, res) => {
+app.post("/api/livestreams/end/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -11372,7 +11343,7 @@ app.post("/api/livestreams/end/:id", authMiddleware, async (req, res) => {
 // ============================================================
 
 // GET /api/settings - Fetch all user data
-app.get("/api/settings", authMiddleware, async (req, res) => {
+app.get("/api/settings", authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT 
@@ -11439,7 +11410,7 @@ app.get('/api/users/:id', authenticateToken, async (req, res) => {
 });
 
 // PATCH /api/settings/profile
-app.patch("/api/settings/profile", authMiddleware, async (req, res) => {
+app.patch("/api/settings/profile", authenticateToken, async (req, res) => {
   try {
     const { username, email, bio } = req.body;
     
@@ -11471,7 +11442,7 @@ app.patch("/api/settings/profile", authMiddleware, async (req, res) => {
 });
 
 // PATCH /api/settings/privacy
-app.patch("/api/settings/privacy", authMiddleware, async (req, res) => {
+app.patch("/api/settings/privacy", authenticateToken, async (req, res) => {
   try {
     // req.body contains { key: value }, e.g. { privateAccount: true }
     // We merge this into the existing JSONB column
@@ -11493,7 +11464,7 @@ app.patch("/api/settings/privacy", authMiddleware, async (req, res) => {
 });
 
 // PATCH /api/settings/preferences
-app.patch("/api/settings/preferences", authMiddleware, async (req, res) => {
+app.patch("/api/settings/preferences", authenticateToken, async (req, res) => {
   try {
     const updates = req.body;
     
@@ -11513,7 +11484,7 @@ app.patch("/api/settings/preferences", authMiddleware, async (req, res) => {
 });
 
 // POST /api/settings/change-password
-app.post("/api/settings/change-password", authMiddleware, async (req, res) => {
+app.post("/api/settings/change-password", authenticateToken, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
     
@@ -11776,7 +11747,7 @@ app.get("/api/music/audio/:id", async (req, res) => {
 });
 
 // GET /api/settings/login-activity
-app.get("/api/settings/login-activity", authMiddleware, async (req, res) => {
+app.get("/api/settings/login-activity", authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, device, ip_address, created_at, is_current 
@@ -11804,7 +11775,7 @@ app.get("/api/settings/login-activity", authMiddleware, async (req, res) => {
 });
 
 // DELETE /api/settings/login-activity/:id
-app.delete("/api/settings/login-activity/:id", authMiddleware, async (req, res) => {
+app.delete("/api/settings/login-activity/:id", authenticateToken, async (req, res) => {
   try {
     await pool.query(
       "DELETE FROM login_sessions WHERE id = $1 AND user_id = $2",
