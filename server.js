@@ -3059,7 +3059,7 @@ app.get('/api/videos', async (req, res) => {
 // ==========================================
 // 1. GET /api/users/me
 // ==========================================
-app.get('/api/users/me', authenticate, async (req, res) => {
+app.get('/api/users/me', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, username, email, profile_url as avatar, profile_url, role, subscription_plan, balance, channel_points, followers_count, created_at FROM users WHERE id = $1`, [req.userId]
