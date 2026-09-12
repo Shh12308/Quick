@@ -10223,6 +10223,58 @@ export {
   getNotificationLink
 };
 
+// ==========================================================
+// ENDPOINT 1: SEARCH USERS
+// ==========================================================
+app.get("/api/users/search", authMiddleware, async (req, res) => {
+  try {
+    const q = req.query.q;
+    const limit = parseInt(req.query.limit) || 10;
+
+    if (!q || q.trim() === "") {
+      return res.json([]);
+    }
+
+    // Case-insensitive search, excluding the currently logged-in user
+    const regex = new RegExp(q, "i");
+
+    const users = await User.find({
+      _id: { $ne: req.user._id }, // Don't search yourself
+      $or: [
+        { username: regex },
+        { display_name: regex },
+        { name: regex }
+      ]
+    })
+    .limit(limit)
+    .select("id username display_name profile_url bio");
+
+    return res.json(users);
+  } catch (error) {
+    console.error("Search error:", error);
+    return res.status(500).json({ error: "Server error during search" });
+  }
+});
+
+// ==========================================================
+// ENDPOINT 2: SUGGESTED USERS
+// ==========================================================
+app.get("/api/users/suggested", authMiddleware, async (req, res) => {
+  try {
+    // Find 10 users, excluding the currently logged-in user
+    const users = await User.find({
+      _id: { $ne: req.user._id }
+    })
+    .limit(10)
+    .select("id username display_name profile_url bio");
+
+    return res.json(users);
+  } catch (error) {
+    console.error("Suggested users error:", error);
+    return res.status(500).json({ error: "Server error fetching suggestions" });
+  }
+});
+
 app.post("/auth/check-vpn", async (req, res) => {
   try {
     const ip = req.headers["x-forwarded-for"]?.split(',')[0] || req.socket.remoteAddress;
