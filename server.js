@@ -3552,7 +3552,7 @@ app.use((err, req, res, next) => {
 // ==========================================
 // 2. POST /api/videos (UPLOAD)
 // ==========================================
-app.get("/api/uploadv", authenticate, async (req, res) => {
+app.get("/api/uploadv", authenticateToken, async (req, res) => {
 
   try {
 
@@ -3628,7 +3628,7 @@ app.get("/api/uploadv", authenticate, async (req, res) => {
 
 // Saves metadata after files have already been uploaded to S3
 
-app.post("/api/uploadv", authenticate, async (req, res) => {
+app.post("/api/uploadv", authenticateToken, async (req, res) => {
 
   try {
 
@@ -3946,7 +3946,7 @@ app.get('/api/search', async (req, res) => {
 // ==========================================
 // 5. POST /api/videos/:videoId/hide
 // ==========================================
-app.post('/api/videos/:videoId/hide', authenticate, async (req, res) => {
+app.post('/api/videos/:videoId/hide', authenticateToken, async (req, res) => {
   try {
     await pool.query(`INSERT INTO hidden_videos (user_id, video_id, created_at) VALUES ($1, $2, NOW()) ON CONFLICT (user_id, video_id) DO NOTHING`, [req.userId, req.params.videoId]);
     res.json({ message: "Video hidden" });
@@ -3956,7 +3956,7 @@ app.post('/api/videos/:videoId/hide', authenticate, async (req, res) => {
 // ==========================================
 // 6. POST /users/:userId/block
 // ==========================================
-app.post('/users/:userId/block', authenticate, async (req, res) => {
+app.post('/users/:userId/block', authenticateToken, async (req, res) => {
   try {
     if (parseInt(req.params.userId) === req.userId) return res.status(400).json({ error: "Cannot block yourself" });
     await pool.query(`INSERT INTO blocks (blocker_id, blocked_id, created_at) VALUES ($1, $2, NOW()) ON CONFLICT (blocker_id, blocked_id) DO NOTHING`, [req.userId, req.params.userId]);
@@ -3968,7 +3968,7 @@ app.post('/users/:userId/block', authenticate, async (req, res) => {
 // ==========================================
 // 7. GET /api/notifications
 // ==========================================
-app.get('/api/notifications', authenticate, async (req, res) => {
+app.get('/api/notifications', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT n.id, n.type, n.message as text, n.created_at as time, n.is_read, n.video_id as "videoId", n.link, u.username as user, u.profile_url as avatar
@@ -3982,7 +3982,7 @@ app.get('/api/notifications', authenticate, async (req, res) => {
 // ==========================================
 // 8. POST /api/notifications/read-all
 // ==========================================
-app.post('/api/notifications/read-all', authenticate, async (req, res) => {
+app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
   try {
     await pool.query("UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false", [req.userId]);
     res.json({ message: "All read" });
@@ -5619,7 +5619,7 @@ app.post("/api/chats/direct", authenticateREST, async (req, res) => {
 // Used by /myprofile
 // Returns the same general structure as GET /api/users/:username
 // ============================================================
-app.get('/api/users/profile', async (req, res) => {
+app.get('/api/users/profile', authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
 
@@ -5866,7 +5866,7 @@ app.get('/api/test-db', async (req, res) => {
   }
 });
 
-app.put('/api/users/profile', async (req, res) => {
+app.put('/api/users/profile',  authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
 
@@ -10555,104 +10555,6 @@ app.post('/api/users/:userId/follow', async (req, res) => {
     res.status(500).json({ error: 'Failed to follow' });
   }
 });
-
-// ═══════ GET /api/users/profile ═══════
-app.get("/api/users/profile", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.userId;
-
-    const result = await pool.query(
-      `SELECT id, username, display_name, email, bio, location, website,
-              profile_url, cover_url, is_verified, is_musician, is_creator,
-              status, role, privacy_settings, subscribers_count, total_views,
-              followers_count, updated_at
-       FROM users
-       WHERE id = $1`,
-      [userId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    const user = result.rows[0];
-
-    return res.json({
-      id: user.id,
-      username: user.username,
-      display_name: user.display_name || user.username,
-      displayName: user.display_name || user.username,
-      email: user.email,
-      bio: user.bio || "",
-      location: user.location || "",
-      website: user.website || "",
-      is_verified: !!user.is_verified,
-      profile_url: user.profile_url,
-      cover_url: user.cover_url,
-      subscribers_count: user.subscribers_count || 0,
-      total_views: user.total_views || 0,
-      followers_count: user.followers_count || 0,
-      role: user.role || "user",
-      is_musician: !!user.is_musician,
-      is_creator: !!user.is_creator,
-      privacy_settings: user.privacy_settings,
-      updated_at: user.updated_at
-    });
-
-  } catch (err) {
-    console.error("Fetch profile error:", err);
-    return res.status(500).json({
-      error: "Failed to fetch profile"
-    });
-  }
-});
-
-
-// ═══════ PUT /api/users/profile ═══════
-app.put("/api/users/profile", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.userId;
-    if (!userId) {
-      return res.status(401).json({ error: "Not authenticated" });
-    }
-
-    const { display_name, bio, location, website } = req.body;
-
-    const result = await pool.query(
-      `UPDATE users 
-       SET display_name = COALESCE($1, display_name),
-           bio = COALESCE($2, bio),
-           location = COALESCE($3, location),
-           website = COALESCE($4, website),
-           updated_at = NOW()
-       WHERE id = $5
-       RETURNING id, username, display_name, bio, location, website`,
-      [display_name, bio, location, website, userId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    const updated = result.rows[0];
-    
-    return res.json({
-      id: updated.id,
-      username: updated.username,
-      display_name: updated.display_name,
-      displayName: updated.display_name,
-      bio: updated.bio,
-      location: updated.location,
-      website: updated.website,
-      message: "Profile updated successfully"
-    });
-
-  } catch (err) {
-    console.error("Update profile error:", err);
-    return res.status(500).json({ error: "Failed to update profile" });
-  }
-});
-
 
 app.post('/api/users/:userId/unfollow', async (req, res) => {
   try {
