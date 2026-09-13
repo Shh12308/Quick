@@ -10115,83 +10115,219 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
     const myId = Number(req.user.id);
 
     const result = await pool.query(
-      `SELECT c.id, c.created_at,
-              u.id AS other_id, u.username AS other_username, u.profile_url AS other_avatar,
-              EXISTS (SELECT 1 FROM follows f
-                      WHERE f.follower_id = $1 AND f.following_id = u.id) AS i_follow,
-              lm.content AS last_message,
-              COALESCE(lm.timestamp, c.created_at) AS last_message_at,
-              (SELECT COUNT(*) FROM messages m
-               WHERE m.chat_id = c.id AND m.sender_id <> $1 AND m.is_read = false) AS unread
-       FROM chats c
-       LEFT JOIN LATERAL (
-         SELECT id, username, profile_url FROM users
-         WHERE id = ANY(c.participants) AND id <> $1
-         ORDER BY id LIMIT 1
-       ) u ON true
-       LEFT JOIN LATERAL (
-         SELECT content, timestamp FROM messages
-         WHERE chat_id = c.id ORDER BY timestamp DESC LIMIT 1
-       ) lm ON true
-       WHERE $1 = ANY(c.participants)
-       ORDER BY COALESCE(lm.timestamp, c.created_at) DESC`,
+      `
+      SELECT
+        c.id,
+        c.created_at,
+
+        u.id AS other_id,
+        u.username AS other_username,
+        u.profile_url AS other_avatar,
+
+        EXISTS (
+          SELECT 1
+          FROM follows f
+          WHERE f.follower_id = $1
+            AND f.following_id = u.id
+        ) AS i_follow,
+
+        EXISTS (
+          SELECT 1
+          FROM follows f
+          WHERE f.follower_id = u.id
+            AND f.following_id = $1
+        ) AS follows_me,
+
+        lm.id AS last_message_id,
+        lm.content AS last_message,
+        lm.timestamp AS last_message_at,
+        lm.sender_id AS last_message_sender_id,
+
+        (
+          SELECT COUNT(*)
+          FROM messages m
+          WHERE m.chat_id = c.id
+            AND m.sender_id <> $1
+            AND m.is_read = false
+        ) AS unread
+
+      FROM chats c
+
+      LEFT JOIN LATERAL (
+        SELECT
+          id,
+          username,
+          profile_url
+        FROM users
+        WHERE id = ANY(c.participants)
+          AND id <> $1
+        ORDER BY id
+        LIMIT 1
+      ) u ON true
+
+      LEFT JOIN LATERAL (
+        SELECT
+          id,
+          content,
+          timestamp,
+          sender_id
+        FROM messages
+        WHERE chat_id = c.id
+        ORDER BY timestamp DESC
+        LIMIT 1
+      ) lm ON true
+
+      WHERE $1 = ANY(c.participants)
+
+      ORDER BY
+        COALESCE(lm.timestamp, c.created_at) DESC
+      `,
       [myId]
     );
 
-    const chats = (result.rows || []).map((r) => ({
-      id: r?.id ?? null,
-      lastMessage: r?.last_message ?? null,
-      lastMessageAt: r?.last_message_at ?? null,
-      unread: Number(r?.unread ?? 0),
-      isRequest: !r?.i_follow,
-      otherUser: r?.other_id
-        ? { id: r.other_id, username: r.other_username, profile_url: r.other_avatar }
-        : null,
-    }));
+    const chats = (result.rows || [])
+      .filter((r) => r.other_id)
+      .map((r) => {
+        const iFollow = Boolean(r.i_follow);
+        const followsMe = Boolean(r.follows_me);
+
+        /*
+         * Normal conversation:
+         * both users follow each other.
+         *
+         * Request:
+         * the other user has sent/contacted us but
+         * we don't follow them yet.
+         */
+        const isRequest = !iFollow;
+
+        return {
+          id: r.id,
+
+          createdAt: r.created_at,
+
+          isRequest,
+
+          iFollow,
+          followsMe,
+
+          unread: Number(r.unread || 0),
+
+          lastMessage: r.last_message
+            ? {
+                id: r.last_message_id,
+                text: r.last_message,
+                timestamp: r.last_message_at,
+                senderId: r.last_message_sender_id,
+              }
+            : null,
+
+          otherUser: {
+            id: Number(r.other_id),
+            username: r.other_username,
+            profile_url: r.other_avatar,
+          },
+        };
+      });
+
+    const inbox = chats.filter((chat) => !chat.isRequest);
+    const requests = chats.filter((chat) => chat.isRequest);
 
     res.json({
-      inbox: chats.filter((c) => !c.isRequest),
-      requests: chats.filter((c) => c.isRequest),
+      chats,
+      inbox,
+      requests,
     });
   } catch (err) {
-    console.error("GET /api/chats failed:", err); // full error + stack
-    res.status(500).json({ error: "Failed to load chats", detail: String(err?.message || err) });
+    console.error("GET /api/chats failed:", err);
+
+    res.status(500).json({
+      error: "Failed to load chats",
+      detail: String(err?.message || err),
+    });
   }
 });
 
 // POST /api/chats/:chatId/accept — accept request = follow them back
 app.post("/api/chats/:chatId/accept", authenticateToken, async (req, res) => {
   try {
-    const myId = req.user.id;
+    const myId = Number(req.user.id);
     const chatId = req.params.chatId;
 
-    if (!UUID_RE.test(chatId)) return res.status(400).json({ error: "Invalid chat id" });
+    if (!UUID_RE.test(chatId)) {
+      return res.status(400).json({
+        error: "Invalid chat id",
+      });
+    }
 
     const { rows } = await pool.query(
-      "SELECT participants FROM chats WHERE id = $1 AND $2 = ANY(participants)",
-      [chatId, myId]
-    );
-    if (!rows.length) return res.status(404).json({ error: "Chat not found" });
-
-    const otherId = (rows[0].participants || [])
-      .find((p) => Number(p) !== Number(myId));
-
-    // Following them back moves the chat to the inbox
-    await pool.query(
-      `INSERT INTO follows (follower_id, following_id)
-       VALUES ($1, $2) ON CONFLICT (follower_id, following_id) DO NOTHING`,
-      [myId, otherId]
-    );
-
-    await pool.query(
-      "UPDATE messages SET is_read = true WHERE chat_id = $1 AND sender_id <> $1",
+      `
+      SELECT participants
+      FROM chats
+      WHERE id = $1
+        AND $2 = ANY(participants)
+      `,
       [chatId, myId]
     );
 
-    res.json({ success: true });
+    if (!rows.length) {
+      return res.status(404).json({
+        error: "Chat not found",
+      });
+    }
+
+    const participants = rows[0].participants || [];
+
+    const otherId = participants.find(
+      (id) => Number(id) !== Number(myId)
+    );
+
+    if (!otherId) {
+      return res.status(400).json({
+        error: "Unable to determine other user",
+      });
+    }
+
+    /*
+     * Accepting a message request means:
+     * current user follows the person who messaged them.
+     */
+    await pool.query(
+      `
+      INSERT INTO follows (follower_id, following_id)
+      VALUES ($1, $2)
+      ON CONFLICT (follower_id, following_id)
+      DO NOTHING
+      `,
+      [myId, Number(otherId)]
+    );
+
+    /*
+     * Correct placeholders:
+     * $1 = chatId
+     * $2 = myId
+     */
+    await pool.query(
+      `
+      UPDATE messages
+      SET is_read = true
+      WHERE chat_id = $1
+        AND sender_id <> $2
+      `,
+      [chatId, myId]
+    );
+
+    res.json({
+      success: true,
+      chatId,
+      otherUserId: Number(otherId),
+    });
   } catch (err) {
-    console.error("Accept request error:", err.message);
-    res.status(500).json({ error: "Failed to accept request" });
+    console.error("Accept request error:", err);
+
+    res.status(500).json({
+      error: "Failed to accept request",
+    });
   }
 });
 
