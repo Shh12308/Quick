@@ -3747,7 +3747,7 @@ RETURNING *
 // ==========================================
 // 3. GET /api/videos (FEED & SEARCH)
 // ==========================================
-app.get('/api/videos', authenticateToken, async (req, res) => {
+app.get('/api/videos', optionalAuth, async (req, res) => {
   try {
     const { filter, q, page = 1, limit = 10 } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
@@ -5153,7 +5153,7 @@ app.post('/api/support/feedback', authenticateToken, async (req, res) => {
 });
 
 // POST /api/support/report - Submit report
-app.post('/api/support/report', authenticateToken, async (req, res) => {
+app.post('/api/support/report', optionalAuth, async (req, res) => {
   try {
     const { category, description, email } = req.body;
     
@@ -5180,7 +5180,7 @@ app.post('/api/support/report', authenticateToken, async (req, res) => {
 });
 
 // POST /api/support/contact - Submit contact form
-app.post('/api/support/contact', authenticateToken, async (req, res) => {
+app.post('/api/support/contact', optionalAuth, async (req, res) => {
   try {
     const { name, email, subject, message } = req.body;
     
@@ -5619,33 +5619,18 @@ app.post("/api/chats/direct", authenticateREST, async (req, res) => {
 // Used by /myprofile
 // Returns the same general structure as GET /api/users/:username
 // ============================================================
+// ============================================================
+// GET OWN PROFILE
+// ============================================================
 app.get('/api/users/profile', authenticateToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
+    // authenticateToken already verified the JWT
+    // and populated req.userId.
+    const userId = req.userId;
 
-    if (!token) {
+    if (!userId) {
       return res.status(401).json({
         error: 'Not authenticated'
-      });
-    }
-
-    let decoded;
-
-    try {
-      decoded = jwt.verify(token, JWT_SECRET);
-    } catch (err) {
-      console.error('❌ Profile JWT error:', err.message);
-
-      return res.status(401).json({
-        error: 'Invalid or expired token'
-      });
-    }
-
-    const userId = Number(decoded.id);
-
-    if (!userId || Number.isNaN(userId)) {
-      return res.status(401).json({
-        error: 'Invalid user ID in token'
       });
     }
 
@@ -5718,14 +5703,6 @@ app.get('/api/users/profile', authenticateToken, async (req, res) => {
 
     // ------------------------------------------------------------
     // FOLLOWER / FOLLOWING COUNTS
-    //
-    // IMPORTANT:
-    // This section assumes your follow table is called `follows`
-    // and contains:
-    //   follower_id
-    //   following_id
-    //
-    // If your table has a different name, tell me and I'll change it.
     // ------------------------------------------------------------
     let followersCount = 0;
     let followingCount = 0;
@@ -5768,7 +5745,6 @@ app.get('/api/users/profile', authenticateToken, async (req, res) => {
 
     // ------------------------------------------------------------
     // USER OBJECT
-    // Match the structure used by ViewProfilePage
     // ------------------------------------------------------------
     const user = {
       id: dbUser.id,
@@ -5806,10 +5782,10 @@ app.get('/api/users/profile', authenticateToken, async (req, res) => {
       followingCount: followingCount,
       following_count: followingCount,
 
-      // This is YOUR profile
+      // This is the logged-in user's own profile
       isSelf: true,
 
-      // Useful defaults for the ViewProfile-style UI
+      // Defaults for ViewProfile-style UI
       isPrivate: false,
       isFollowing: false,
       banned: false,
@@ -5827,9 +5803,6 @@ app.get('/api/users/profile', authenticateToken, async (req, res) => {
 
     // ------------------------------------------------------------
     // RESPONSE
-    //
-    // This deliberately puts content arrays at ROOT LEVEL,
-    // just like your ViewProfilePage expects.
     // ------------------------------------------------------------
     return res.json({
       user,
@@ -5854,92 +5827,156 @@ app.get('/api/users/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// A hardcoded test to prove the database connection works
+
+// ============================================================
+// TEST DATABASE CONNECTION
+// ============================================================
+// TEMPORARY diagnostic endpoint.
+// Remove this after we confirm the Railway database is correct.
+// ============================================================
 app.get('/api/test-db', async (req, res) => {
   try {
-    // We are hardcoding ID 9 here
-    const { rows } = await pool.query('SELECT id, username FROM users WHERE id = 9');
-    console.log("TEST DB ROWS:", rows);
-    res.json({ rows_found: rows.length, data: rows });
+    const { rows } = await pool.query(
+      `
+      SELECT
+        id,
+        username,
+        email
+      FROM users
+      WHERE id = 9
+      LIMIT 1
+      `
+    );
+
+    console.log('🔎 TEST DB ROWS:', rows);
+
+    return res.json({
+      rows_found: rows.length,
+      data: rows
+    });
+
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('❌ TEST DB ERROR:', err);
+
+    return res.status(500).json({
+      error: err.message
+    });
   }
 });
 
-app.put('/api/users/profile',  authenticateToken, async (req, res) => {
+
+// ============================================================
+// UPDATE OWN PROFILE
+// ============================================================
+app.put('/api/users/profile', authenticateToken, async (req, res) => {
   try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
+    // authenticateToken already verified the JWT
+    // and populated req.userId.
+    const userId = req.userId;
 
-    if (!token) {
-      return res.status(401).json({ error: 'Not authenticated' });
+    if (!userId) {
+      return res.status(401).json({
+        error: 'Not authenticated'
+      });
     }
 
-    let decoded;
+    console.log('✏️ Updating profile for user ID:', userId);
 
-    try {
-      decoded = jwt.verify(token, JWT_SECRET);
-    } catch {
-      return res.status(401).json({ error: 'Invalid or expired token' });
-    }
+    let {
+      display_name,
+      bio,
+      location,
+      website
+    } = req.body;
 
-    let { display_name, bio, location, website } = req.body;
-
+    // ------------------------------------------------------------
+    // DISPLAY NAME
+    // ------------------------------------------------------------
     if (display_name !== undefined) {
       display_name = String(display_name).trim();
 
       if (!display_name) {
         return res.status(400).json({
-          error: 'Display name cannot be empty',
+          error: 'Display name cannot be empty'
         });
       }
     }
 
+    // ------------------------------------------------------------
+    // BIO
+    // ------------------------------------------------------------
     if (bio !== undefined) {
       bio = String(bio).trim();
     }
 
+    // ------------------------------------------------------------
+    // LOCATION
+    // ------------------------------------------------------------
     if (location !== undefined) {
       location = String(location).trim();
     }
 
+    // ------------------------------------------------------------
+    // WEBSITE
+    // ------------------------------------------------------------
     if (website !== undefined) {
       website = String(website).trim();
 
-      if (website && !/^https?:\/\//i.test(website)) {
+      if (
+        website &&
+        !/^https?:\/\//i.test(website)
+      ) {
         website = `https://${website}`;
       }
     }
 
+    // ------------------------------------------------------------
+    // BUILD UPDATE QUERY
+    // ------------------------------------------------------------
     const updates = [];
     const params = [];
     let paramIndex = 1;
 
     if (display_name !== undefined) {
-      updates.push(`display_name = $${paramIndex++}`);
+      updates.push(
+        `display_name = $${paramIndex++}`
+      );
       params.push(display_name);
     }
 
     if (bio !== undefined) {
-      updates.push(`bio = $${paramIndex++}`);
+      updates.push(
+        `bio = $${paramIndex++}`
+      );
       params.push(bio);
     }
 
     if (location !== undefined) {
-      updates.push(`location = $${paramIndex++}`);
+      updates.push(
+        `location = $${paramIndex++}`
+      );
       params.push(location);
     }
 
     if (website !== undefined) {
-      updates.push(`website = $${paramIndex++}`);
+      updates.push(
+        `website = $${paramIndex++}`
+      );
       params.push(website || null);
     }
 
+    // ------------------------------------------------------------
+    // NOTHING TO UPDATE
+    // ------------------------------------------------------------
     if (!updates.length) {
       return res.status(400).json({
-        error: 'Nothing to update',
+        error: 'Nothing to update'
       });
     }
 
+    // ------------------------------------------------------------
+    // UPDATE USER
+    // ------------------------------------------------------------
     const query = `
       UPDATE users
       SET ${updates.join(', ')}
@@ -5960,38 +5997,68 @@ app.put('/api/users/profile',  authenticateToken, async (req, res) => {
 
     const { rows } = await pool.query(query, [
       ...params,
-      decoded.id,
+      userId
     ]);
 
+    // ------------------------------------------------------------
+    // USER NOT FOUND
+    // ------------------------------------------------------------
     if (!rows.length) {
+      console.error(
+        '❌ Could not update profile. User does not exist:',
+        userId
+      );
+
       return res.status(404).json({
-        error: 'User not found',
+        error: 'User not found'
       });
     }
 
     const user = rows[0];
 
-    res.json({
+    // ------------------------------------------------------------
+    // RESPONSE
+    // ------------------------------------------------------------
+    return res.json({
       success: true,
+
       user: {
         id: user.id,
-        username: user.username,
-        email: user.email,
-        display_name: user.display_name,
-        bio: user.bio || '',
-        location: user.location || '',
-        website: user.website || '',
-        profile_url: user.profile_url || null,
-        cover_url: user.cover_url || null,
-        is_verified: Boolean(user.is_verified),
-        role: user.role || 'user',
-      },
-    });
-  } catch (err) {
-    console.error('Update profile error:', err);
+        user_id: user.id,
 
-    res.status(500).json({
-      error: 'Failed to update profile',
+        username: user.username,
+
+        email: user.email,
+
+        display_name: user.display_name || '',
+        displayName: user.display_name || '',
+
+        bio: user.bio || '',
+
+        location: user.location || '',
+
+        website: user.website || '',
+
+        profile_url: user.profile_url || null,
+        profilePicture: user.profile_url || null,
+
+        cover_url: user.cover_url || null,
+        coverPhoto: user.cover_url || null,
+
+        is_verified: Boolean(user.is_verified),
+        verified: Boolean(user.is_verified),
+
+        role: user.role || 'user',
+
+        isSelf: true
+      }
+    });
+
+  } catch (err) {
+    console.error('🔥 Update profile error:', err);
+
+    return res.status(500).json({
+      error: 'Failed to update profile'
     });
   }
 });
