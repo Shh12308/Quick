@@ -3747,7 +3747,7 @@ RETURNING *
 // ==========================================
 // 3. GET /api/videos (FEED & SEARCH)
 // ==========================================
-app.get('/api/videos', optionalAuth, async (req, res) => {
+app.get('/api/videos', authenticateToken, async (req, res) => {
   try {
     const { filter, q, page = 1, limit = 10 } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
@@ -5153,7 +5153,7 @@ app.post('/api/support/feedback', authenticateToken, async (req, res) => {
 });
 
 // POST /api/support/report - Submit report
-app.post('/api/support/report', optionalAuth, async (req, res) => {
+app.post('/api/support/report', authenticateToken, async (req, res) => {
   try {
     const { category, description, email } = req.body;
     
@@ -5180,7 +5180,7 @@ app.post('/api/support/report', optionalAuth, async (req, res) => {
 });
 
 // POST /api/support/contact - Submit contact form
-app.post('/api/support/contact', optionalAuth, async (req, res) => {
+app.post('/api/support/contact', authenticateToken, async (req, res) => {
   try {
     const { name, email, subject, message } = req.body;
     
