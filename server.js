@@ -4952,8 +4952,6 @@ app.post('/api/settings/blocked', authenticateToken, async (req, res) => {
       res.status(500).json({
         error: "Failed to unblock user",
       });
-    }
-  }
 );
 
 // GET /api/settings/hidden-words - Get hidden words
