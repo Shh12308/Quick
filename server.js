@@ -3747,7 +3747,7 @@ RETURNING *
 // ==========================================
 // 3. GET /api/videos (FEED & SEARCH)
 // ==========================================
-app.get('/api/videos', authenticateToken, async (req, res) => {
+app.get('/api/videos', optionalAuth, async (req, res) => {
   try {
     const { filter, q, page = 1, limit = 10 } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
@@ -5153,7 +5153,7 @@ app.post('/api/support/feedback', authenticateToken, async (req, res) => {
 });
 
 // POST /api/support/report - Submit report
-app.post('/api/support/report', authenticateToken, async (req, res) => {
+app.post('/api/support/report', optionalAuth, async (req, res) => {
   try {
     const { category, description, email } = req.body;
     
@@ -5180,7 +5180,7 @@ app.post('/api/support/report', authenticateToken, async (req, res) => {
 });
 
 // POST /api/support/contact - Submit contact form
-app.post('/api/support/contact', authenticateToken, async (req, res) => {
+app.post('/api/support/contact', optionalAuth, async (req, res) => {
   try {
     const { name, email, subject, message } = req.body;
     
@@ -5610,27 +5610,36 @@ app.post("/api/chats/direct", authenticateREST, async (req, res) => {
   }
 });
 
+// ==========================================
+// USER PROFILE & "MY CONTENT" ROUTES
+// ==========================================
+
+// ============================================================
+// GET CURRENT USER PROFILE
+// Used by /myprofile
+// Returns the same general structure as GET /api/users/:username
+// ============================================================
+// ============================================================
+// GET OWN PROFILE
+// ============================================================
 app.get('/api/users/profile', authenticateToken, async (req, res) => {
   try {
-    console.log('======================================');
-    console.log('🔐 PROFILE AUTH DEBUG');
-    console.log('req.user:', req.user);
-    console.log('req.userId:', req.userId);
-    console.log('======================================');
-
+    // authenticateToken already verified the JWT
+    // and populated req.userId.
     const userId = req.userId;
 
     if (!userId) {
       return res.status(401).json({
-        error: 'Not authenticated',
-        debug: {
-          reqUser: req.user || null,
-          reqUserId: req.userId || null
-        }
+        error: 'Not authenticated'
       });
     }
 
-    const result = await pool.query(
+    console.log('👤 Loading own profile for user ID:', userId);
+
+    // ------------------------------------------------------------
+    // USER
+    // ------------------------------------------------------------
+    const userResult = await pool.query(
       `
       SELECT
         id,
@@ -5652,85 +5661,168 @@ app.get('/api/users/profile', authenticateToken, async (req, res) => {
       [userId]
     );
 
-    console.log('🔎 PROFILE DB USER:', result.rows);
+    if (userResult.rows.length === 0) {
+      console.error('❌ User does not exist:', userId);
 
-    if (result.rows.length === 0) {
       return res.status(404).json({
-        error: 'User not found',
-        debug: {
-          userId,
-          rowsFound: 0
-        }
+        error: 'User not found'
       });
     }
 
-    const dbUser = result.rows[0];
+    const dbUser = userResult.rows[0];
 
+    // ------------------------------------------------------------
+    // VIDEOS
+    // ------------------------------------------------------------
+    const videosResult = await pool.query(
+      `
+      SELECT *
+      FROM videos
+      WHERE user_id = $1
+        AND is_short = false
+        AND is_public = true
+      ORDER BY created_at DESC
+      `,
+      [userId]
+    );
+
+    // ------------------------------------------------------------
+    // SHORTS
+    // ------------------------------------------------------------
+    const shortsResult = await pool.query(
+      `
+      SELECT *
+      FROM videos
+      WHERE user_id = $1
+        AND is_short = true
+        AND is_public = true
+      ORDER BY created_at DESC
+      `,
+      [userId]
+    );
+
+    // ------------------------------------------------------------
+    // FOLLOWER / FOLLOWING COUNTS
+    // ------------------------------------------------------------
+    let followersCount = 0;
+    let followingCount = 0;
+
+    try {
+      const followersResult = await pool.query(
+        `
+        SELECT COUNT(*)::int AS count
+        FROM follows
+        WHERE following_id = $1
+        `,
+        [userId]
+      );
+
+      followersCount = followersResult.rows[0]?.count || 0;
+    } catch (err) {
+      console.warn(
+        '⚠️ Could not load followers count:',
+        err.message
+      );
+    }
+
+    try {
+      const followingResult = await pool.query(
+        `
+        SELECT COUNT(*)::int AS count
+        FROM follows
+        WHERE follower_id = $1
+        `,
+        [userId]
+      );
+
+      followingCount = followingResult.rows[0]?.count || 0;
+    } catch (err) {
+      console.warn(
+        '⚠️ Could not load following count:',
+        err.message
+      );
+    }
+
+    // ------------------------------------------------------------
+    // USER OBJECT
+    // ------------------------------------------------------------
+    const user = {
+      id: dbUser.id,
+      user_id: dbUser.id,
+
+      username: dbUser.username,
+
+      email: dbUser.email,
+
+      display_name: dbUser.display_name || '',
+      displayName: dbUser.display_name || '',
+
+      bio: dbUser.bio || '',
+
+      location: dbUser.location || '',
+
+      website: dbUser.website || '',
+
+      profile_url: dbUser.profile_url || null,
+      profilePicture: dbUser.profile_url || null,
+
+      cover_url: dbUser.cover_url || null,
+      coverPhoto: dbUser.cover_url || null,
+
+      is_verified: Boolean(dbUser.is_verified),
+      verified: Boolean(dbUser.is_verified),
+
+      role: dbUser.role || 'user',
+
+      created_at: dbUser.created_at || null,
+
+      followersCount: followersCount,
+      followers_count: followersCount,
+
+      followingCount: followingCount,
+      following_count: followingCount,
+
+      // This is the logged-in user's own profile
+      isSelf: true,
+
+      // Defaults for ViewProfile-style UI
+      isPrivate: false,
+      isFollowing: false,
+      banned: false,
+      blockedByViewer: false,
+      viewerBlockedUser: false,
+
+      isContentCreator:
+        dbUser.role === 'creator' ||
+        dbUser.role === 'admin',
+
+      isMusician:
+        dbUser.role === 'musician' ||
+        dbUser.role === 'artist'
+    };
+
+    // ------------------------------------------------------------
+    // RESPONSE
+    // ------------------------------------------------------------
     return res.json({
-      user: {
-        id: dbUser.id,
-        user_id: dbUser.id,
-
-        username: dbUser.username,
-        email: dbUser.email,
-
-        display_name: dbUser.display_name || '',
-        displayName: dbUser.display_name || '',
-
-        bio: dbUser.bio || '',
-        location: dbUser.location || '',
-        website: dbUser.website || '',
-
-        profile_url: dbUser.profile_url || null,
-        profilePicture: dbUser.profile_url || null,
-
-        cover_url: dbUser.cover_url || null,
-        coverPhoto: dbUser.cover_url || null,
-
-        is_verified: Boolean(dbUser.is_verified),
-        verified: Boolean(dbUser.is_verified),
-
-        role: dbUser.role || 'user',
-
-        created_at: dbUser.created_at || null,
-
-        followersCount: 0,
-        followers_count: 0,
-
-        followingCount: 0,
-        following_count: 0,
-
-        isSelf: true,
-        isPrivate: false,
-        isFollowing: false,
-        banned: false,
-        blockedByViewer: false,
-        viewerBlockedUser: false,
-
-        isContentCreator:
-          dbUser.role === 'creator' ||
-          dbUser.role === 'admin',
-
-        isMusician:
-          dbUser.role === 'musician' ||
-          dbUser.role === 'artist'
-      },
+      user,
 
       stories: [],
       highlights: [],
-      videos: [],
-      shorts: [],
+
+      videos: videosResult.rows || [],
+      shorts: shortsResult.rows || [],
+
       music: [],
       reposts: [],
       likes: []
     });
 
   } catch (err) {
-    console.error('🔥 PROFILE ROUTE ERROR:', err);
+    console.error('🔥 Failed to load own profile:', err);
 
     return res.status(500).json({
-      error: 'Failed to fetch profile',
-      debug: err.message
+      error: 'Failed to fetch profile'
     });
   }
 });
