@@ -2998,23 +2998,54 @@ app.patch('/api/settings/profile', authenticateToken, async (req, res) => {
 });
 
 // 3. Update Privacy Settings
-app.patch('/api/settings/privacy', authenticateToken, async (req, res) => {
-  // Frontend sends body like { privateAccount: true } or { allowComments: false }
-  // We merge this into the JSONB 'privacy' column
+app.patch("/api/settings/privacy", authenticateToken, async (req, res) => {
   try {
-    const updateData = JSON.stringify(req.body);
-    
-    await pool.query(
-      `UPDATE users 
-       SET privacy = COALESCE(privacy, '{}'::jsonb) || $1::jsonb 
-       WHERE id = $2`,
-      [updateData, req.userId]
+    const allowedKeys = [
+      "profileVisibility",
+      "allowComments",
+      "allowDirectMessages",
+      "allowDownloads",
+      "privateAccount",
+      "hideViewHistory",
+      "allowMentions",
+    ];
+
+    const updates = {};
+
+    for (const key of allowedKeys) {
+      if (Object.prototype.hasOwnProperty.call(req.body, key)) {
+        updates[key] = req.body[key];
+      }
+    }
+
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({ error: "No valid privacy settings provided" });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE users
+       SET privacy_settings =
+           COALESCE(privacy_settings, '{}'::jsonb)
+           || $1::jsonb,
+           updated_at = NOW()
+       WHERE id = $2
+       RETURNING privacy_settings`,
+      [JSON.stringify(updates), req.user.id]
     );
-    
-    res.json({ success: true });
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json({
+      success: true,
+      privacy: rows[0].privacy_settings,
+    });
   } catch (err) {
-    console.error("Update privacy error:", err);
-    res.status(500).json({ error: true, msg: "Update failed" });
+    console.error("Update privacy settings error:", err);
+    res.status(500).json({
+      error: "Failed to update privacy settings",
+    });
   }
 });
 
@@ -4726,28 +4757,54 @@ app.patch('/api/settings/privacy', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /api/settings/preferences - Update preferences
-app.patch('/api/settings/preferences', authenticateToken, async (req, res) => {
+app.patch("/api/settings/preferences", authenticateToken, async (req, res) => {
   try {
+    const allowedKeys = [
+      "autoplay",
+      "highQuality",
+      "dataSaver",
+      "notifications",
+      "language",
+    ];
+
+    const updates = {};
+
+    for (const key of allowedKeys) {
+      if (Object.prototype.hasOwnProperty.call(req.body, key)) {
+        updates[key] = req.body[key];
+      }
+    }
+
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({
+        error: "No valid preference settings provided",
+      });
+    }
+
     const { rows } = await pool.query(
-      "SELECT preferences FROM users WHERE id = $1",
-      [req.user.id]
+      `UPDATE users
+       SET preferences =
+           COALESCE(preferences, '{}'::json)
+           || $1::json,
+           updated_at = NOW()
+       WHERE id = $2
+       RETURNING preferences`,
+      [JSON.stringify(updates), req.user.id]
     );
-    
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    
-    const currentPrefs = rows[0].preferences || {};
-    const newPrefs = { ...currentPrefs, ...req.body };
-    
-    await pool.query(
-      "UPDATE users SET preferences = $1 WHERE id = $2",
-      [JSON.stringify(newPrefs), req.user.id]
-    );
-    
-    res.json({ success: true });
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json({
+      success: true,
+      preferences: rows[0].preferences,
+    });
   } catch (err) {
     console.error("Update preferences error:", err);
-    res.status(500).json({ message: "Failed to update preferences" });
+    res.status(500).json({
+      error: "Failed to update preferences",
+    });
   }
 });
 
@@ -4793,54 +4850,28 @@ app.post('/api/settings/change-password', authenticateToken, async (req, res) =>
   }
 });
 
-// GET /api/settings/login-activity - Get login sessions
-app.get('/api/settings/login-activity', authenticateToken, async (req, res) => {
+app.get("/api/settings/login-activity", authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT s.id as "_id", s.device, s.ip, s.user_agent as "userAgent", 
-              s.created_at as "createdAt",
-              CASE WHEN s.id = (
-                SELECT id FROM user_sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1
-              ) THEN true ELSE false END as current
-       FROM user_sessions s 
-       WHERE s.user_id = $1 
-       ORDER BY s.created_at DESC`,
+      `SELECT
+         id,
+         device,
+         ip_address AS ip,
+         user_agent AS "userAgent",
+         created_at AS "createdAt",
+         is_current AS current
+       FROM login_sessions
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
       [req.user.id]
     );
-    
+
     res.json({ sessions: rows });
   } catch (err) {
     console.error("Get login activity error:", err);
-    res.status(500).json({ error: "Failed to fetch login activity" });
-  }
-});
-
-// DELETE /api/settings/login-activity/:id - Revoke session
-app.delete('/api/settings/login-activity/:id', authenticateToken, async (req, res) => {
-  try {
-    // Don't allow revoking current session
-    const { rows: currentSession } = await pool.query(
-      `SELECT id FROM user_sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`,
-      [req.user.id]
-    );
-    
-    if (currentSession.length > 0 && currentSession[0].id === parseInt(req.params.id)) {
-      return res.status(400).json({ message: "Cannot revoke current session" });
-    }
-    
-    const { rows } = await pool.query(
-      "DELETE FROM user_sessions WHERE id = $1 AND user_id = $2 RETURNING id",
-      [req.params.id, req.user.id]
-    );
-    
-    if (!rows.length) {
-      return res.status(404).json({ message: "Session not found" });
-    }
-    
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Revoke session error:", err);
-    res.status(500).json({ message: "Failed to revoke session" });
+    res.status(500).json({
+      error: "Failed to fetch login activity",
+    });
   }
 });
 
@@ -4896,24 +4927,34 @@ app.post('/api/settings/blocked', authenticateToken, async (req, res) => {
   }
 });
 
-// DELETE /api/settings/blocked/:id - Unblock user
-app.delete('/api/settings/blocked/:id', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      "DELETE FROM blocked_users WHERE id = $1 AND blocker_id = $2 RETURNING id",
-      [req.params.id, req.user.id]
-    );
-    
-    if (!rows.length) {
-      return res.status(404).json({ message: "Block not found" });
+// DELETE /api/settings/app.delete(
+  "/api/settings/blocked/:userId",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `DELETE FROM blocked_users
+         WHERE blocker_id = $1
+           AND blocked_id = $2
+         RETURNING blocked_id`,
+        [req.user.id, req.params.userId]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({
+          error: "Blocked user not found",
+        });
+      }
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Unblock user error:", err);
+      res.status(500).json({
+        error: "Failed to unblock user",
+      });
     }
-    
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Unblock user error:", err);
-    res.status(500).json({ message: "Failed to unblock user" });
   }
-});
+);
 
 // GET /api/settings/hidden-words - Get hidden words
 app.get('/api/settings/hidden-words', authenticateToken, async (req, res) => {
