@@ -10106,254 +10106,947 @@ app.post("/auth/check-vpn", async (req, res) => {
   } catch (err) { console.error("check-vpn error:", err); res.status(500).json({ error: "Failed to check VPN status" }); }
 });
 
-// ============================================
-// GET /api/chats — my conversations, split into inbox and requests
-// Request = a chat where I don't follow the other person
-// ============================================
+// ============================================================
+// CHAT ROUTES
+// IMPORTANT:
+// Keep ONLY ONE GET /api/chats route in your backend.
+// Keep ONLY ONE POST /api/chats/:chatId/accept route.
+// Keep ONLY ONE POST /api/chats/:chatId/read route.
+// Keep ONLY ONE POST /api/chats/:chatId/messages route.
+// ============================================================
+
+
+// ============================================================
+// GET /api/chats
+// Returns:
+// {
+//   inbox: [...],
+//   requests: [...]
+// }
+//
+// A request is a chat where the current user does NOT follow
+// the other participant.
+//
+// Unread state comes from chat_read_states.
+// There is NO messages.is_read column in your schema.
+// ============================================================
+
 app.get("/api/chats", authenticateToken, async (req, res) => {
   try {
     const myId = Number(req.user.id);
 
-    const result = await pool.query(
+    if (!Number.isInteger(myId)) {
+      return res.status(401).json({
+        error: "Invalid authenticated user",
+      });
+    }
+
+    const { rows } = await pool.query(
       `
       SELECT
         c.id,
+        c.type,
+        c.name,
+        c.avatar,
         c.created_at,
+        c.updated_at,
+        c.last_message,
+        c.last_message_id,
+        c.last_message_at,
 
-        u.id AS other_id,
-        u.username AS other_username,
-        u.profile_url AS other_avatar,
+        -- Find the other participant.
+        -- Prefer chat_participants, then fall back to
+        -- the legacy chats.participants array.
+        COALESCE(
+          (
+            SELECT cp.user_id
+            FROM chat_participants cp
+            WHERE cp.chat_id = c.id
+              AND cp.user_id <> $1
+            ORDER BY cp.id
+            LIMIT 1
+          ),
+          (
+            SELECT p
+            FROM unnest(COALESCE(c.participants, ARRAY[]::integer[])) AS p
+            WHERE p <> $1
+            LIMIT 1
+          )
+        ) AS other_user_id,
 
+        COALESCE(
+          (
+            SELECT u.username
+            FROM chat_participants cp
+            JOIN users u ON u.id = cp.user_id
+            WHERE cp.chat_id = c.id
+              AND cp.user_id <> $1
+            ORDER BY cp.id
+            LIMIT 1
+          ),
+          (
+            SELECT u.username
+            FROM users u
+            WHERE u.id = (
+              SELECT p
+              FROM unnest(COALESCE(c.participants, ARRAY[]::integer[])) AS p
+              WHERE p <> $1
+              LIMIT 1
+            )
+          )
+        ) AS other_username,
+
+        COALESCE(
+          (
+            SELECT u.profile_url
+            FROM chat_participants cp
+            JOIN users u ON u.id = cp.user_id
+            WHERE cp.chat_id = c.id
+              AND cp.user_id <> $1
+            ORDER BY cp.id
+            LIMIT 1
+          ),
+          (
+            SELECT u.profile_url
+            FROM users u
+            WHERE u.id = (
+              SELECT p
+              FROM unnest(COALESCE(c.participants, ARRAY[]::integer[])) AS p
+              WHERE p <> $1
+              LIMIT 1
+            )
+          )
+        ) AS other_avatar,
+
+        -- Do I follow the other person?
         EXISTS (
           SELECT 1
           FROM follows f
           WHERE f.follower_id = $1
-            AND f.following_id = u.id
+            AND f.following_id = COALESCE(
+              (
+                SELECT cp.user_id
+                FROM chat_participants cp
+                WHERE cp.chat_id = c.id
+                  AND cp.user_id <> $1
+                ORDER BY cp.id
+                LIMIT 1
+              ),
+              (
+                SELECT p
+                FROM unnest(
+                  COALESCE(c.participants, ARRAY[]::integer[])
+                ) AS p
+                WHERE p <> $1
+                LIMIT 1
+              )
+            )
+            AND f.status = 'accepted'
         ) AS i_follow,
 
-        EXISTS (
-          SELECT 1
-          FROM follows f
-          WHERE f.follower_id = u.id
-            AND f.following_id = $1
-        ) AS follows_me,
+        -- Last message.
+        lm.id AS last_msg_id,
+        lm.content AS last_msg_content,
+        lm.type AS last_msg_type,
+        lm.media_url AS last_msg_media_url,
+        lm.sender_id AS last_msg_sender_id,
+        lm.timestamp AS last_msg_timestamp,
 
-        lm.id AS last_message_id,
-        lm.content AS last_message,
-        lm.timestamp AS last_message_at,
-        lm.sender_id AS last_message_sender_id,
+        -- Read state for THIS user.
+        crs.last_read_at,
 
+        -- Number of messages from the other person after
+        -- this user's last_read_at.
         (
           SELECT COUNT(*)
           FROM messages m
-          WHERE m.chat_id = c.id
+          WHERE m.chat_id = c.id::text
             AND m.sender_id <> $1
-            AND m.is_read = false
-        ) AS unread
+            AND m.created_at >
+                COALESCE(crs.last_read_at, 'epoch'::timestamp)
+        ) AS unread_count
 
       FROM chats c
 
-      LEFT JOIN LATERAL (
-        SELECT
-          id,
-          username,
-          profile_url
-        FROM users
-        WHERE id = ANY(c.participants)
-          AND id <> $1
-        ORDER BY id
-        LIMIT 1
-      ) u ON true
+      LEFT JOIN chat_read_states crs
+        ON crs.chat_id = c.id
+       AND crs.user_id = $1
 
       LEFT JOIN LATERAL (
         SELECT
-          id,
-          content,
-          timestamp,
-          sender_id
-        FROM messages
-        WHERE chat_id = c.id
-        ORDER BY timestamp DESC
+          m.id,
+          m.content,
+          m.type,
+          m.media_url,
+          m.sender_id,
+          m.timestamp
+        FROM messages m
+        WHERE m.chat_id = c.id::text
+        ORDER BY m.created_at DESC, m.id DESC
         LIMIT 1
       ) lm ON true
 
-      WHERE $1 = ANY(c.participants)
+      WHERE
+        (
+          -- Modern participant records
+          EXISTS (
+            SELECT 1
+            FROM chat_participants cp
+            WHERE cp.chat_id = c.id
+              AND cp.user_id = $1
+          )
+
+          OR
+
+          -- Legacy participant array
+          $1 = ANY(
+            COALESCE(c.participants, ARRAY[]::integer[])
+          )
+        )
 
       ORDER BY
-        COALESCE(lm.timestamp, c.created_at) DESC
+        COALESCE(
+          lm.timestamp,
+          c.last_message_at,
+          c.created_at
+        ) DESC
       `,
       [myId]
     );
 
-    const chats = (result.rows || [])
-      .filter((r) => r.other_id)
-      .map((r) => {
-        const iFollow = Boolean(r.i_follow);
-        const followsMe = Boolean(r.follows_me);
+    const chats = rows.map((r) => {
+      const otherUserId = r.other_user_id
+        ? Number(r.other_user_id)
+        : null;
 
-        /*
-         * Normal conversation:
-         * both users follow each other.
-         *
-         * Request:
-         * the other user has sent/contacted us but
-         * we don't follow them yet.
-         */
-        const isRequest = !iFollow;
+      const unreadCount = Number(r.unread_count || 0);
 
-        return {
-          id: r.id,
+      return {
+        id: r.id,
 
-          createdAt: r.created_at,
+        type: r.type || "private",
 
-          isRequest,
+        name:
+          r.name ||
+          r.other_username ||
+          "Chat",
 
-          iFollow,
-          followsMe,
+        avatar:
+          r.avatar ||
+          r.other_avatar ||
+          "",
 
-          unread: Number(r.unread || 0),
+        otherUserId,
 
-          lastMessage: r.last_message
+        otherUser: otherUserId
+          ? {
+              id: otherUserId,
+              username: r.other_username || "Unknown user",
+              profile_url: r.other_avatar || "",
+            }
+          : null,
+
+        lastMessage: r.last_msg_id
+          ? {
+              id: Number(r.last_msg_id),
+              text: r.last_msg_content || "",
+              content: r.last_msg_content || "",
+              type: r.last_msg_type || "text",
+              media_url: r.last_msg_media_url || null,
+              senderId: r.last_msg_sender_id
+                ? Number(r.last_msg_sender_id)
+                : null,
+              timestamp: r.last_msg_timestamp || null,
+            }
+          : r.last_message
             ? {
-                id: r.last_message_id,
+                id: r.last_message_id
+                  ? Number(r.last_message_id)
+                  : null,
                 text: r.last_message,
-                timestamp: r.last_message_at,
-                senderId: r.last_message_sender_id,
+                content: r.last_message,
+                timestamp: r.last_message_at || null,
               }
             : null,
 
-          otherUser: {
-            id: Number(r.other_id),
-            username: r.other_username,
-            profile_url: r.other_avatar,
-          },
-        };
-      });
+        lastMessageAt:
+          r.last_msg_timestamp ||
+          r.last_message_at ||
+          r.created_at,
 
-    const inbox = chats.filter((chat) => !chat.isRequest);
-    const requests = chats.filter((chat) => chat.isRequest);
+        unread: unreadCount,
+        unreadCount,
+
+        // IMPORTANT:
+        // If I don't follow them, it is a request.
+        isRequest: !Boolean(r.i_follow),
+
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+
+        pinned: false,
+        muted: false,
+        archived: false,
+      };
+    });
 
     res.json({
-      chats,
-      inbox,
-      requests,
+      inbox: chats.filter((chat) => !chat.isRequest),
+      requests: chats.filter((chat) => chat.isRequest),
     });
   } catch (err) {
     console.error("GET /api/chats failed:", err);
 
     res.status(500).json({
       error: "Failed to load chats",
-      detail: String(err?.message || err),
+      detail:
+        process.env.NODE_ENV === "development"
+          ? String(err?.message || err)
+          : undefined,
     });
   }
 });
 
-// POST /api/chats/:chatId/accept — accept request = follow them back
-app.post("/api/chats/:chatId/accept", authenticateToken, async (req, res) => {
-  try {
-    const myId = Number(req.user.id);
-    const chatId = req.params.chatId;
 
-    if (!UUID_RE.test(chatId)) {
-      return res.status(400).json({
-        error: "Invalid chat id",
+// ============================================================
+// POST /api/chats/:chatId/accept
+//
+// Accepting a request:
+// 1. Verifies the user belongs to the chat.
+// 2. Finds the requester.
+// 3. Follows the requester back.
+// 4. Marks the current user's read state.
+// 5. The next GET /api/chats automatically moves it from
+//    requests -> inbox because i_follow becomes true.
+//
+// IMPORTANT:
+// There is NO messages.is_read column.
+// ============================================================
+
+app.post(
+  "/api/chats/:chatId/accept",
+  authenticateToken,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const myId = Number(req.user.id);
+      const chatId = req.params.chatId;
+
+      if (!Number.isInteger(myId)) {
+        return res.status(401).json({
+          error: "Invalid authenticated user",
+        });
+      }
+
+      // UUID validation.
+      const UUID_RE =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+      if (!UUID_RE.test(chatId)) {
+        return res.status(400).json({
+          error: "Invalid chat id",
+        });
+      }
+
+      await client.query("BEGIN");
+
+      // Verify that the current user belongs to the chat.
+      const chatResult = await client.query(
+        `
+        SELECT
+          c.id,
+          c.participants
+        FROM chats c
+        WHERE c.id = $1
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM chat_participants cp
+              WHERE cp.chat_id = c.id
+                AND cp.user_id = $2
+            )
+            OR
+            $2 = ANY(
+              COALESCE(c.participants, ARRAY[]::integer[])
+            )
+          )
+        FOR UPDATE
+        `,
+        [chatId, myId]
+      );
+
+      if (!chatResult.rowCount) {
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+          error: "Chat not found",
+        });
+      }
+
+      // Find the other participant.
+      const participantResult = await client.query(
+        `
+        SELECT user_id
+        FROM chat_participants
+        WHERE chat_id = $1
+          AND user_id <> $2
+
+        UNION
+
+        SELECT p AS user_id
+        FROM chats c,
+             unnest(
+               COALESCE(c.participants, ARRAY[]::integer[])
+             ) AS p
+        WHERE c.id = $1
+          AND p <> $2
+
+        LIMIT 1
+        `,
+        [chatId, myId]
+      );
+
+      if (!participantResult.rowCount) {
+        await client.query("ROLLBACK");
+
+        return res.status(400).json({
+          error: "Could not find the other participant",
+        });
+      }
+
+      const otherId = Number(
+        participantResult.rows[0].user_id
+      );
+
+      if (!Number.isInteger(otherId)) {
+        await client.query("ROLLBACK");
+
+        return res.status(400).json({
+          error: "Invalid other participant",
+        });
+      }
+
+      // Verify requester still exists.
+      const userResult = await client.query(
+        `
+        SELECT id, username, profile_url
+        FROM users
+        WHERE id = $1
+        `,
+        [otherId]
+      );
+
+      if (!userResult.rowCount) {
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+          error: "Other user not found",
+        });
+      }
+
+      // ======================================================
+      // FOLLOW THE REQUESTER BACK
+      //
+      // Your follows table has:
+      // follower_id
+      // following_id
+      // status
+      //
+      // The UNIQUE constraint is on follower_id/following_id.
+      // ======================================================
+
+      await client.query(
+        `
+        INSERT INTO follows (
+          follower_id,
+          following_id,
+          status
+        )
+        VALUES ($1, $2, 'accepted')
+        ON CONFLICT (follower_id, following_id)
+        DO UPDATE SET status = 'accepted'
+        `,
+        [myId, otherId]
+      );
+
+      // Make sure current user has a chat_participants row.
+      await client.query(
+        `
+        INSERT INTO chat_participants (
+          chat_id,
+          user_id
+        )
+        VALUES ($1, $2)
+        ON CONFLICT (chat_id, user_id)
+        DO NOTHING
+        `,
+        [chatId, myId]
+      );
+
+      // ======================================================
+      // MARK THIS USER'S CHAT AS READ.
+      //
+      // DO NOT use:
+      // UPDATE messages SET is_read = ...
+      //
+      // There is no is_read column.
+      // ======================================================
+
+      await client.query(
+        `
+        INSERT INTO chat_read_states (
+          chat_id,
+          user_id,
+          last_read_at
+        )
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (chat_id, user_id)
+        DO UPDATE SET last_read_at = NOW()
+        `,
+        [chatId, myId]
+      );
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        chatId,
+        otherUser: {
+          id: otherId,
+          username: userResult.rows[0].username,
+          profile_url: userResult.rows[0].profile_url || "",
+        },
       });
-    }
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
 
-    const { rows } = await pool.query(
-      `
-      SELECT participants
-      FROM chats
-      WHERE id = $1
-        AND $2 = ANY(participants)
-      `,
-      [chatId, myId]
-    );
+      console.error("POST /api/chats/:chatId/accept failed:", err);
 
-    if (!rows.length) {
-      return res.status(404).json({
-        error: "Chat not found",
+      return res.status(500).json({
+        error: "Failed to accept message request",
       });
+    } finally {
+      client.release();
     }
-
-    const participants = rows[0].participants || [];
-
-    const otherId = participants.find(
-      (id) => Number(id) !== Number(myId)
-    );
-
-    if (!otherId) {
-      return res.status(400).json({
-        error: "Unable to determine other user",
-      });
-    }
-
-    /*
-     * Accepting a message request means:
-     * current user follows the person who messaged them.
-     */
-    await pool.query(
-      `
-      INSERT INTO follows (follower_id, following_id)
-      VALUES ($1, $2)
-      ON CONFLICT (follower_id, following_id)
-      DO NOTHING
-      `,
-      [myId, Number(otherId)]
-    );
-
-    /*
-     * Correct placeholders:
-     * $1 = chatId
-     * $2 = myId
-     */
-    await pool.query(
-      `
-      UPDATE messages
-      SET is_read = true
-      WHERE chat_id = $1
-        AND sender_id <> $2
-      `,
-      [chatId, myId]
-    );
-
-    res.json({
-      success: true,
-      chatId,
-      otherUserId: Number(otherId),
-    });
-  } catch (err) {
-    console.error("Accept request error:", err);
-
-    res.status(500).json({
-      error: "Failed to accept request",
-    });
   }
-});
+);
 
-// DELETE /api/chats/:chatId — decline request (deletes the conversation)
-app.delete("/api/chats/:chatId", authenticateToken, async (req, res) => {
-  try {
-    const myId = req.user.id;
-    const chatId = req.params.chatId;
 
-    if (!UUID_RE.test(chatId)) return res.status(400).json({ error: "Invalid chat id" });
+// ============================================================
+// POST /api/chats/:chatId/read
+//
+// Marks the current user's chat as read using chat_read_states.
+// ============================================================
 
-    const { rows } = await pool.query(
-      "SELECT id FROM chats WHERE id = $1 AND $2 = ANY(participants)",
-      [chatId, myId]
-    );
-    if (!rows.length) return res.status(404).json({ error: "Chat not found" });
+app.post(
+  "/api/chats/:chatId/read",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const myId = Number(req.user.id);
+      const chatId = req.params.chatId;
 
-    await pool.query("DELETE FROM messages WHERE chat_id = $1", [chatId]);
-    await pool.query("DELETE FROM chats WHERE id = $1", [chatId]);
+      if (!Number.isInteger(myId)) {
+        return res.status(401).json({
+          error: "Invalid authenticated user",
+        });
+      }
 
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Decline request error:", err.message);
-    res.status(500).json({ error: "Failed to decline request" });
+      const UUID_RE =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+      if (!UUID_RE.test(chatId)) {
+        return res.status(400).json({
+          error: "Invalid chat id",
+        });
+      }
+
+      // Verify that the user actually belongs to this chat.
+      const accessResult = await pool.query(
+        `
+        SELECT c.id
+        FROM chats c
+        WHERE c.id = $1
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM chat_participants cp
+              WHERE cp.chat_id = c.id
+                AND cp.user_id = $2
+            )
+            OR
+            $2 = ANY(
+              COALESCE(c.participants, ARRAY[]::integer[])
+            )
+          )
+        LIMIT 1
+        `,
+        [chatId, myId]
+      );
+
+      if (!accessResult.rowCount) {
+        return res.status(404).json({
+          error: "Chat not found",
+        });
+      }
+
+      // The ONLY source of truth for read state.
+      await pool.query(
+        `
+        INSERT INTO chat_read_states (
+          chat_id,
+          user_id,
+          last_read_at
+        )
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (chat_id, user_id)
+        DO UPDATE SET last_read_at = NOW()
+        `,
+        [chatId, myId]
+      );
+
+      // If an old chat_participants.last_read_at column exists,
+      // update it too. This is NOT required for unread counting,
+      // but keeps old data synchronized.
+      await pool.query(
+        `
+        UPDATE chat_participants
+        SET last_read_at = NOW()
+        WHERE chat_id = $1
+          AND user_id = $2
+        `,
+        [chatId, myId]
+      );
+
+      return res.json({
+        success: true,
+        chatId,
+        lastReadAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error("POST /api/chats/:chatId/read failed:", err);
+
+      return res.status(500).json({
+        error: "Failed to mark chat as read",
+      });
+    }
   }
-});
+);
+
+
+// ============================================================
+// POST /api/chats/:chatId/messages
+//
+// Sends a message.
+//
+// IMPORTANT:
+// Your actual messages table contains:
+//
+// id
+// chat_id TEXT
+// sender_id INTEGER
+// content TEXT
+// type VARCHAR
+// media_url TEXT
+// timestamp TIMESTAMP
+// created_at TIMESTAMP
+//
+// So this route does NOT use reply_to, poll_data, is_read, etc.
+// ============================================================
+
+app.post(
+  "/api/chats/:chatId/messages",
+  authenticateToken,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const myId = Number(req.user.id);
+      const chatId = req.params.chatId;
+
+      const {
+        content,
+        type = "text",
+        media_url = null,
+      } = req.body || {};
+
+      if (!Number.isInteger(myId)) {
+        return res.status(401).json({
+          error: "Invalid authenticated user",
+        });
+      }
+
+      const UUID_RE =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+      if (!UUID_RE.test(chatId)) {
+        return res.status(400).json({
+          error: "Invalid chat id",
+        });
+      }
+
+      const cleanContent =
+        typeof content === "string"
+          ? content.trim()
+          : "";
+
+      const cleanMediaUrl =
+        typeof media_url === "string"
+          ? media_url.trim()
+          : media_url;
+
+      if (!cleanContent && !cleanMediaUrl) {
+        return res.status(400).json({
+          error: "Message content required",
+        });
+      }
+
+      const allowedTypes = [
+        "text",
+        "image",
+        "video",
+        "audio",
+        "file",
+      ];
+
+      const messageType = allowedTypes.includes(type)
+        ? type
+        : "text";
+
+      await client.query("BEGIN");
+
+      // ======================================================
+      // Verify participant.
+      // Supports both:
+      //   chat_participants
+      // and legacy chats.participants.
+      // ======================================================
+
+      const accessResult = await client.query(
+        `
+        SELECT
+          c.id,
+          c.participants
+        FROM chats c
+        WHERE c.id = $1
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM chat_participants cp
+              WHERE cp.chat_id = c.id
+                AND cp.user_id = $2
+            )
+            OR
+            $2 = ANY(
+              COALESCE(c.participants, ARRAY[]::integer[])
+            )
+          )
+        FOR UPDATE
+        `,
+        [chatId, myId]
+      );
+
+      if (!accessResult.rowCount) {
+        await client.query("ROLLBACK");
+
+        return res.status(403).json({
+          error: "You are not a participant in this chat",
+        });
+      }
+
+      // Make sure a participant row exists for modern chat logic.
+      await client.query(
+        `
+        INSERT INTO chat_participants (
+          chat_id,
+          user_id
+        )
+        VALUES ($1, $2)
+        ON CONFLICT (chat_id, user_id)
+        DO NOTHING
+        `,
+        [chatId, myId]
+      );
+
+      // ======================================================
+      // INSERT MESSAGE
+      //
+      // chat_id in your schema is TEXT, while chats.id is UUID.
+      // Therefore we pass chatId as text.
+      // ======================================================
+
+      const messageResult = await client.query(
+        `
+        INSERT INTO messages (
+          chat_id,
+          sender_id,
+          content,
+          type,
+          media_url,
+          timestamp,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5,
+          NOW(),
+          NOW()
+        )
+        RETURNING
+          id,
+          chat_id,
+          sender_id,
+          content,
+          type,
+          media_url,
+          timestamp,
+          created_at
+        `,
+        [
+          String(chatId),
+          myId,
+          cleanContent || null,
+          messageType,
+          cleanMediaUrl || null,
+        ]
+      );
+
+      const message = messageResult.rows[0];
+
+      // ======================================================
+      // Update chat preview.
+      // ======================================================
+
+      const previewText =
+        cleanContent ||
+        (
+          messageType === "image"
+            ? "[Image]"
+            : messageType === "video"
+              ? "[Video]"
+              : messageType === "audio"
+                ? "[Audio]"
+                : "[Media]"
+        );
+
+      await client.query(
+        `
+        UPDATE chats
+        SET
+          last_message = $1,
+          last_message_id = $2,
+          last_message_at = $3,
+          updated_at = NOW()
+        WHERE id = $4
+        `,
+        [
+          previewText.substring(0, 100),
+          message.id,
+          message.timestamp || message.created_at,
+          chatId,
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      // ======================================================
+      // Response object
+      // ======================================================
+
+      const newMessage = {
+        id: Number(message.id),
+        chat_id: message.chat_id,
+        sender_id: Number(message.sender_id),
+        content: message.content,
+        type: message.type,
+        media_url: message.media_url,
+        timestamp: message.timestamp,
+        created_at: message.created_at,
+
+        // Convenient frontend aliases.
+        senderId: Number(message.sender_id),
+        text: message.content || "",
+      };
+
+      // ======================================================
+      // Socket.IO notifications
+      // ======================================================
+
+      try {
+        if (typeof io !== "undefined") {
+          // Chat room.
+          io.to(`chat-${chatId}`).emit(
+            "new-message",
+            newMessage
+          );
+
+          // Find all participants.
+          const participantResult = await pool.query(
+            `
+            SELECT DISTINCT user_id
+            FROM (
+              SELECT cp.user_id
+              FROM chat_participants cp
+              WHERE cp.chat_id = $1
+
+              UNION
+
+              SELECT p AS user_id
+              FROM chats c,
+                   unnest(
+                     COALESCE(
+                       c.participants,
+                       ARRAY[]::integer[]
+                     )
+                   ) AS p
+              WHERE c.id = $1
+            ) participants
+            WHERE user_id <> $2
+            `,
+            [chatId, myId]
+          );
+
+          for (const participant of participantResult.rows) {
+            io.to(`user-${participant.user_id}`).emit(
+              "new-message",
+              newMessage
+            );
+          }
+        }
+      } catch (socketErr) {
+        // Do not fail an already-successful database operation
+        // just because Socket.IO notification failed.
+        console.error(
+          "Socket notification failed:",
+          socketErr
+        );
+      }
+
+      return res.status(201).json(newMessage);
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+
+      console.error(
+        "POST /api/chats/:chatId/messages failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error: "Failed to send message",
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
 
 app.post("/api/auth/register", checkBan, async (req, res) => {
   try {
