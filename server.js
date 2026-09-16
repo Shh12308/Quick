@@ -9230,6 +9230,511 @@ app.get('/api/users/:userId/following', authenticateToken, async (req, res) => {
 // CHAT CREATION ENDPOINT
 // ==========================================
 
+
+// ============================================================
+// VIDEO 3-DOT MENU ENDPOINTS
+// ============================================================
+
+// ------------------------------------------------------------
+// POST /api/videos/:id/hide
+// Hide a video for the current user
+// ------------------------------------------------------------
+app.post('/api/videos/:id/hide', authMiddleware, async (req, res) => {
+  try {
+    const videoId = req.params.id;
+    const userId = req.user.id;
+
+    // Prevent duplicate hides
+    const existing = await VideoHide.findOne({
+      user_id: userId,
+      video_id: videoId
+    });
+
+    if (existing) {
+      return res.json({
+        success: true,
+        message: 'Video already hidden'
+      });
+    }
+
+    await VideoHide.create({
+      user_id: userId,
+      video_id: videoId,
+      created_at: new Date()
+    });
+
+    res.json({
+      success: true,
+      message: 'Video hidden'
+    });
+
+  } catch (error) {
+    console.error('Hide video error:', error);
+
+    res.status(500).json({
+      success: false,
+      message: 'Failed to hide video'
+    });
+  }
+});
+
+
+// ------------------------------------------------------------
+// POST /api/users/:id/not-recommended
+// Don't recommend videos from this creator
+// ------------------------------------------------------------
+app.post(
+  '/api/users/:id/not-recommended',
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const targetUserId = req.params.id;
+      const userId = req.user.id;
+
+      if (String(targetUserId) === String(userId)) {
+        return res.status(400).json({
+          success: false,
+          message: 'You cannot block recommendations from yourself'
+        });
+      }
+
+      const existing = await NotRecommended.findOne({
+        user_id: userId,
+        target_user_id: targetUserId
+      });
+
+      if (existing) {
+        return res.json({
+          success: true,
+          message: 'Channel already excluded'
+        });
+      }
+
+      await NotRecommended.create({
+        user_id: userId,
+        target_user_id: targetUserId,
+        created_at: new Date()
+      });
+
+      res.json({
+        success: true,
+        message: 'Channel will no longer be recommended'
+      });
+
+    } catch (error) {
+      console.error('Not recommended error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Failed to update recommendation settings'
+      });
+    }
+  }
+);
+
+
+// ------------------------------------------------------------
+// POST /api/users/:id/block
+// Block a user
+// ------------------------------------------------------------
+app.post(
+  '/api/users/:id/block',
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const targetUserId = req.params.id;
+      const userId = req.user.id;
+
+      if (String(targetUserId) === String(userId)) {
+        return res.status(400).json({
+          success: false,
+          message: 'You cannot block yourself'
+        });
+      }
+
+      const existing = await BlockedUser.findOne({
+        user_id: userId,
+        blocked_user_id: targetUserId
+      });
+
+      if (existing) {
+        return res.json({
+          success: true,
+          message: 'User already blocked'
+        });
+      }
+
+      await BlockedUser.create({
+        user_id: userId,
+        blocked_user_id: targetUserId,
+        created_at: new Date()
+      });
+
+      res.json({
+        success: true,
+        message: 'User blocked'
+      });
+
+    } catch (error) {
+      console.error('Block user error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Failed to block user'
+      });
+    }
+  }
+);
+
+
+// ------------------------------------------------------------
+// POST /api/videos/:id/watch-later
+// Add video to Watch Later
+// ------------------------------------------------------------
+app.post(
+  '/api/videos/:id/watch-later',
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const videoId = req.params.id;
+      const userId = req.user.id;
+
+      const existing = await WatchLater.findOne({
+        user_id: userId,
+        video_id: videoId
+      });
+
+      if (existing) {
+        return res.json({
+          success: true,
+          saved: true,
+          message: 'Video already in Watch Later'
+        });
+      }
+
+      await WatchLater.create({
+        user_id: userId,
+        video_id: videoId,
+        created_at: new Date()
+      });
+
+      res.json({
+        success: true,
+        saved: true,
+        message: 'Added to Watch Later'
+      });
+
+    } catch (error) {
+      console.error('Watch later error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Failed to add video to Watch Later'
+      });
+    }
+  }
+);
+
+
+// ------------------------------------------------------------
+// DELETE /api/videos/:id/watch-later
+// Remove video from Watch Later
+// ------------------------------------------------------------
+app.delete(
+  '/api/videos/:id/watch-later',
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const videoId = req.params.id;
+      const userId = req.user.id;
+
+      await WatchLater.deleteOne({
+        user_id: userId,
+        video_id: videoId
+      });
+
+      res.json({
+        success: true,
+        saved: false,
+        message: 'Removed from Watch Later'
+      });
+
+    } catch (error) {
+      console.error('Remove watch later error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Failed to remove video from Watch Later'
+      });
+    }
+  }
+);
+
+
+// ------------------------------------------------------------
+// POST /api/videos/:id/save
+// Save video to Library
+// ------------------------------------------------------------
+app.post(
+  '/api/videos/:id/save',
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const videoId = req.params.id;
+      const userId = req.user.id;
+
+      const existing = await SavedVideo.findOne({
+        user_id: userId,
+        video_id: videoId
+      });
+
+      if (existing) {
+        return res.json({
+          success: true,
+          saved: true,
+          message: 'Video already saved'
+        });
+      }
+
+      await SavedVideo.create({
+        user_id: userId,
+        video_id: videoId,
+        created_at: new Date()
+      });
+
+      res.json({
+        success: true,
+        saved: true,
+        message: 'Video saved'
+      });
+
+    } catch (error) {
+      console.error('Save video error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Failed to save video'
+      });
+    }
+  }
+);
+
+
+// ------------------------------------------------------------
+// DELETE /api/videos/:id/save
+// Remove video from Library
+// ------------------------------------------------------------
+app.delete(
+  '/api/videos/:id/save',
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const videoId = req.params.id;
+      const userId = req.user.id;
+
+      await SavedVideo.deleteOne({
+        user_id: userId,
+        video_id: videoId
+      });
+
+      res.json({
+        success: true,
+        saved: false,
+        message: 'Video removed from library'
+      });
+
+    } catch (error) {
+      console.error('Unsave video error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Failed to remove video from library'
+      });
+    }
+  }
+);
+
+
+// ------------------------------------------------------------
+// POST /api/videos/:id/report
+// Report a video
+// ------------------------------------------------------------
+app.post(
+  '/api/videos/:id/report',
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const videoId = req.params.id;
+      const userId = req.user.id;
+
+      const {
+        reason,
+        details = ''
+      } = req.body;
+
+      const validReasons = [
+        'Spam',
+        'Harassment',
+        'Hateful content',
+        'Violence',
+        'Sexual content',
+        'Dangerous content',
+        'Misinformation',
+        'Scam or fraud',
+        'Copyright',
+        'Other'
+      ];
+
+      if (!reason) {
+        return res.status(400).json({
+          success: false,
+          message: 'Report reason is required'
+        });
+      }
+
+      if (!validReasons.includes(reason)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid report reason'
+        });
+      }
+
+      // Prevent duplicate reports
+      const existing = await VideoReport.findOne({
+        video_id: videoId,
+        reporter_id: userId
+      });
+
+      if (existing) {
+        return res.status(409).json({
+          success: false,
+          message: 'You have already reported this video'
+        });
+      }
+
+      await VideoReport.create({
+        video_id: videoId,
+        reporter_id: userId,
+        reason,
+        details,
+        status: 'pending',
+        created_at: new Date()
+      });
+
+      res.json({
+        success: true,
+        message: 'Report submitted'
+      });
+
+    } catch (error) {
+      console.error('Report video error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Failed to report video'
+      });
+    }
+  }
+);
+
+
+// ------------------------------------------------------------
+// GET /api/videos/:id/share
+// Get share URL
+// ------------------------------------------------------------
+app.get(
+  '/api/videos/:id/share',
+  async (req, res) => {
+    try {
+      const videoId = req.params.id;
+
+      const video = await Video.findById(videoId);
+
+      if (!video) {
+        return res.status(404).json({
+          success: false,
+          message: 'Video not found'
+        });
+      }
+
+      const shareUrl =
+        `${process.env.FRONTEND_URL || 'http://localhost:3000'}/watch/${videoId}`;
+
+      res.json({
+        success: true,
+        video_id: videoId,
+        url: shareUrl
+      });
+
+    } catch (error) {
+      console.error('Share video error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Failed to generate share URL'
+      });
+    }
+  }
+);
+
+
+// ------------------------------------------------------------
+// GET /api/videos/:id/download
+// Get video download URL
+// ------------------------------------------------------------
+app.get(
+  '/api/videos/:id/download',
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const videoId = req.params.id;
+
+      const video = await Video.findById(videoId);
+
+      if (!video) {
+        return res.status(404).json({
+          success: false,
+          message: 'Video not found'
+        });
+      }
+
+      // Change this according to your database field
+      if (video.download_enabled === false) {
+        return res.status(403).json({
+          success: false,
+          message: 'Downloads are disabled for this video'
+        });
+      }
+
+      const downloadUrl =
+        video.video_url ||
+        video.url ||
+        video.file_url;
+
+      if (!downloadUrl) {
+        return res.status(404).json({
+          success: false,
+          message: 'Video file not available'
+        });
+      }
+
+      res.json({
+        success: true,
+        video_id: videoId,
+        download_url: downloadUrl
+      });
+
+    } catch (error) {
+      console.error('Download video error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Failed to get download URL'
+      });
+    }
+  }
+);
+
 // Create or get existing chat with a user
 app.post('/api/chats/direct', authenticateToken, async (req, res) => {
   try {
