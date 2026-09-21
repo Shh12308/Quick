@@ -5646,6 +5646,153 @@ app.get('/api/test-db', async (req, res) => {
   }
 });
 
+// ============================================================
+// GET CURRENT USER PROFILE
+// ============================================================
+
+app.get("/api/users/profile", authenticateToken, async (req, res) => {
+  try {
+    // The authenticated user's ID comes from the JWT
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({
+        error: "Unauthorized",
+        message: "User ID not found in authentication token.",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.email,
+        u.display_name,
+        u.bio,
+        u.location,
+        u.website,
+        u.profile_url,
+        u.profile_pic,
+        u.profile_picture,
+        u.avatar_url,
+        u.cover_url,
+        u.cover_photo,
+        u.is_verified,
+        u.verified,
+        u.role,
+
+        COALESCE(
+          (
+            SELECT COUNT(*)
+            FROM subscriptions s
+            WHERE s.channel_id = u.id
+          ),
+          0
+        ) AS subscribers_count,
+
+        COALESCE(
+          (
+            SELECT SUM(COALESCE(v.views, 0))
+            FROM videos v
+            WHERE v.user_id = u.id
+          ),
+          0
+        ) AS total_views,
+
+        COALESCE(
+          (
+            SELECT COUNT(*)
+            FROM videos v
+            WHERE v.user_id = u.id
+          ),
+          0
+        ) AS video_count,
+
+        COALESCE(
+          (
+            SELECT COUNT(*)
+            FROM shorts sh
+            WHERE sh.user_id = u.id
+          ),
+          0
+        ) AS short_count
+
+      FROM users u
+      WHERE u.id = $1
+      LIMIT 1
+      `,
+      [userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: "User not found",
+        message: "The authenticated user does not exist.",
+      });
+    }
+
+    const user = result.rows[0];
+
+    return res.status(200).json({
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+
+        display_name:
+          user.display_name ||
+          user.username,
+
+        bio: user.bio || "",
+        location: user.location || "",
+        website: user.website || "",
+
+        profile_url:
+          user.profile_url ||
+          user.profile_pic ||
+          user.profile_picture ||
+          user.avatar_url ||
+          null,
+
+        cover_url:
+          user.cover_url ||
+          user.cover_photo ||
+          null,
+
+        is_verified:
+          user.is_verified === true ||
+          user.is_verified === 1 ||
+          user.is_verified === "1" ||
+          user.verified === true,
+
+        role: user.role || "user",
+
+        subscribers_count:
+          Number(user.subscribers_count) || 0,
+
+        total_views:
+          Number(user.total_views) || 0,
+
+        video_count:
+          Number(user.video_count) || 0,
+
+        short_count:
+          Number(user.short_count) || 0,
+      },
+    });
+  } catch (error) {
+    console.error(
+      "GET /api/users/profile error:",
+      error
+    );
+
+    return res.status(500).json({
+      error: "Failed to load profile",
+      message: error.message,
+    });
+  }
+});
 
 // ============================================================
 // UPDATE OWN PROFILE
