@@ -6354,7 +6354,6 @@ app.post("/api/livestreams/end/:streamId", authenticateToken, async (req, res) =
 // AGORA TOKEN ROUTE
 app.post("/api/agora/token", authenticateToken, async (req, res) => {
   try {
-    const userId = req.userId;
     const { channelName } = req.body;
 
     if (!channelName) {
@@ -6363,11 +6362,26 @@ app.post("/api/agora/token", authenticateToken, async (req, res) => {
       });
     }
 
-    if (!AGORA_APP_ID || !AGORA_APP_CERTIFICATE) {
-      return res.status(500).json({
-        error: "Agora not configured"
+    const { rows } = await pool.query(
+      `
+      SELECT id, public_id, username
+      FROM users
+      WHERE id = $1
+      `,
+      [req.user.id]
+    );
+
+    if (!rows.length) {
+      return res.status(401).json({
+        error: "Authenticated user not found"
       });
     }
+
+    const user = rows[0];
+
+    const uuid = String(user.public_id);
+
+    const agoraUid = uuidToAgoraUid(uuid);
 
     const expirationTimeInSeconds = 86400;
     const currentTimestamp = Math.floor(Date.now() / 1000);
@@ -6378,7 +6392,7 @@ app.post("/api/agora/token", authenticateToken, async (req, res) => {
       AGORA_APP_ID,
       AGORA_APP_CERTIFICATE,
       channelName.toString(),
-      userId,
+      agoraUid,
       RtcRole.PUBLISHER,
       privilegeExpiredTs
     );
@@ -6386,11 +6400,18 @@ app.post("/api/agora/token", authenticateToken, async (req, res) => {
     res.json({
       appId: AGORA_APP_ID,
       token,
-      uid: userId,
       channelName,
+      uid: agoraUid,
+
+      // Application identity
+      uuid,
+
+      // Useful for debugging/server-side mapping
+      userId: user.id,
+      username: user.username,
+
       expiresIn: expirationTimeInSeconds
     });
-
   } catch (err) {
     console.error("Agora token error:", err);
 
@@ -6566,18 +6587,53 @@ app.post('/api/subscriptions/checkout', async (req, res) => {
   }
 });
 
-// GET /api/users/me (if you don't already have this exact route)
-app.get("/api/users/me", authenticateREST, async (req, res) => {
+app.get("/api/users/me", authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      "SELECT id, username, name, email, profile_url, role, status, dob, subscription_plan, subscription_expires, balance, earnings FROM users WHERE id = $1",
+      `
+      SELECT
+        id,
+        public_id,
+        username,
+        email,
+        profile_url,
+        cover_url,
+        bio,
+        is_musician,
+        is_creator,
+        is_verified,
+        role,
+        subscription_plan,
+        preferences,
+        notification_style
+      FROM users
+      WHERE id = $1
+      `,
       [req.user.id]
     );
-    if (rows.length === 0) return res.status(404).json({ error: "User not found" });
-    res.json({ user: rows[0] });
+
+    if (!rows.length) {
+      return res.status(404).json({
+        error: "User not found"
+      });
+    }
+
+    const user = rows[0];
+
+    res.json({
+      user: {
+        ...user,
+
+        // UUID used by the frontend
+        uuid: user.public_id
+      }
+    });
   } catch (err) {
-    console.error("Fetch me error:", err.message);
-    res.status(500).json({ error: "Failed to fetch user" });
+    console.error("GET /api/users/me error:", err);
+
+    res.status(500).json({
+      error: "Failed to fetch user"
+    });
   }
 });
 
