@@ -1,7 +1,7 @@
-FROM node:18-bullseye
+FROM node:18-bookworm
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     python3 \
     make \
@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY package*.json ./
+
 RUN npm install
 
 COPY . .
