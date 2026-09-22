@@ -9903,41 +9903,7 @@ app.delete('/api/notifications/read', authenticateToken, async (req, res) => {
   }
 });
 
-// ==========================================
-// NOTIFICATION HELPERS FOR OTHER FEATURES
-// ==========================================
 
-// Helper: Get notification link based on type
-function getNotificationLink(type, data) {
-  switch (type) {
-    case 'like':
-    case 'comment':
-      return data?.videoId ? `/watch/${data.videoId}` : null;
-    case 'follow':
-      return data?.followerId ? `/viewprofile/${data.followerId}` : null;
-    case 'mention':
-      return data?.videoId ? `/watch/${data.videoId}` : null;
-    case 'login':
-    case 'Login':
-      return null; // Opens modal, no navigation
-    case 'warning':
-    case 'Warning':
-      return null; // Opens modal, no navigation
-    case 'app_update':
-    case 'App Update':
-      return null; // Opens modal, no navigation
-    case 'subscription':
-      return '/profile';
-    case 'merch_order':
-      return data?.orderId ? `/orders/${data.orderId}` : '/shop';
-    case 'tip_received':
-      return data?.streamId ? `/live/${data.streamId}` : '/earnings';
-    case 'call_missed':
-      return data?.callerId ? `/messages` : null;
-    default:
-      return null;
-  }
-}
 
 // Helper: Create like notification
 async function notifyLike(videoOwnerId, likerId, videoId) {
