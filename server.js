@@ -5646,219 +5646,6 @@ app.get('/api/test-db', async (req, res) => {
   }
 });
 
-// ============================================================
-// GET CURRENT USER PROFILE
-// GET /api/users/profile
-// ============================================================
-app.get("/api/users/profile", authenticateToken, async (req, res) => {
-  console.log("🔥 PROFILE ROUTE HIT");
-  console.log("req.user:", req.user);
-
-  return res.json({
-    success: true,
-    message: "PROFILE ROUTE IS WORKING",
-    userId: req.user?.id || null
-  });
-});
-
-// ============================================================
-// UPDATE OWN PROFILE
-// ============================================================
-app.put('/api/users/profile', authenticateToken, async (req, res) => {
-  try {
-    // authenticateToken already verified the JWT
-    // and populated req.userId.
-    const userId = req.userId;
-
-    if (!userId) {
-      return res.status(401).json({
-        error: 'Not authenticated'
-      });
-    }
-
-    console.log('✏️ Updating profile for user ID:', userId);
-
-    let {
-      display_name,
-      bio,
-      location,
-      website
-    } = req.body;
-
-    // ------------------------------------------------------------
-    // DISPLAY NAME
-    // ------------------------------------------------------------
-    if (display_name !== undefined) {
-      display_name = String(display_name).trim();
-
-      if (!display_name) {
-        return res.status(400).json({
-          error: 'Display name cannot be empty'
-        });
-      }
-    }
-
-    // ------------------------------------------------------------
-    // BIO
-    // ------------------------------------------------------------
-    if (bio !== undefined) {
-      bio = String(bio).trim();
-    }
-
-    // ------------------------------------------------------------
-    // LOCATION
-    // ------------------------------------------------------------
-    if (location !== undefined) {
-      location = String(location).trim();
-    }
-
-    // ------------------------------------------------------------
-    // WEBSITE
-    // ------------------------------------------------------------
-    if (website !== undefined) {
-      website = String(website).trim();
-
-      if (
-        website &&
-        !/^https?:\/\//i.test(website)
-      ) {
-        website = `https://${website}`;
-      }
-    }
-
-    // ------------------------------------------------------------
-    // BUILD UPDATE QUERY
-    // ------------------------------------------------------------
-    const updates = [];
-    const params = [];
-    let paramIndex = 1;
-
-    if (display_name !== undefined) {
-      updates.push(
-        `display_name = $${paramIndex++}`
-      );
-      params.push(display_name);
-    }
-
-    if (bio !== undefined) {
-      updates.push(
-        `bio = $${paramIndex++}`
-      );
-      params.push(bio);
-    }
-
-    if (location !== undefined) {
-      updates.push(
-        `location = $${paramIndex++}`
-      );
-      params.push(location);
-    }
-
-    if (website !== undefined) {
-      updates.push(
-        `website = $${paramIndex++}`
-      );
-      params.push(website || null);
-    }
-
-    // ------------------------------------------------------------
-    // NOTHING TO UPDATE
-    // ------------------------------------------------------------
-    if (!updates.length) {
-      return res.status(400).json({
-        error: 'Nothing to update'
-      });
-    }
-
-    // ------------------------------------------------------------
-    // UPDATE USER
-    // ------------------------------------------------------------
-    const query = `
-      UPDATE users
-      SET ${updates.join(', ')}
-      WHERE id = $${paramIndex}
-      RETURNING
-        id,
-        username,
-        email,
-        display_name,
-        bio,
-        location,
-        website,
-        profile_url,
-        cover_url,
-        is_verified,
-        role
-    `;
-
-    const { rows } = await pool.query(query, [
-      ...params,
-      userId
-    ]);
-
-    // ------------------------------------------------------------
-    // USER NOT FOUND
-    // ------------------------------------------------------------
-    if (!rows.length) {
-      console.error(
-        '❌ Could not update profile. User does not exist:',
-        userId
-      );
-
-      return res.status(404).json({
-        error: 'User not found'
-      });
-    }
-
-    const user = rows[0];
-
-    // ------------------------------------------------------------
-    // RESPONSE
-    // ------------------------------------------------------------
-    return res.json({
-      success: true,
-
-      user: {
-        id: user.id,
-        user_id: user.id,
-
-        username: user.username,
-
-        email: user.email,
-
-        display_name: user.display_name || '',
-        displayName: user.display_name || '',
-
-        bio: user.bio || '',
-
-        location: user.location || '',
-
-        website: user.website || '',
-
-        profile_url: user.profile_url || null,
-        profilePicture: user.profile_url || null,
-
-        cover_url: user.cover_url || null,
-        coverPhoto: user.cover_url || null,
-
-        is_verified: Boolean(user.is_verified),
-        verified: Boolean(user.is_verified),
-
-        role: user.role || 'user',
-
-        isSelf: true
-      }
-    });
-
-  } catch (err) {
-    console.error('🔥 Update profile error:', err);
-
-    return res.status(500).json({
-      error: 'Failed to update profile'
-    });
-  }
-});
-
 // Cleanup stale streams for a user
 app.post("/api/livestreams/cleanup", authenticateToken, async (req, res) => {
   try {
@@ -5884,131 +5671,208 @@ app.post("/api/livestreams/cleanup", authenticateToken, async (req, res) => {
   }
 });
 
-// Get current user's videos
-app.get('/api/users/my/videos', authenticateToken, async (req, res) => {
-  try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Not authenticated' });
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(50, parseInt(req.query.limit) || 20);
-    const offset = (page - 1) * limit;
-
-    const { rows } = await pool.query(
-      `SELECT * FROM videos 
-       WHERE user_id = $1 AND is_short = false AND is_public = true 
-       ORDER BY created_at DESC 
-       LIMIT $2 OFFSET $3`,
-      [decoded.id, limit, offset]
-    );
-
-    res.json({ data: rows, page, limit });
-  } catch (err) {
-    console.error('Get my videos error:', err);
-    res.status(500).json({ error: 'Failed to fetch videos' });
-  }
-});
-
-// Get current user's shorts
-app.get('/api/users/my/shorts', authenticateToken, async (req, res) => {
-  try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Not authenticated' });
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(50, parseInt(req.query.limit) || 20);
-    const offset = (page - 1) * limit;
-
-    const { rows } = await pool.query(
-      `SELECT * FROM videos 
-       WHERE user_id = $1 AND is_short = true AND is_public = true 
-       ORDER BY created_at DESC 
-       LIMIT $2 OFFSET $3`,
-      [decoded.id, limit, offset]
-    );
-
-    res.json({ data: rows, page, limit });
-  } catch (err) {
-    console.error('Get my shorts error:', err);
-    res.status(500).json({ error: 'Failed to fetch shorts' });
-  }
-});
-
 // Upload profile picture
-app.post('/api/users/profile/pic', authenticateToken, async (req, res) => {
-  try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Not authenticated' });
-    if (!s3) return res.status(500).json({ error: 'S3 not configured' });
+// ============================================================
+// UPLOAD PROFILE PICTURE
+// POST /api/users/profile/pic
+// ============================================================
+app.post(
+  "/api/users/profile/pic",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId = Number(req.user?.id);
 
-    const decoded = jwt.verify(token, JWT_SECRET);
+      if (!userId || Number.isNaN(userId)) {
+        return res.status(401).json({
+          success: false,
+          error: "Authentication required",
+        });
+      }
 
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+      if (!s3) {
+        return res.status(500).json({
+          success: false,
+          error: "S3 not configured",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          error: "No file uploaded",
+        });
+      }
+
+      const safeName = String(
+        req.file.originalname || "profile"
+      )
+        .replace(/[^a-zA-Z0-9._-]/g, "_")
+        .slice(0, 100);
+
+      const key =
+        `profile-pics/${userId}/` +
+        `${Date.now()}-${safeName}`;
+
+      const buffer = await sharp(
+        req.file.buffer
+      )
+        .resize(400, 400, {
+          fit: "cover",
+        })
+        .png()
+        .toBuffer();
+
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: S3_BUCKET_NAME,
+          Key: key,
+          Body: buffer,
+          ContentType: "image/png",
+        })
+      );
+
+      const url =
+        AWS_CLOUDFRONT_DOMAIN
+          ? `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`
+          : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+
+      await pool.query(
+        `
+        UPDATE users
+        SET
+          profile_url = $1,
+          updated_at = NOW()
+        WHERE id = $2
+        `,
+        [
+          url,
+          userId,
+        ]
+      );
+
+      return res.json({
+        success: true,
+
+        profile_url: url,
+        profileUrl: url,
+        avatar: url,
+        profilePicture: url,
+      });
+    } catch (err) {
+      console.error(
+        "Upload profile pic error:",
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to upload profile picture",
+      });
     }
-
-    const key = `profile-pics/${decoded.id}/${Date.now()}-${req.file.originalname}`;
-    const buffer = await sharp(req.file.buffer).resize(400, 400, { fit: 'cover' }).png().toBuffer();
-
-    await s3.send(new PutObjectCommand({
-      Bucket: S3_BUCKET_NAME,
-      Key: key,
-      Body: buffer,
-      ContentType: 'image/png',
-    }));
-
-    const url = `https://${AWS_CLOUDFRONT_DOMAIN || `s3.${AWS_REGION}.amazonaws.com`}/${S3_BUCKET_NAME}/${key}`;
-
-    await pool.query(
-      'UPDATE users SET profile_url = $1 WHERE id = $2',
-      [url, decoded.id]
-    );
-
-    res.json({ success: true, profile_url: url });
-  } catch (err) {
-    console.error('Upload profile pic error:', err);
-    res.status(500).json({ error: 'Failed to upload profile picture' });
   }
-});
+);
 
-// Upload cover photo
-app.post('/api/users/cover', authenticateToken, async (req, res) => {
-  try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Not authenticated' });
-    if (!s3) return res.status(500).json({ error: 'S3 not configured' });
 
-    const decoded = jwt.verify(token, JWT_SECRET);
+// ============================================================
+// UPLOAD COVER PHOTO
+// POST /api/users/cover
+// ============================================================
+app.post(
+  "/api/users/cover",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId = Number(req.user?.id);
 
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+      if (!userId || Number.isNaN(userId)) {
+        return res.status(401).json({
+          success: false,
+          error: "Authentication required",
+        });
+      }
+
+      if (!s3) {
+        return res.status(500).json({
+          success: false,
+          error: "S3 not configured",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          error: "No file uploaded",
+        });
+      }
+
+      const safeName = String(
+        req.file.originalname || "cover"
+      )
+        .replace(/[^a-zA-Z0-9._-]/g, "_")
+        .slice(0, 100);
+
+      const key =
+        `cover-photos/${userId}/` +
+        `${Date.now()}-${safeName}`;
+
+      const buffer = await sharp(
+        req.file.buffer
+      )
+        .resize(1500, 500, {
+          fit: "cover",
+        })
+        .png()
+        .toBuffer();
+
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: S3_BUCKET_NAME,
+          Key: key,
+          Body: buffer,
+          ContentType: "image/png",
+        })
+      );
+
+      const url =
+        AWS_CLOUDFRONT_DOMAIN
+          ? `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`
+          : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+
+      await pool.query(
+        `
+        UPDATE users
+        SET
+          cover_url = $1,
+          updated_at = NOW()
+        WHERE id = $2
+        `,
+        [
+          url,
+          userId,
+        ]
+      );
+
+      return res.json({
+        success: true,
+
+        cover_url: url,
+        coverUrl: url,
+        coverPhoto: url,
+      });
+    } catch (err) {
+      console.error(
+        "Upload cover error:",
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to upload cover photo",
+      });
     }
-
-    const key = `cover-photos/${decoded.id}/${Date.now()}-${req.file.originalname}`;
-    const buffer = await sharp(req.file.buffer).resize(1500, 500, { fit: 'cover' }).png().toBuffer();
-
-    await s3.send(new PutObjectCommand({
-      Bucket: S3_BUCKET_NAME,
-      Key: key,
-      Body: buffer,
-      ContentType: 'image/png',
-    }));
-
-    const url = `https://${AWS_CLOUDFRONT_DOMAIN || `s3.${AWS_REGION}.amazonaws.com`}/${S3_BUCKET_NAME}/${key}`;
-
-    await pool.query(
-      'UPDATE users SET cover_url = $1 WHERE id = $2',
-      [url, decoded.id]
-    );
-
-    res.json({ success: true, cover_url: url });
-  } catch (err) {
-    console.error('Upload cover error:', err);
-    res.status(500).json({ error: 'Failed to upload cover photo' });
   }
-});
+);
 
 // ==========================================
 // MUSIC TRACKS
@@ -6601,8 +6465,21 @@ app.post('/api/subscriptions/checkout', async (req, res) => {
   }
 });
 
+// ============================================================
+// GET CURRENT USER
+// GET /api/users/me
+// ============================================================
 app.get("/api/users/me", authenticateToken, async (req, res) => {
   try {
+    const userId = Number(req.user?.id);
+
+    if (!userId || Number.isNaN(userId)) {
+      return res.status(401).json({
+        success: false,
+        error: "Authentication required",
+      });
+    }
+
     const { rows } = await pool.query(
       `
       SELECT
@@ -6610,46 +6487,897 @@ app.get("/api/users/me", authenticateToken, async (req, res) => {
         public_id,
         username,
         email,
+        name,
+        display_name,
+        phone,
         profile_url,
         cover_url,
         bio,
+        location,
+        website,
+        social_links,
         is_musician,
         is_creator,
+        is_admin,
         is_verified,
+        verified,
         role,
         subscription_plan,
+        subscription_expires,
         preferences,
-        notification_style
+        notification_style,
+        status,
+        followers_count,
+        following_count,
+        created_at,
+        updated_at
       FROM users
       WHERE id = $1
+      LIMIT 1
       `,
-      [req.user.id]
+      [userId]
     );
 
     if (!rows.length) {
       return res.status(404).json({
-        error: "User not found"
+        success: false,
+        error: "User not found",
       });
     }
 
     const user = rows[0];
 
-    res.json({
+    const displayName =
+      user.display_name ||
+      user.name ||
+      user.username ||
+      "";
+
+    const verified =
+      Boolean(user.is_verified) ||
+      Boolean(user.verified);
+
+    return res.json({
+      success: true,
+
       user: {
         ...user,
 
-        // UUID used by the frontend
-        uuid: user.public_id
-      }
+        id: user.id,
+        user_id: user.id,
+
+        uuid: user.public_id,
+        publicId: user.public_id,
+
+        username: user.username,
+        email: user.email,
+
+        name: displayName,
+        displayName,
+        display_name: user.display_name || "",
+
+        profileUrl: user.profile_url || null,
+        profile_url: user.profile_url || null,
+        avatar: user.profile_url || null,
+        profilePicture: user.profile_url || null,
+
+        coverUrl: user.cover_url || null,
+        cover_url: user.cover_url || null,
+        coverPhoto: user.cover_url || null,
+
+        bio: user.bio || "",
+        location: user.location || "",
+        website: user.website || "",
+
+        socialLinks: user.social_links || {},
+        social_links: user.social_links || {},
+
+        isMusician: Boolean(user.is_musician),
+        is_musician: Boolean(user.is_musician),
+
+        isCreator: Boolean(user.is_creator),
+        is_creator: Boolean(user.is_creator),
+
+        isAdmin: Boolean(user.is_admin),
+        is_admin: Boolean(user.is_admin),
+
+        isVerified: verified,
+        is_verified: verified,
+        verified,
+
+        role: user.role || "free",
+
+        subscriptionPlan:
+          user.subscription_plan || "free",
+
+        subscriptionExpires:
+          user.subscription_expires || null,
+
+        status: user.status || "active",
+
+        isSelf: true,
+      },
     });
   } catch (err) {
     console.error("GET /api/users/me error:", err);
 
-    res.status(500).json({
-      error: "Failed to fetch user"
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch user",
     });
   }
 });
+
+
+// ============================================================
+// GET CURRENT USER PROFILE
+// GET /api/users/profile
+// ============================================================
+app.get(
+  "/api/users/profile",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId = Number(req.user?.id);
+
+      if (!userId || Number.isNaN(userId)) {
+        console.warn(
+          "[PROFILE] Invalid authenticated user:",
+          req.user
+        );
+
+        return res.status(401).json({
+          success: false,
+          error: "Authentication required",
+        });
+      }
+
+      console.log(
+        "[PROFILE] Loading profile for user:",
+        userId
+      );
+
+      // ----------------------------------------------------------
+      // USER
+      // ----------------------------------------------------------
+      const userResult = await pool.query(
+        `
+        SELECT
+          id,
+          public_id,
+          username,
+          email,
+          name,
+          display_name,
+          phone,
+          profile_url,
+          cover_url,
+          bio,
+          location,
+          website,
+          social_links,
+          role,
+          subscription_plan,
+          subscription_expires,
+          is_musician,
+          is_creator,
+          is_admin,
+          is_verified,
+          verified,
+          status,
+          followers_count,
+          following_count,
+          created_at,
+          updated_at
+        FROM users
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [userId]
+      );
+
+      if (!userResult.rows.length) {
+        console.warn(
+          "[PROFILE] User not found:",
+          userId
+        );
+
+        return res.status(404).json({
+          success: false,
+          error: "User not found",
+        });
+      }
+
+      const user = userResult.rows[0];
+
+      // ----------------------------------------------------------
+      // FOLLOW COUNTS
+      // ----------------------------------------------------------
+      const countsResult = await pool.query(
+        `
+        SELECT
+          (
+            SELECT COUNT(*)
+            FROM follows
+            WHERE following_id = $1
+              AND status = 'accepted'
+          )::integer AS followers_count,
+
+          (
+            SELECT COUNT(*)
+            FROM follows
+            WHERE follower_id = $1
+              AND status = 'accepted'
+          )::integer AS following_count
+        `,
+        [userId]
+      );
+
+      const counts = countsResult.rows[0] || {};
+
+      const followersCount = Number(
+        counts.followers_count || 0
+      );
+
+      const followingCount = Number(
+        counts.following_count || 0
+      );
+
+      // ----------------------------------------------------------
+      // VIDEOS
+      // ----------------------------------------------------------
+      const videosResult = await pool.query(
+        `
+        SELECT
+          id,
+          title,
+          description,
+          video_url,
+          file_url,
+          thumbnail_url,
+          duration,
+          tags,
+          category,
+          is_public,
+          is_short,
+          is_live,
+          processing_status,
+          status,
+          views,
+          likes,
+          dislikes,
+          comments_count,
+          shares,
+          created_at,
+          updated_at
+        FROM videos
+        WHERE user_id = $1
+          AND is_short = false
+          AND (
+            is_public = true
+            OR user_id = $1
+          )
+        ORDER BY created_at DESC
+        `,
+        [userId]
+      );
+
+      // ----------------------------------------------------------
+      // SHORTS
+      // ----------------------------------------------------------
+      const shortsResult = await pool.query(
+        `
+        SELECT
+          id,
+          title,
+          description,
+          video_url,
+          file_url,
+          thumbnail_url,
+          duration,
+          tags,
+          category,
+          is_public,
+          is_short,
+          is_live,
+          processing_status,
+          status,
+          views,
+          likes,
+          dislikes,
+          comments_count,
+          shares,
+          created_at,
+          updated_at
+        FROM videos
+        WHERE user_id = $1
+          AND is_short = true
+          AND (
+            is_public = true
+            OR user_id = $1
+          )
+        ORDER BY created_at DESC
+        `,
+        [userId]
+      );
+
+      // ----------------------------------------------------------
+      // DISPLAY NAME
+      // ----------------------------------------------------------
+      const displayName =
+        user.display_name ||
+        user.name ||
+        user.username ||
+        "";
+
+      // ----------------------------------------------------------
+      // VERIFIED
+      // ----------------------------------------------------------
+      const verified =
+        Boolean(user.is_verified) ||
+        Boolean(user.verified);
+
+      // ----------------------------------------------------------
+      // PROFILE OBJECT
+      // ----------------------------------------------------------
+      const profile = {
+        id: user.id,
+        user_id: user.id,
+
+        publicId: user.public_id,
+        public_id: user.public_id,
+
+        uuid: user.public_id,
+
+        username: user.username,
+
+        email: user.email,
+
+        name: displayName,
+        displayName: displayName,
+        display_name: user.display_name || "",
+
+        phone: user.phone || null,
+
+        profileUrl:
+          user.profile_url || null,
+
+        profile_url:
+          user.profile_url || null,
+
+        avatar:
+          user.profile_url || null,
+
+        profilePicture:
+          user.profile_url || null,
+
+        coverUrl:
+          user.cover_url || null,
+
+        cover_url:
+          user.cover_url || null,
+
+        coverPhoto:
+          user.cover_url || null,
+
+        bio:
+          user.bio || "",
+
+        location:
+          user.location || "",
+
+        website:
+          user.website || "",
+
+        socialLinks:
+          user.social_links || {},
+
+        social_links:
+          user.social_links || {},
+
+        role:
+          user.role || "free",
+
+        subscriptionPlan:
+          user.subscription_plan || "free",
+
+        subscription_plan:
+          user.subscription_plan || "free",
+
+        subscriptionExpires:
+          user.subscription_expires || null,
+
+        isMusician:
+          Boolean(user.is_musician),
+
+        is_musician:
+          Boolean(user.is_musician),
+
+        isCreator:
+          Boolean(user.is_creator),
+
+        is_creator:
+          Boolean(user.is_creator),
+
+        isAdmin:
+          Boolean(user.is_admin),
+
+        is_admin:
+          Boolean(user.is_admin),
+
+        isVerified:
+          verified,
+
+        is_verified:
+          verified,
+
+        verified,
+
+        status:
+          user.status || "active",
+
+        followersCount:
+          followersCount,
+
+        followingCount:
+          followingCount,
+
+        followers_count:
+          followersCount,
+
+        following_count:
+          followingCount,
+
+        createdAt:
+          user.created_at,
+
+        updatedAt:
+          user.updated_at,
+
+        created_at:
+          user.created_at,
+
+        updated_at:
+          user.updated_at,
+
+        videos:
+          videosResult.rows,
+
+        shorts:
+          shortsResult.rows,
+
+        videoCount:
+          videosResult.rows.length,
+
+        shortsCount:
+          shortsResult.rows.length,
+
+        isSelf: true,
+      };
+
+      console.log(
+        `[PROFILE] Returning profile for ${user.username} (${user.id})`
+      );
+
+      return res.status(200).json({
+        success: true,
+        user: profile,
+        profile,
+      });
+    } catch (error) {
+      console.error(
+        "[PROFILE] Get profile error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load profile",
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// UPDATE OWN PROFILE
+// PUT /api/users/profile
+// ============================================================
+app.put(
+  "/api/users/profile",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId = Number(req.user?.id);
+
+      if (!userId || Number.isNaN(userId)) {
+        return res.status(401).json({
+          success: false,
+          error: "Authentication required",
+        });
+      }
+
+      console.log(
+        "✏️ Updating profile for user ID:",
+        userId
+      );
+
+      let {
+        display_name,
+        bio,
+        location,
+        website,
+      } = req.body;
+
+      // ----------------------------------------------------------
+      // DISPLAY NAME
+      // ----------------------------------------------------------
+      if (display_name !== undefined) {
+        display_name = String(
+          display_name
+        ).trim();
+
+        if (!display_name) {
+          return res.status(400).json({
+            success: false,
+            error: "Display name cannot be empty",
+          });
+        }
+      }
+
+      // ----------------------------------------------------------
+      // BIO
+      // ----------------------------------------------------------
+      if (bio !== undefined) {
+        bio = String(bio).trim();
+      }
+
+      // ----------------------------------------------------------
+      // LOCATION
+      // ----------------------------------------------------------
+      if (location !== undefined) {
+        location = String(location).trim();
+      }
+
+      // ----------------------------------------------------------
+      // WEBSITE
+      // ----------------------------------------------------------
+      if (website !== undefined) {
+        website = String(website).trim();
+
+        if (
+          website &&
+          !/^https?:\/\//i.test(website)
+        ) {
+          website = `https://${website}`;
+        }
+      }
+
+      // ----------------------------------------------------------
+      // BUILD UPDATE
+      // ----------------------------------------------------------
+      const updates = [];
+      const params = [];
+      let paramIndex = 1;
+
+      if (display_name !== undefined) {
+        updates.push(
+          `display_name = $${paramIndex++}`
+        );
+
+        params.push(display_name);
+      }
+
+      if (bio !== undefined) {
+        updates.push(
+          `bio = $${paramIndex++}`
+        );
+
+        params.push(bio);
+      }
+
+      if (location !== undefined) {
+        updates.push(
+          `location = $${paramIndex++}`
+        );
+
+        params.push(location);
+      }
+
+      if (website !== undefined) {
+        updates.push(
+          `website = $${paramIndex++}`
+        );
+
+        params.push(
+          website || null
+        );
+      }
+
+      if (!updates.length) {
+        return res.status(400).json({
+          success: false,
+          error: "Nothing to update",
+        });
+      }
+
+      // ----------------------------------------------------------
+      // UPDATE
+      // ----------------------------------------------------------
+      const query = `
+        UPDATE users
+        SET
+          ${updates.join(", ")},
+          updated_at = NOW()
+        WHERE id = $${paramIndex}
+        RETURNING
+          id,
+          public_id,
+          username,
+          email,
+          name,
+          display_name,
+          bio,
+          location,
+          website,
+          profile_url,
+          cover_url,
+          is_verified,
+          verified,
+          role
+      `;
+
+      const { rows } = await pool.query(
+        query,
+        [
+          ...params,
+          userId,
+        ]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({
+          success: false,
+          error: "User not found",
+        });
+      }
+
+      const user = rows[0];
+
+      const displayName =
+        user.display_name ||
+        user.name ||
+        user.username ||
+        "";
+
+      const verified =
+        Boolean(user.is_verified) ||
+        Boolean(user.verified);
+
+      return res.json({
+        success: true,
+
+        user: {
+          id: user.id,
+          user_id: user.id,
+
+          uuid: user.public_id,
+          publicId: user.public_id,
+
+          username: user.username,
+
+          email: user.email,
+
+          name: displayName,
+          displayName,
+          display_name:
+            user.display_name || "",
+
+          bio:
+            user.bio || "",
+
+          location:
+            user.location || "",
+
+          website:
+            user.website || "",
+
+          profileUrl:
+            user.profile_url || null,
+
+          profile_url:
+            user.profile_url || null,
+
+          profilePicture:
+            user.profile_url || null,
+
+          avatar:
+            user.profile_url || null,
+
+          coverUrl:
+            user.cover_url || null,
+
+          cover_url:
+            user.cover_url || null,
+
+          coverPhoto:
+            user.cover_url || null,
+
+          isVerified:
+            verified,
+
+          is_verified:
+            verified,
+
+          verified,
+
+          role:
+            user.role || "free",
+
+          isSelf: true,
+        },
+      });
+    } catch (err) {
+      console.error(
+        "🔥 Update profile error:",
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to update profile",
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// GET CURRENT USER VIDEOS
+// GET /api/users/my/videos
+// ============================================================
+app.get(
+  "/api/users/my/videos",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId = Number(req.user?.id);
+
+      if (!userId || Number.isNaN(userId)) {
+        return res.status(401).json({
+          success: false,
+          error: "Authentication required",
+        });
+      }
+
+      const page = Math.max(
+        1,
+        parseInt(req.query.page, 10) || 1
+      );
+
+      const limit = Math.min(
+        50,
+        Math.max(
+          1,
+          parseInt(req.query.limit, 10) || 20
+        )
+      );
+
+      const offset =
+        (page - 1) * limit;
+
+      const { rows } = await pool.query(
+        `
+        SELECT *
+        FROM videos
+        WHERE user_id = $1
+          AND is_short = false
+          AND is_public = true
+        ORDER BY created_at DESC
+        LIMIT $2
+        OFFSET $3
+        `,
+        [
+          userId,
+          limit,
+          offset,
+        ]
+      );
+
+      return res.json({
+        success: true,
+        data: rows,
+        videos: rows,
+        page,
+        limit,
+      });
+    } catch (err) {
+      console.error(
+        "Get my videos error:",
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to fetch videos",
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// GET CURRENT USER SHORTS
+// GET /api/users/my/shorts
+// ============================================================
+app.get(
+  "/api/users/my/shorts",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId = Number(req.user?.id);
+
+      if (!userId || Number.isNaN(userId)) {
+        return res.status(401).json({
+          success: false,
+          error: "Authentication required",
+        });
+      }
+
+      const page = Math.max(
+        1,
+        parseInt(req.query.page, 10) || 1
+      );
+
+      const limit = Math.min(
+        50,
+        Math.max(
+          1,
+          parseInt(req.query.limit, 10) || 20
+        )
+      );
+
+      const offset =
+        (page - 1) * limit;
+
+      const { rows } = await pool.query(
+        `
+        SELECT *
+        FROM videos
+        WHERE user_id = $1
+          AND is_short = true
+          AND is_public = true
+        ORDER BY created_at DESC
+        LIMIT $2
+        OFFSET $3
+        `,
+        [
+          userId,
+          limit,
+          offset,
+        ]
+      );
+
+      return res.json({
+        success: true,
+        data: rows,
+        shorts: rows,
+        page,
+        limit,
+      });
+    } catch (err) {
+      console.error(
+        "Get my shorts error:",
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to fetch shorts",
+      });
+    }
+  }
+);
 
 // 4. Update Preferences
 app.patch('/api/settings/preferences', authenticateToken, async (req, res) => {
