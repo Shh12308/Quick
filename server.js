@@ -5648,148 +5648,329 @@ app.get('/api/test-db', async (req, res) => {
 
 // ============================================================
 // GET CURRENT USER PROFILE
+// GET /api/users/profile
 // ============================================================
-
-app.get("/api/users/profile", authenticateToken, async (req, res) => {
+app.get("/api/users/profile", async (req, res) => {
   try {
-    // The authenticated user's ID comes from the JWT
-    const userId = req.user?.id;
+    // ----------------------------------------------------------
+    // 1. Get authenticated user ID
+    // ----------------------------------------------------------
+    let userId = null;
 
+    // If your authentication middleware already populated req.user
+    if (req.user?.id) {
+      userId = Number(req.user.id);
+    }
+
+    // Support reqUser as used elsewhere in your server
+    if (!userId && req.reqUser?.id) {
+      userId = Number(req.reqUser.id);
+    }
+
+    // Support reqUserId if your auth middleware sets it
+    if (!userId && req.reqUserId) {
+      userId = Number(req.reqUserId);
+    }
+
+    // ----------------------------------------------------------
+    // 2. Fallback: read JWT from Authorization header
+    // ----------------------------------------------------------
     if (!userId) {
+      const authHeader = req.headers.authorization;
+
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.substring(7);
+
+        try {
+          const decoded = jwt.verify(
+            token,
+            process.env.JWT_SECRET
+          );
+
+          userId = Number(
+            decoded.id ||
+            decoded.userId ||
+            decoded.user_id
+          );
+        } catch (jwtError) {
+          console.error(
+            "[PROFILE] JWT verification failed:",
+            jwtError.message
+          );
+
+          return res.status(401).json({
+            success: false,
+            error: "Invalid or expired authentication token"
+          });
+        }
+      }
+    }
+
+    // ----------------------------------------------------------
+    // 3. Make sure we actually have a user ID
+    // ----------------------------------------------------------
+    if (!userId || Number.isNaN(userId)) {
+      console.warn("[PROFILE] No authenticated user");
+
       return res.status(401).json({
-        error: "Unauthorized",
-        message: "User ID not found in authentication token.",
+        success: false,
+        error: "Authentication required"
       });
     }
 
-    const result = await pool.query(
+    console.log("[PROFILE] Loading profile for user:", userId);
+
+    // ----------------------------------------------------------
+    // 4. Load user
+    // ----------------------------------------------------------
+    const userResult = await pool.query(
       `
       SELECT
-        u.id,
-        u.username,
-        u.email,
-        u.display_name,
-        u.bio,
-        u.location,
-        u.website,
-        u.profile_url,
-        u.profile_pic,
-        u.profile_picture,
-        u.avatar_url,
-        u.cover_url,
-        u.cover_photo,
-        u.is_verified,
-        u.verified,
-        u.role,
-
-        COALESCE(
-          (
-            SELECT COUNT(*)
-            FROM subscriptions s
-            WHERE s.channel_id = u.id
-          ),
-          0
-        ) AS subscribers_count,
-
-        COALESCE(
-          (
-            SELECT SUM(COALESCE(v.views, 0))
-            FROM videos v
-            WHERE v.user_id = u.id
-          ),
-          0
-        ) AS total_views,
-
-        COALESCE(
-          (
-            SELECT COUNT(*)
-            FROM videos v
-            WHERE v.user_id = u.id
-          ),
-          0
-        ) AS video_count,
-
-        COALESCE(
-          (
-            SELECT COUNT(*)
-            FROM shorts sh
-            WHERE sh.user_id = u.id
-          ),
-          0
-        ) AS short_count
-
-      FROM users u
-      WHERE u.id = $1
+        id,
+        public_id,
+        username,
+        email,
+        name,
+        display_name,
+        phone,
+        profile_url,
+        cover_url,
+        bio,
+        location,
+        website,
+        social_links,
+        role,
+        subscription_plan,
+        subscription_expires,
+        is_musician,
+        is_creator,
+        is_admin,
+        is_verified,
+        verified,
+        status,
+        followers_count,
+        following_count,
+        created_at,
+        updated_at
+      FROM users
+      WHERE id = $1
       LIMIT 1
       `,
       [userId]
     );
 
-    if (result.rows.length === 0) {
+    if (userResult.rows.length === 0) {
+      console.warn(
+        "[PROFILE] User not found:",
+        userId
+      );
+
       return res.status(404).json({
-        error: "User not found",
-        message: "The authenticated user does not exist.",
+        success: false,
+        error: "User not found"
       });
     }
 
-    const user = result.rows[0];
+    const user = userResult.rows[0];
+
+    // ----------------------------------------------------------
+    // 5. Get accurate follower/following counts
+    // ----------------------------------------------------------
+    const countsResult = await pool.query(
+      `
+      SELECT
+        (
+          SELECT COUNT(*)
+          FROM follows
+          WHERE following_id = $1
+            AND status = 'accepted'
+        )::integer AS followers_count,
+
+        (
+          SELECT COUNT(*)
+          FROM follows
+          WHERE follower_id = $1
+            AND status = 'accepted'
+        )::integer AS following_count
+      `,
+      [userId]
+    );
+
+    const counts = countsResult.rows[0];
+
+    // ----------------------------------------------------------
+    // 6. Get user's videos
+    // ----------------------------------------------------------
+    const videosResult = await pool.query(
+      `
+      SELECT
+        id,
+        title,
+        description,
+        video_url,
+        file_url,
+        thumbnail_url,
+        duration,
+        tags,
+        category,
+        is_public,
+        is_short,
+        is_live,
+        processing_status,
+        status,
+        views,
+        likes,
+        dislikes,
+        comments_count,
+        shares,
+        created_at,
+        updated_at
+      FROM videos
+      WHERE user_id = $1
+        AND is_short = false
+        AND (
+          is_public = true
+          OR user_id = $1
+        )
+      ORDER BY created_at DESC
+      `,
+      [userId]
+    );
+
+    // ----------------------------------------------------------
+    // 7. Get user's shorts
+    // ----------------------------------------------------------
+    const shortsResult = await pool.query(
+      `
+      SELECT
+        id,
+        title,
+        description,
+        video_url,
+        file_url,
+        thumbnail_url,
+        duration,
+        tags,
+        category,
+        is_public,
+        is_short,
+        is_live,
+        processing_status,
+        status,
+        views,
+        likes,
+        dislikes,
+        comments_count,
+        shares,
+        created_at,
+        updated_at
+      FROM videos
+      WHERE user_id = $1
+        AND is_short = true
+        AND (
+          is_public = true
+          OR user_id = $1
+        )
+      ORDER BY created_at DESC
+      `,
+      [userId]
+    );
+
+    // ----------------------------------------------------------
+    // 8. Return profile
+    // ----------------------------------------------------------
+    const profile = {
+      id: user.id,
+      publicId: user.public_id,
+      username: user.username,
+
+      // Prefer display_name, then name, then username
+      name:
+        user.display_name ||
+        user.name ||
+        user.username,
+
+      displayName:
+        user.display_name ||
+        user.name ||
+        user.username,
+
+      email: user.email,
+
+      profileUrl: user.profile_url || null,
+      avatar: user.profile_url || null,
+
+      coverUrl: user.cover_url || null,
+      bio: user.bio || "",
+      location: user.location || "",
+      website: user.website || "",
+
+      socialLinks: user.social_links || {},
+
+      role: user.role || "free",
+      subscriptionPlan:
+        user.subscription_plan || "free",
+
+      subscriptionExpires:
+        user.subscription_expires || null,
+
+      isMusician: Boolean(user.is_musician),
+      isCreator: Boolean(user.is_creator),
+      isAdmin: Boolean(user.is_admin),
+
+      isVerified:
+        Boolean(user.is_verified) ||
+        Boolean(user.verified),
+
+      verified:
+        Boolean(user.is_verified) ||
+        Boolean(user.verified),
+
+      status: user.status || "active",
+
+      followersCount:
+        Number(counts.followers_count || 0),
+
+      followingCount:
+        Number(counts.following_count || 0),
+
+      // Keep snake_case too in case your frontend
+      // currently expects the database-style names.
+      followers_count:
+        Number(counts.followers_count || 0),
+
+      following_count:
+        Number(counts.following_count || 0),
+
+      createdAt: user.created_at,
+      updatedAt: user.updated_at,
+
+      videos: videosResult.rows,
+      shorts: shortsResult.rows,
+
+      videoCount: videosResult.rows.length,
+      shortsCount: shortsResult.rows.length
+    };
+
+    console.log(
+      `[PROFILE] Returning profile for ${user.username} (${user.id})`
+    );
 
     return res.status(200).json({
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-
-        display_name:
-          user.display_name ||
-          user.username,
-
-        bio: user.bio || "",
-        location: user.location || "",
-        website: user.website || "",
-
-        profile_url:
-          user.profile_url ||
-          user.profile_pic ||
-          user.profile_picture ||
-          user.avatar_url ||
-          null,
-
-        cover_url:
-          user.cover_url ||
-          user.cover_photo ||
-          null,
-
-        is_verified:
-          user.is_verified === true ||
-          user.is_verified === 1 ||
-          user.is_verified === "1" ||
-          user.verified === true,
-
-        role: user.role || "user",
-
-        subscribers_count:
-          Number(user.subscribers_count) || 0,
-
-        total_views:
-          Number(user.total_views) || 0,
-
-        video_count:
-          Number(user.video_count) || 0,
-
-        short_count:
-          Number(user.short_count) || 0,
-      },
+      success: true,
+      user: profile,
+      profile
     });
+
   } catch (error) {
     console.error(
-      "GET /api/users/profile error:",
+      "[PROFILE] Get profile error:",
       error
     );
 
     return res.status(500).json({
-      error: "Failed to load profile",
-      message: error.message,
+      success: false,
+      error: "Failed to load profile"
     });
   }
 });
