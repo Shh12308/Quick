@@ -5652,65 +5652,14 @@ app.get('/api/test-db', async (req, res) => {
 // ============================================================
 app.get("/api/users/profile", authenticateToken, async (req, res) => {
   try {
-    // ----------------------------------------------------------
-    // 1. Get authenticated user ID
-    // ----------------------------------------------------------
-    let userId = null;
+    // authenticateToken has already verified the JWT.
+    // Use the same user ID source as /api/users/me.
+    const userId = Number(req.user?.id);
 
-    // If your authentication middleware already populated req.user
-    if (req.user?.id) {
-      userId = Number(req.user.id);
-    }
-
-    // Support reqUser as used elsewhere in your server
-    if (!userId && req.reqUser?.id) {
-      userId = Number(req.reqUser.id);
-    }
-
-    // Support reqUserId if your auth middleware sets it
-    if (!userId && req.reqUserId) {
-      userId = Number(req.reqUserId);
-    }
-
-    // ----------------------------------------------------------
-    // 2. Fallback: read JWT from Authorization header
-    // ----------------------------------------------------------
-    if (!userId) {
-      const authHeader = req.headers.authorization;
-
-      if (authHeader && authHeader.startsWith("Bearer ")) {
-        const token = authHeader.substring(7);
-
-        try {
-          const decoded = jwt.verify(
-            token,
-            process.env.JWT_SECRET
-          );
-
-          userId = Number(
-            decoded.id ||
-            decoded.userId ||
-            decoded.user_id
-          );
-        } catch (jwtError) {
-          console.error(
-            "[PROFILE] JWT verification failed:",
-            jwtError.message
-          );
-
-          return res.status(401).json({
-            success: false,
-            error: "Invalid or expired authentication token"
-          });
-        }
-      }
-    }
-
-    // ----------------------------------------------------------
-    // 3. Make sure we actually have a user ID
-    // ----------------------------------------------------------
     if (!userId || Number.isNaN(userId)) {
-      console.warn("[PROFILE] No authenticated user");
+      console.error(
+        "[PROFILE] authenticateToken did not provide req.user.id"
+      );
 
       return res.status(401).json({
         success: false,
@@ -5721,7 +5670,7 @@ app.get("/api/users/profile", authenticateToken, async (req, res) => {
     console.log("[PROFILE] Loading profile for user:", userId);
 
     // ----------------------------------------------------------
-    // 4. Load user
+    // 1. Load user
     // ----------------------------------------------------------
     const userResult = await pool.query(
       `
@@ -5759,11 +5708,8 @@ app.get("/api/users/profile", authenticateToken, async (req, res) => {
       [userId]
     );
 
-    if (userResult.rows.length === 0) {
-      console.warn(
-        "[PROFILE] User not found:",
-        userId
-      );
+    if (!userResult.rows.length) {
+      console.warn("[PROFILE] User not found:", userId);
 
       return res.status(404).json({
         success: false,
@@ -5774,7 +5720,7 @@ app.get("/api/users/profile", authenticateToken, async (req, res) => {
     const user = userResult.rows[0];
 
     // ----------------------------------------------------------
-    // 5. Get accurate follower/following counts
+    // 2. Accurate follower/following counts
     // ----------------------------------------------------------
     const countsResult = await pool.query(
       `
@@ -5796,10 +5742,10 @@ app.get("/api/users/profile", authenticateToken, async (req, res) => {
       [userId]
     );
 
-    const counts = countsResult.rows[0];
+    const counts = countsResult.rows[0] || {};
 
     // ----------------------------------------------------------
-    // 6. Get user's videos
+    // 3. User videos
     // ----------------------------------------------------------
     const videosResult = await pool.query(
       `
@@ -5838,7 +5784,7 @@ app.get("/api/users/profile", authenticateToken, async (req, res) => {
     );
 
     // ----------------------------------------------------------
-    // 7. Get user's shorts
+    // 4. User shorts
     // ----------------------------------------------------------
     const shortsResult = await pool.query(
       `
@@ -5877,30 +5823,51 @@ app.get("/api/users/profile", authenticateToken, async (req, res) => {
     );
 
     // ----------------------------------------------------------
-    // 8. Return profile
+    // 5. Build profile
     // ----------------------------------------------------------
+    const displayName =
+      user.display_name ||
+      user.name ||
+      user.username;
+
+    const followersCount =
+      Number(counts.followers_count || 0);
+
+    const followingCount =
+      Number(counts.following_count || 0);
+
+    const verified =
+      Boolean(user.is_verified) ||
+      Boolean(user.verified);
+
     const profile = {
       id: user.id,
+      user_id: user.id,
+
       publicId: user.public_id,
+      public_id: user.public_id,
+
+      uuid: user.public_id,
+
       username: user.username,
 
-      // Prefer display_name, then name, then username
-      name:
-        user.display_name ||
-        user.name ||
-        user.username,
-
-      displayName:
-        user.display_name ||
-        user.name ||
-        user.username,
+      name: displayName,
+      displayName,
+      display_name: user.display_name || "",
 
       email: user.email,
 
+      phone: user.phone || null,
+
       profileUrl: user.profile_url || null,
+      profile_url: user.profile_url || null,
       avatar: user.profile_url || null,
+      profilePicture: user.profile_url || null,
 
       coverUrl: user.cover_url || null,
+      cover_url: user.cover_url || null,
+      coverPhoto: user.cover_url || null,
+
       bio: user.bio || "",
       location: user.location || "",
       website: user.website || "",
@@ -5908,6 +5875,7 @@ app.get("/api/users/profile", authenticateToken, async (req, res) => {
       socialLinks: user.social_links || {},
 
       role: user.role || "free",
+
       subscriptionPlan:
         user.subscription_plan || "free",
 
@@ -5915,41 +5883,38 @@ app.get("/api/users/profile", authenticateToken, async (req, res) => {
         user.subscription_expires || null,
 
       isMusician: Boolean(user.is_musician),
+      is_musician: Boolean(user.is_musician),
+
       isCreator: Boolean(user.is_creator),
+      is_creator: Boolean(user.is_creator),
+
       isAdmin: Boolean(user.is_admin),
 
-      isVerified:
-        Boolean(user.is_verified) ||
-        Boolean(user.verified),
-
-      verified:
-        Boolean(user.is_verified) ||
-        Boolean(user.verified),
+      isVerified: verified,
+      is_verified: verified,
+      verified,
 
       status: user.status || "active",
 
-      followersCount:
-        Number(counts.followers_count || 0),
+      followersCount,
+      followers_count: followersCount,
 
-      followingCount:
-        Number(counts.following_count || 0),
-
-      // Keep snake_case too in case your frontend
-      // currently expects the database-style names.
-      followers_count:
-        Number(counts.followers_count || 0),
-
-      following_count:
-        Number(counts.following_count || 0),
+      followingCount,
+      following_count: followingCount,
 
       createdAt: user.created_at,
+      created_at: user.created_at,
+
       updatedAt: user.updated_at,
+      updated_at: user.updated_at,
 
       videos: videosResult.rows,
       shorts: shortsResult.rows,
 
       videoCount: videosResult.rows.length,
-      shortsCount: shortsResult.rows.length
+      shortsCount: shortsResult.rows.length,
+
+      isSelf: true
     };
 
     console.log(
@@ -5963,10 +5928,7 @@ app.get("/api/users/profile", authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
-    console.error(
-      "[PROFILE] Get profile error:",
-      error
-    );
+    console.error("[PROFILE] Get profile error:", error);
 
     return res.status(500).json({
       success: false,
