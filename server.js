@@ -5650,7 +5650,7 @@ app.get('/api/test-db', async (req, res) => {
 // GET CURRENT USER PROFILE
 // GET /api/users/profile
 // ============================================================
-app.get("/api/users/profile", async (req, res) => {
+app.get("/api/users/profile", authenticateToken, async (req, res) => {
   try {
     // ----------------------------------------------------------
     // 1. Get authenticated user ID
@@ -6199,7 +6199,7 @@ app.post("/api/livestreams/cleanup", authenticateToken, async (req, res) => {
 });
 
 // Get current user's videos
-app.get('/api/users/my/videos', async (req, res) => {
+app.get('/api/users/my/videos', authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Not authenticated' });
@@ -6225,7 +6225,7 @@ app.get('/api/users/my/videos', async (req, res) => {
 });
 
 // Get current user's shorts
-app.get('/api/users/my/shorts', async (req, res) => {
+app.get('/api/users/my/shorts', authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Not authenticated' });
@@ -6251,7 +6251,7 @@ app.get('/api/users/my/shorts', async (req, res) => {
 });
 
 // Upload profile picture
-app.post('/api/users/profile/pic', async (req, res) => {
+app.post('/api/users/profile/pic', authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Not authenticated' });
@@ -6288,7 +6288,7 @@ app.post('/api/users/profile/pic', async (req, res) => {
 });
 
 // Upload cover photo
-app.post('/api/users/cover', async (req, res) => {
+app.post('/api/users/cover', authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Not authenticated' });
