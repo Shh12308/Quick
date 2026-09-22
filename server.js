@@ -8801,35 +8801,24 @@ async function createNotification(userId, senderId, type, title, message, data =
     return null;
   }
 }
-
 // ============================================================
 // NOTIFICATIONS
 // ============================================================
 
-// ------------------------------------------------------------
 // GET /api/notifications
-// Get current user's notifications
-// ------------------------------------------------------------
-app.get('/api/notifications', authenticateToken, async (req, res) => {
+app.get("/api/notifications", authenticateToken, async (req, res) => {
   try {
-    // Support both authentication styles used in the server.
-    const userId =
-      req.user?.id ||
-      req.userId;
+    // Support both styles used by your authentication middleware.
+    const userId = req.user?.id || req.userId;
 
     if (!userId) {
       return res.status(401).json({
         success: false,
-        error: 'Not authenticated',
+        error: "Not authenticated",
         notifications: [],
-        unreadCount: 0
+        unreadCount: 0,
       });
     }
-
-    console.log(
-      '🔔 GET /api/notifications - User:',
-      userId
-    );
 
     const { rows } = await pool.query(
       `
@@ -8838,15 +8827,10 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
         n.user_id,
         n.sender_id,
         n.actor_id,
-
         n.type,
         n.title,
         n.message,
         n.data,
-
-        n.video_id,
-        n.link,
-
         n.is_read,
         n.created_at,
 
@@ -8867,184 +8851,112 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
       [userId]
     );
 
-    /*
-     * Convert notification.data from JSON/string
-     * into an object where possible.
-     */
-    const formattedNotifications = rows.map((notification) => {
-      let parsedData = {};
+    const notifications = rows.map((n) => {
+      let data = {};
 
-      if (notification.data) {
+      if (n.data) {
         try {
-          parsedData =
-            typeof notification.data === 'string'
-              ? JSON.parse(notification.data)
-              : notification.data;
-
-          if (
-            !parsedData ||
-            typeof parsedData !== 'object' ||
-            Array.isArray(parsedData)
-          ) {
-            parsedData = {};
-          }
-        } catch (error) {
+          data =
+            typeof n.data === "string"
+              ? JSON.parse(n.data)
+              : n.data;
+        } catch (parseError) {
           console.warn(
-            '⚠️ Could not parse notification data:',
-            notification.id
+            "[NOTIFICATIONS] Invalid JSON data:",
+            n.id
           );
 
-          parsedData = {};
+          data = {};
         }
       }
 
-      /*
-       * Flatten data onto the notification.
-       *
-       * Example:
-       *
-       * data = {
-       *   device: "iPhone",
-       *   browser: "Safari"
-       * }
-       *
-       * becomes:
-       *
-       * notification.device
-       * notification.browser
-       */
-      return {
-        id: notification.id,
+      const notification = {
+        id: n.id,
 
-        userId: notification.user_id,
-        senderId:
-          notification.sender_id ||
-          notification.actor_id ||
-          null,
+        userId: n.user_id,
+        senderId: n.sender_id || n.actor_id || null,
 
-        type: notification.type,
+        type: n.type,
 
-        title:
-          notification.title ||
-          getNotificationTitle(
-            notification.type,
-            notification.message
-          ),
+        title: n.title || "",
 
-        message:
-          notification.message || '',
+        message: n.message || "",
+        text: n.message || "",
 
-        text:
-          notification.message || '',
+        data,
 
-        data: parsedData,
+        is_read: Boolean(n.is_read),
+        read: Boolean(n.is_read),
 
-        // Flatten notification data
-        ...parsedData,
+        created_at: n.created_at,
+        time: n.created_at,
 
-        // Read state
-        is_read: Boolean(notification.is_read),
-        read: Boolean(notification.is_read),
-
-        // Time
-        created_at: notification.created_at,
-        time: notification.created_at,
-
-        // Video/link
-        videoId:
-          notification.video_id ||
-          parsedData.videoId ||
-          parsedData.video_id ||
-          null,
-
-        link:
-          notification.link ||
-          parsedData.link ||
-          getNotificationLink(
-            notification.type,
-            parsedData
-          ),
-
-        // Sender
         user:
-          notification.sender_username ||
-          parsedData.username ||
-          parsedData.user ||
-          'System',
-
-        username:
-          notification.sender_username ||
-          parsedData.username ||
-          null,
+          n.sender_username ||
+          data.username ||
+          data.user ||
+          "System",
 
         avatar:
-          notification.sender_avatar ||
-          parsedData.avatar ||
-          null
+          n.sender_avatar ||
+          data.avatar ||
+          null,
+
+        link: getNotificationLink(n.type, data),
+
+        // Flatten notification data so the existing
+        // frontend can continue using fields such as:
+        // n.device, n.browser, n.reason, n.version, etc.
+        ...data,
       };
+
+      return notification;
     });
 
-    /*
-     * Accurate unread count.
-     */
-    const unreadResult = await pool.query(
-      `
-      SELECT COUNT(*)::integer AS count
-      FROM notifications
-      WHERE user_id = $1
-        AND is_read = false
-      `,
-      [userId]
-    );
-
-    const unreadCount =
-      Number(
-        unreadResult.rows[0]?.count || 0
-      );
+    const unreadCount = notifications.filter(
+      (notification) => !notification.read
+    ).length;
 
     console.log(
-      `🔔 Returning ${formattedNotifications.length} notifications (${unreadCount} unread)`
+      `[NOTIFICATIONS] User ${userId}: ${notifications.length} notifications, ${unreadCount} unread`
     );
 
     return res.status(200).json({
       success: true,
-      notifications: formattedNotifications,
-      unreadCount
+      notifications,
+      unreadCount,
     });
-
   } catch (err) {
     console.error(
-      '❌ Get notifications error:',
+      "[NOTIFICATIONS] Get notifications error:",
       err
     );
 
     return res.status(500).json({
       success: false,
-      error: 'Failed to fetch notifications',
+      error: "Failed to fetch notifications",
       notifications: [],
-      unreadCount: 0
+      unreadCount: 0,
     });
   }
 });
 
 
-// ------------------------------------------------------------
+// ============================================================
 // POST /api/notifications/read-all
-// Mark all notifications as read
-// ------------------------------------------------------------
+// ============================================================
+
 app.post(
-  '/api/notifications/read-all',
+  "/api/notifications/read-all",
   authenticateToken,
   async (req, res) => {
     try {
-      const userId =
-        req.user?.id ||
-        req.userId;
+      const userId = req.user?.id || req.userId;
 
       if (!userId) {
         return res.status(401).json({
           success: false,
-          error: 'Not authenticated'
+          error: "Not authenticated",
         });
       }
 
@@ -9058,244 +8970,194 @@ app.post(
         [userId]
       );
 
-      console.log(
-        `🔔 Marked ${result.rowCount} notifications as read for user ${userId}`
-      );
-
       return res.json({
         success: true,
-        message: 'All notifications marked as read',
-        updated: result.rowCount
+        message: "All notifications marked as read",
+        updated: result.rowCount || 0,
       });
-
     } catch (err) {
       console.error(
-        '❌ Mark all notifications read error:',
+        "[NOTIFICATIONS] Mark all read error:",
         err
       );
 
       return res.status(500).json({
         success: false,
-        error: 'Failed to mark notifications as read'
+        error: "Failed to mark notifications as read",
       });
     }
   }
 );
 
 
-// ------------------------------------------------------------
+// ============================================================
 // PUT /api/notifications/:id/read
-// Mark one notification as read
-// ------------------------------------------------------------
+// ============================================================
+
 app.put(
-  '/api/notifications/:id/read',
+  "/api/notifications/:id/read",
   authenticateToken,
   async (req, res) => {
     try {
-      const userId =
-        req.user?.id ||
-        req.userId;
+      const userId = req.user?.id || req.userId;
+      const notificationId = Number(req.params.id);
 
       if (!userId) {
         return res.status(401).json({
           success: false,
-          error: 'Not authenticated'
+          error: "Not authenticated",
         });
       }
 
-      const notificationId =
-        Number.parseInt(
-          req.params.id,
-          10
-        );
-
-      if (
-        !Number.isInteger(notificationId)
-      ) {
+      if (!Number.isInteger(notificationId)) {
         return res.status(400).json({
           success: false,
-          error: 'Invalid notification ID'
+          error: "Invalid notification ID",
         });
       }
 
-      const { rowCount } =
-        await pool.query(
-          `
-          UPDATE notifications
+      const result = await pool.query(
+        `
+        UPDATE notifications
+        SET is_read = true
+        WHERE id = $1
+          AND user_id = $2
+        `,
+        [notificationId, userId]
+      );
 
-          SET is_read = true
-
-          WHERE id = $1
-            AND user_id = $2
-          `,
-          [
-            notificationId,
-            userId
-          ]
-        );
-
-      if (rowCount === 0) {
+      if (result.rowCount === 0) {
         return res.status(404).json({
           success: false,
-          error: 'Notification not found'
+          error: "Notification not found",
         });
       }
 
       return res.json({
         success: true,
-        message:
-          'Notification marked as read'
+        message: "Notification marked as read",
       });
-
     } catch (err) {
       console.error(
-        '❌ Mark notification read error:',
+        "[NOTIFICATIONS] Mark read error:",
         err
       );
 
       return res.status(500).json({
         success: false,
-        error:
-          'Failed to mark notification as read'
+        error: "Failed to mark notification as read",
       });
     }
   }
 );
 
 
-// ------------------------------------------------------------
+// ============================================================
 // DELETE /api/notifications/:id
-// Delete one notification
-// ------------------------------------------------------------
+// ============================================================
+
 app.delete(
-  '/api/notifications/:id',
+  "/api/notifications/:id",
   authenticateToken,
   async (req, res) => {
     try {
-      const userId =
-        req.user?.id ||
-        req.userId;
+      const userId = req.user?.id || req.userId;
+      const notificationId = Number(req.params.id);
 
       if (!userId) {
         return res.status(401).json({
           success: false,
-          error: 'Not authenticated'
+          error: "Not authenticated",
         });
       }
 
-      const notificationId =
-        Number.parseInt(
-          req.params.id,
-          10
-        );
-
-      if (
-        !Number.isInteger(notificationId)
-      ) {
+      if (!Number.isInteger(notificationId)) {
         return res.status(400).json({
           success: false,
-          error: 'Invalid notification ID'
+          error: "Invalid notification ID",
         });
       }
 
-      const { rowCount } =
-        await pool.query(
-          `
-          DELETE FROM notifications
+      const result = await pool.query(
+        `
+        DELETE FROM notifications
+        WHERE id = $1
+          AND user_id = $2
+        `,
+        [notificationId, userId]
+      );
 
-          WHERE id = $1
-            AND user_id = $2
-          `,
-          [
-            notificationId,
-            userId
-          ]
-        );
-
-      if (rowCount === 0) {
+      if (result.rowCount === 0) {
         return res.status(404).json({
           success: false,
-          error: 'Notification not found'
+          error: "Notification not found",
         });
       }
 
       return res.json({
         success: true,
-        message:
-          'Notification deleted'
+        message: "Notification deleted",
       });
-
     } catch (err) {
       console.error(
-        '❌ Delete notification error:',
+        "[NOTIFICATIONS] Delete error:",
         err
       );
 
       return res.status(500).json({
         success: false,
-        error:
-          'Failed to delete notification'
+        error: "Failed to delete notification",
       });
     }
   }
 );
 
 
-// ------------------------------------------------------------
+// ============================================================
 // GET /api/notifications/unread-count
-// Lightweight unread counter
-// ------------------------------------------------------------
+// ============================================================
+
 app.get(
-  '/api/notifications/unread-count',
+  "/api/notifications/unread-count",
   authenticateToken,
   async (req, res) => {
     try {
-      const userId =
-        req.user?.id ||
-        req.userId;
+      const userId = req.user?.id || req.userId;
 
       if (!userId) {
         return res.status(401).json({
           success: false,
-          error: 'Not authenticated',
-          unreadCount: 0
+          error: "Not authenticated",
+          unreadCount: 0,
         });
       }
 
-      const { rows } =
-        await pool.query(
-          `
-          SELECT COUNT(*)::integer AS unread_count
-
-          FROM notifications
-
-          WHERE user_id = $1
-            AND is_read = false
-          `,
-          [userId]
-        );
-
-      const unreadCount =
-        Number(
-          rows[0]?.unread_count || 0
-        );
+      const { rows } = await pool.query(
+        `
+        SELECT COUNT(*)::integer AS unread_count
+        FROM notifications
+        WHERE user_id = $1
+          AND is_read = false
+        `,
+        [userId]
+      );
 
       return res.json({
         success: true,
-        unreadCount
+        unreadCount: Number(
+          rows[0]?.unread_count || 0
+        ),
       });
-
     } catch (err) {
       console.error(
-        '❌ Get unread count error:',
+        "[NOTIFICATIONS] Unread count error:",
         err
       );
 
       return res.status(500).json({
         success: false,
-        error:
-          'Failed to get unread count',
-        unreadCount: 0
+        error: "Failed to get unread count",
+        unreadCount: 0,
       });
     }
   }
