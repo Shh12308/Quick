@@ -3965,30 +3965,6 @@ app.post('/users/:userId/block', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed to block user" }); }
 });
 
-// ==========================================
-// 7. GET /api/notifications
-// ==========================================
-app.get('/api/notifications', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT n.id, n.type, n.message as text, n.created_at as time, n.is_read, n.video_id as "videoId", n.link, u.username as user, u.profile_url as avatar
-       FROM notifications n JOIN users u ON n.actor_id = u.id WHERE n.user_id = $1 ORDER BY n.created_at DESC LIMIT 20`, [req.userId]
-    );
-    const { rows: c } = await pool.query(`SELECT COUNT(*) as count FROM notifications WHERE user_id = $1 AND is_read = false`, [req.userId]);
-    res.json({ notifications: rows, unreadCount: parseInt(c[0]?.count || 0) });
-  } catch (err) { res.status(500).json({ error: "Failed to fetch notifications", notifications: [] }); }
-});
-
-// ==========================================
-// 8. POST /api/notifications/read-all
-// ==========================================
-app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
-  try {
-    await pool.query("UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false", [req.userId]);
-    res.json({ message: "All read" });
-  } catch (err) { res.status(500).json({ error: "Failed" }); }
-});
-
 // 2. GET /api/livestreams/active - List active streams
 app.get('/api/livestreams/active', async (req, res) => {
   try {
@@ -8826,176 +8802,590 @@ async function createNotification(userId, senderId, type, title, message, data =
   }
 }
 
-// GET /api/notifications - Get all notifications for current user
+// ============================================================
+// NOTIFICATIONS
+// ============================================================
+
+// ------------------------------------------------------------
+// GET /api/notifications
+// Get current user's notifications
+// ------------------------------------------------------------
 app.get('/api/notifications', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.id;
+    // Support both authentication styles used in the server.
+    const userId =
+      req.user?.id ||
+      req.userId;
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        error: 'Not authenticated',
+        notifications: [],
+        unreadCount: 0
+      });
+    }
+
+    console.log(
+      '🔔 GET /api/notifications - User:',
+      userId
+    );
 
     const { rows } = await pool.query(
-      `SELECT 
+      `
+      SELECT
         n.id,
         n.user_id,
         n.sender_id,
+        n.actor_id,
+
         n.type,
         n.title,
         n.message,
         n.data,
+
+        n.video_id,
+        n.link,
+
         n.is_read,
         n.created_at,
+
         u.username AS sender_username,
         u.profile_url AS sender_avatar
-       FROM notifications n
-       LEFT JOIN users u ON n.sender_id = u.id
-       WHERE n.user_id = $1
-       ORDER BY n.created_at DESC
-       LIMIT 100`,
+
+      FROM notifications n
+
+      LEFT JOIN users u
+        ON u.id = COALESCE(n.sender_id, n.actor_id)
+
+      WHERE n.user_id = $1
+
+      ORDER BY n.created_at DESC
+
+      LIMIT 100
+      `,
       [userId]
     );
 
-    // Parse JSON data and format for frontend
-    const formattedNotifications = rows.map(n => {
-      let parsedData = null;
-      if (n.data) {
+    /*
+     * Convert notification.data from JSON/string
+     * into an object where possible.
+     */
+    const formattedNotifications = rows.map((notification) => {
+      let parsedData = {};
+
+      if (notification.data) {
         try {
-          parsedData = typeof n.data === 'string' ? JSON.parse(n.data) : n.data;
-        } catch {
-          parsedData = null;
+          parsedData =
+            typeof notification.data === 'string'
+              ? JSON.parse(notification.data)
+              : notification.data;
+
+          if (
+            !parsedData ||
+            typeof parsedData !== 'object' ||
+            Array.isArray(parsedData)
+          ) {
+            parsedData = {};
+          }
+        } catch (error) {
+          console.warn(
+            '⚠️ Could not parse notification data:',
+            notification.id
+          );
+
+          parsedData = {};
         }
       }
 
-      // Map to frontend expected format
+      /*
+       * Flatten data onto the notification.
+       *
+       * Example:
+       *
+       * data = {
+       *   device: "iPhone",
+       *   browser: "Safari"
+       * }
+       *
+       * becomes:
+       *
+       * notification.device
+       * notification.browser
+       */
       return {
-        id: n.id,
-        userId: n.user_id,
-        senderId: n.sender_id,
-        type: n.type,
-        title: n.title,
-        message: n.message,
-        text: n.message, // Frontend uses both
+        id: notification.id,
+
+        userId: notification.user_id,
+        senderId:
+          notification.sender_id ||
+          notification.actor_id ||
+          null,
+
+        type: notification.type,
+
+        title:
+          notification.title ||
+          getNotificationTitle(
+            notification.type,
+            notification.message
+          ),
+
+        message:
+          notification.message || '',
+
+        text:
+          notification.message || '',
+
         data: parsedData,
-        is_read: n.is_read,
-        read: n.is_read, // Frontend uses both
-        created_at: n.created_at,
-        time: n.created_at, // Frontend uses both
-        // Flatten data fields for easy access in frontend
-        ...(parsedData || {}),
-        // Sender info
-        user: n.sender_username || 'System',
-        avatar: n.sender_avatar,
-        // Build link based on type
-        link: getNotificationLink(n.type, parsedData)
+
+        // Flatten notification data
+        ...parsedData,
+
+        // Read state
+        is_read: Boolean(notification.is_read),
+        read: Boolean(notification.is_read),
+
+        // Time
+        created_at: notification.created_at,
+        time: notification.created_at,
+
+        // Video/link
+        videoId:
+          notification.video_id ||
+          parsedData.videoId ||
+          parsedData.video_id ||
+          null,
+
+        link:
+          notification.link ||
+          parsedData.link ||
+          getNotificationLink(
+            notification.type,
+            parsedData
+          ),
+
+        // Sender
+        user:
+          notification.sender_username ||
+          parsedData.username ||
+          parsedData.user ||
+          'System',
+
+        username:
+          notification.sender_username ||
+          parsedData.username ||
+          null,
+
+        avatar:
+          notification.sender_avatar ||
+          parsedData.avatar ||
+          null
       };
     });
 
-    const unreadCount = rows.filter(n => !n.is_read).length;
+    /*
+     * Accurate unread count.
+     */
+    const unreadResult = await pool.query(
+      `
+      SELECT COUNT(*)::integer AS count
+      FROM notifications
+      WHERE user_id = $1
+        AND is_read = false
+      `,
+      [userId]
+    );
 
-    res.json({
+    const unreadCount =
+      Number(
+        unreadResult.rows[0]?.count || 0
+      );
+
+    console.log(
+      `🔔 Returning ${formattedNotifications.length} notifications (${unreadCount} unread)`
+    );
+
+    return res.status(200).json({
+      success: true,
       notifications: formattedNotifications,
       unreadCount
     });
 
   } catch (err) {
-    console.error("Get notifications error:", err);
-    res.status(500).json({ error: "Failed to fetch notifications" });
-  }
-});
-
-// POST /api/notifications/read-all - Mark all notifications as read
-app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-
-    await pool.query(
-      `UPDATE notifications 
-       SET is_read = true 
-       WHERE user_id = $1 AND is_read = false`,
-      [userId]
+    console.error(
+      '❌ Get notifications error:',
+      err
     );
 
-    res.json({ success: true, message: "All notifications marked as read" });
-
-  } catch (err) {
-    console.error("Mark all read error:", err);
-    res.status(500).json({ error: "Failed to mark notifications as read" });
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch notifications',
+      notifications: [],
+      unreadCount: 0
+    });
   }
 });
 
-// PUT /api/notifications/:id/read - Mark single notification as read
-app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const notificationId = parseInt(req.params.id);
 
-    if (isNaN(notificationId)) {
-      return res.status(400).json({ error: "Invalid notification ID" });
+// ------------------------------------------------------------
+// POST /api/notifications/read-all
+// Mark all notifications as read
+// ------------------------------------------------------------
+app.post(
+  '/api/notifications/read-all',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId =
+        req.user?.id ||
+        req.userId;
+
+      if (!userId) {
+        return res.status(401).json({
+          success: false,
+          error: 'Not authenticated'
+        });
+      }
+
+      const result = await pool.query(
+        `
+        UPDATE notifications
+        SET is_read = true
+        WHERE user_id = $1
+          AND is_read = false
+        `,
+        [userId]
+      );
+
+      console.log(
+        `🔔 Marked ${result.rowCount} notifications as read for user ${userId}`
+      );
+
+      return res.json({
+        success: true,
+        message: 'All notifications marked as read',
+        updated: result.rowCount
+      });
+
+    } catch (err) {
+      console.error(
+        '❌ Mark all notifications read error:',
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to mark notifications as read'
+      });
     }
-
-    const { rowCount } = await pool.query(
-      `UPDATE notifications 
-       SET is_read = true 
-       WHERE id = $1 AND user_id = $2`,
-      [notificationId, userId]
-    );
-
-    if (rowCount === 0) {
-      return res.status(404).json({ error: "Notification not found" });
-    }
-
-    res.json({ success: true, message: "Notification marked as read" });
-
-  } catch (err) {
-    console.error("Mark read error:", err);
-    res.status(500).json({ error: "Failed to mark notification as read" });
   }
-});
+);
 
-// DELETE /api/notifications/:id - Delete a single notification
-app.delete('/api/notifications/:id', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const notificationId = parseInt(req.params.id);
 
-    if (isNaN(notificationId)) {
-      return res.status(400).json({ error: "Invalid notification ID" });
+// ------------------------------------------------------------
+// PUT /api/notifications/:id/read
+// Mark one notification as read
+// ------------------------------------------------------------
+app.put(
+  '/api/notifications/:id/read',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId =
+        req.user?.id ||
+        req.userId;
+
+      if (!userId) {
+        return res.status(401).json({
+          success: false,
+          error: 'Not authenticated'
+        });
+      }
+
+      const notificationId =
+        Number.parseInt(
+          req.params.id,
+          10
+        );
+
+      if (
+        !Number.isInteger(notificationId)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid notification ID'
+        });
+      }
+
+      const { rowCount } =
+        await pool.query(
+          `
+          UPDATE notifications
+
+          SET is_read = true
+
+          WHERE id = $1
+            AND user_id = $2
+          `,
+          [
+            notificationId,
+            userId
+          ]
+        );
+
+      if (rowCount === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'Notification not found'
+        });
+      }
+
+      return res.json({
+        success: true,
+        message:
+          'Notification marked as read'
+      });
+
+    } catch (err) {
+      console.error(
+        '❌ Mark notification read error:',
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          'Failed to mark notification as read'
+      });
     }
+  }
+);
 
-    const { rowCount } = await pool.query(
-      `DELETE FROM notifications 
-       WHERE id = $1 AND user_id = $2`,
-      [notificationId, userId]
-    );
 
-    if (rowCount === 0) {
-      return res.status(404).json({ error: "Notification not found" });
+// ------------------------------------------------------------
+// DELETE /api/notifications/:id
+// Delete one notification
+// ------------------------------------------------------------
+app.delete(
+  '/api/notifications/:id',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId =
+        req.user?.id ||
+        req.userId;
+
+      if (!userId) {
+        return res.status(401).json({
+          success: false,
+          error: 'Not authenticated'
+        });
+      }
+
+      const notificationId =
+        Number.parseInt(
+          req.params.id,
+          10
+        );
+
+      if (
+        !Number.isInteger(notificationId)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid notification ID'
+        });
+      }
+
+      const { rowCount } =
+        await pool.query(
+          `
+          DELETE FROM notifications
+
+          WHERE id = $1
+            AND user_id = $2
+          `,
+          [
+            notificationId,
+            userId
+          ]
+        );
+
+      if (rowCount === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'Notification not found'
+        });
+      }
+
+      return res.json({
+        success: true,
+        message:
+          'Notification deleted'
+      });
+
+    } catch (err) {
+      console.error(
+        '❌ Delete notification error:',
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          'Failed to delete notification'
+      });
     }
-
-    res.json({ success: true, message: "Notification deleted" });
-
-  } catch (err) {
-    console.error("Delete notification error:", err);
-    res.status(500).json({ error: "Failed to delete notification" });
   }
-});
+);
 
-// GET /api/notifications/unread-count - Get only unread count (lightweight)
-app.get('/api/notifications/unread-count', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
 
-    const { rows } = await pool.query(
-      `SELECT COUNT(*) as unread_count 
-       FROM notifications 
-       WHERE user_id = $1 AND is_read = false`,
-      [userId]
-    );
+// ------------------------------------------------------------
+// GET /api/notifications/unread-count
+// Lightweight unread counter
+// ------------------------------------------------------------
+app.get(
+  '/api/notifications/unread-count',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId =
+        req.user?.id ||
+        req.userId;
 
-    res.json({ unreadCount: parseInt(rows[0].unread_count) || 0 });
+      if (!userId) {
+        return res.status(401).json({
+          success: false,
+          error: 'Not authenticated',
+          unreadCount: 0
+        });
+      }
 
-  } catch (err) {
-    console.error("Get unread count error:", err);
-    res.status(500).json({ error: "Failed to get unread count" });
+      const { rows } =
+        await pool.query(
+          `
+          SELECT COUNT(*)::integer AS unread_count
+
+          FROM notifications
+
+          WHERE user_id = $1
+            AND is_read = false
+          `,
+          [userId]
+        );
+
+      const unreadCount =
+        Number(
+          rows[0]?.unread_count || 0
+        );
+
+      return res.json({
+        success: true,
+        unreadCount
+      });
+
+    } catch (err) {
+      console.error(
+        '❌ Get unread count error:',
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          'Failed to get unread count',
+        unreadCount: 0
+      });
+    }
   }
-});
+);
+
+
+// ============================================================
+// NOTIFICATION HELPERS
+// ============================================================
+
+function getNotificationTitle(
+  type,
+  message
+) {
+  const normalizedType =
+    String(type || '')
+      .toLowerCase();
+
+  if (normalizedType === 'login') {
+    return 'New login detected';
+  }
+
+  if (normalizedType === 'warning') {
+    return 'Warning';
+  }
+
+  if (
+    normalizedType === 'app update' ||
+    normalizedType === 'app_update' ||
+    normalizedType === 'update'
+  ) {
+    return 'App Update';
+  }
+
+  return message || 'Notification';
+}
+
+
+function getNotificationLink(
+  type,
+  data
+) {
+  const parsedData =
+    data || {};
+
+  /*
+   * If notification data already
+   * contains a link, preserve it.
+   */
+  if (parsedData.link) {
+    return parsedData.link;
+  }
+
+  /*
+   * Video notification.
+   */
+  if (
+    parsedData.videoId ||
+    parsedData.video_id
+  ) {
+    const videoId =
+      parsedData.videoId ||
+      parsedData.video_id;
+
+    return `/video/${videoId}`;
+  }
+
+  const normalizedType =
+    String(type || '')
+      .toLowerCase();
+
+  /*
+   * Profile notification.
+   */
+  if (
+    normalizedType === 'follow' ||
+    normalizedType === 'new_follower'
+  ) {
+    const username =
+      parsedData.username ||
+      parsedData.user ||
+      parsedData.sender_username;
+
+    if (username) {
+      return `/profile/${username}`;
+    }
+  }
+
+  return null;
+}
 
 app.get("/api/messages/search", async (req, res) => {
   try {
