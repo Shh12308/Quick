@@ -164,6 +164,12 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET environment variable is required");
+}
+
 // ==========================================
 // POSTGRESQL POOL
 // ==========================================
@@ -2750,76 +2756,172 @@ app.get("/api/health", async (req, res) => {
 const authenticateToken = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
-    
+
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({ error: "No token provided" });
+      return res.status(401).json({
+        error: "No token provided",
+        code: "NO_TOKEN",
+      });
     }
 
-    const token = authHeader.split(" ")[1];
-    
+    const token = authHeader.slice(7).trim();
+
     if (!token) {
-      return res.status(401).json({ error: "No token provided" });
+      return res.status(401).json({
+        error: "No token provided",
+        code: "NO_TOKEN",
+      });
     }
 
-    const decoded = jwt.verify(token, JWT_SECRET);
-    
-    // Try BOTH common field names for compatibility
-    const userId = decoded.id || decoded.userId || decoded.sub;
-    
-    if (!userId) {
-      return res.status(401).json({ error: "Invalid token payload" });
+    let decoded;
+
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (err) {
+      console.error("[AUTH] JWT verification failed:", {
+        name: err.name,
+        message: err.message,
+      });
+
+      if (err.name === "TokenExpiredError") {
+        return res.status(401).json({
+          error: "Token expired",
+          code: "TOKEN_EXPIRED",
+        });
+      }
+
+      if (err.name === "JsonWebTokenError") {
+        return res.status(401).json({
+          error: "Invalid token",
+          code: "INVALID_TOKEN",
+        });
+      }
+
+      return res.status(401).json({
+        error: "Invalid authentication token",
+        code: "INVALID_AUTH",
+      });
+    }
+
+    const userId = Number(
+      decoded.id ??
+      decoded.userId ??
+      decoded.sub
+    );
+
+    if (!Number.isInteger(userId) || userId <= 0) {
+      console.error("[AUTH] Invalid JWT payload:", decoded);
+
+      return res.status(401).json({
+        error: "Invalid token payload",
+        code: "INVALID_TOKEN_PAYLOAD",
+      });
     }
 
     const { rows } = await pool.query(
-      "SELECT id, username, email, role, profile_url, is_verified, status FROM users WHERE id = $1",
+      `
+      SELECT
+        id,
+        public_id,
+        username,
+        email,
+        name,
+        display_name,
+        phone,
+        profile_url,
+        cover_url,
+        bio,
+        location,
+        website,
+        social_links,
+        is_musician,
+        is_creator,
+        is_admin,
+        is_verified,
+        verified,
+        role,
+        subscription_plan,
+        subscription_expires,
+        preferences,
+        notification_style,
+        status,
+        suspend_until,
+        followers_count,
+        following_count,
+        created_at,
+        updated_at
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+      `,
       [userId]
     );
 
     if (!rows.length) {
-      console.error(`[AUTH] User ${userId} not found in database (token was valid)`);
-      return res.status(404).json({ error: "User not found." });
+      console.error(
+        `[AUTH] User ${userId} not found in database`
+      );
+
+      return res.status(404).json({
+        error: "User not found",
+        code: "USER_NOT_FOUND",
+      });
     }
 
     const user = rows[0];
 
-    // Check if user is suspended
-    if (user.status === 'suspended') {
-      if (user.suspend_until && new Date(user.suspend_until) > new Date()) {
-        return res.status(403).json({ 
+    // Handle suspended accounts
+    if (user.status === "suspended") {
+      if (
+        user.suspend_until &&
+        new Date(user.suspend_until) > new Date()
+      ) {
+        return res.status(403).json({
           error: "Account suspended",
           reason: "Your account is temporarily suspended",
-          until: user.suspend_until
+          until: user.suspend_until,
         });
-      } else if (!user.suspend_until) {
-        return res.status(403).json({ 
-          error: "Account permanently suspended",
-          reason: "Your account has been permanently suspended"
-        });
-      } else {
-        // Suspension expired, reactivate
-        await pool.query(
-          "UPDATE users SET status = 'active', suspend_until = NULL WHERE id = $1",
-          [userId]
-        );
       }
+
+      if (!user.suspend_until) {
+        return res.status(403).json({
+          error: "Account permanently suspended",
+          reason: "Your account has been permanently suspended",
+        });
+      }
+
+      // Suspension expired
+      await pool.query(
+        `
+        UPDATE users
+        SET
+          status = 'active',
+          suspend_until = NULL,
+          updated_at = NOW()
+        WHERE id = $1
+        `,
+        [userId]
+      );
+
+      user.status = "active";
+      user.suspend_until = null;
     }
 
-    // Attach user to request - USE CONSISTENT NAMING
+    // Make authenticated user available everywhere
     req.user = user;
-    req.userId = user.id;  // For backward compatibility
+    req.userId = user.id;
 
     next();
   } catch (err) {
-    if (err.name === 'JsonWebTokenError') {
-      return res.status(401).json({ error: "Invalid token" });
-    }
-    if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: "Token expired" });
-    }
-    console.error("[AUTH] Unexpected error:", err);
-    return res.status(500).json({ error: "Authentication failed" });
+    console.error("[AUTH] Unexpected authentication error:", err);
+
+    return res.status(500).json({
+      error: "Authentication failed",
+      code: "AUTH_ERROR",
+    });
   }
 };
+
 // ==========================================
 // LIBRARY / USER DATA ROUTES
 // ==========================================
@@ -12597,113 +12699,701 @@ app.post(
 
 app.post("/api/auth/register", checkBan, async (req, res) => {
   try {
-    const { username, email, password, dob, captchaToken, profile_url } = req.body;
-    if (!username || !email || !password) return res.status(400).json({ error: "All fields required" });
-    if (!dob) return res.status(400).json({ error: "Date of birth required" });
-    const birthDate = new Date(dob);
-    if (isNaN(birthDate.getTime())) return res.status(400).json({ error: "Invalid date of birth" });
-    const today = new Date();
-    let age = today.getFullYear() - birthDate.getFullYear();
-    if (today.getMonth() < birthDate.getMonth() || (today.getMonth() === birthDate.getMonth() && today.getDate() < birthDate.getDate())) age--;
-    if (age < 1 || age > 130) return res.status(400).json({ error: "Invalid age" });
+    const {
+      username,
+      email,
+      password,
+      dob,
+      captchaToken,
+      profile_url,
+    } = req.body;
 
-    const passwordValidation = validatePassword(password);
-    if (!passwordValidation.valid) return res.status(400).json({ error: "Password does not meet requirements", details: passwordValidation.errors });
-
-    if (TURNSTILE_SECRET_KEY) {
-      if (!captchaToken) return res.status(403).json({ error: "Security verification required" });
-      const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
-      if (!await verifyTurnstile(captchaToken, ip)) return res.status(403).json({ error: "Security verification failed" });
+    if (!username || !email || !password) {
+      return res.status(400).json({
+        error: "All fields required",
+      });
     }
 
-    const emailCheck = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
-    const usernameCheck = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [username]);
-    if (emailCheck.rows.length && usernameCheck.rows.length) return res.status(409).json({ error: "Email and username already taken" });
-    if (emailCheck.rows.length) return res.status(409).json({ error: "Email already registered" });
-    if (usernameCheck.rows.length) return res.status(409).json({ error: "Username already taken" });
+    if (!dob) {
+      return res.status(400).json({
+        error: "Date of birth required",
+      });
+    }
 
+    const birthDate = new Date(dob);
+
+    if (isNaN(birthDate.getTime())) {
+      return res.status(400).json({
+        error: "Invalid date of birth",
+      });
+    }
+
+    const today = new Date();
+
+    let age =
+      today.getFullYear() -
+      birthDate.getFullYear();
+
+    if (
+      today.getMonth() < birthDate.getMonth() ||
+      (
+        today.getMonth() === birthDate.getMonth() &&
+        today.getDate() < birthDate.getDate()
+      )
+    ) {
+      age--;
+    }
+
+    if (age < 1 || age > 130) {
+      return res.status(400).json({
+        error: "Invalid age",
+      });
+    }
+
+    // Password validation
+    const passwordValidation =
+      validatePassword(password);
+
+    if (!passwordValidation.valid) {
+      return res.status(400).json({
+        error: "Password does not meet requirements",
+        details: passwordValidation.errors,
+      });
+    }
+
+    // Turnstile
+    if (TURNSTILE_SECRET_KEY) {
+      if (!captchaToken) {
+        return res.status(403).json({
+          error: "Security verification required",
+        });
+      }
+
+      const ip =
+        req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+        req.socket.remoteAddress;
+
+      const validCaptcha =
+        await verifyTurnstile(
+          captchaToken,
+          ip
+        );
+
+      if (!validCaptcha) {
+        return res.status(403).json({
+          error: "Security verification failed",
+        });
+      }
+    }
+
+    // Check email
+    const emailCheck = await pool.query(
+      `
+      SELECT id
+      FROM users
+      WHERE LOWER(email) = LOWER($1)
+      LIMIT 1
+      `,
+      [email]
+    );
+
+    // Check username
+    const usernameCheck = await pool.query(
+      `
+      SELECT id
+      FROM users
+      WHERE LOWER(username) = LOWER($1)
+      LIMIT 1
+      `,
+      [username]
+    );
+
+    if (
+      emailCheck.rows.length &&
+      usernameCheck.rows.length
+    ) {
+      return res.status(409).json({
+        error: "Email and username already taken",
+      });
+    }
+
+    if (emailCheck.rows.length) {
+      return res.status(409).json({
+        error: "Email already registered",
+      });
+    }
+
+    if (usernameCheck.rows.length) {
+      return res.status(409).json({
+        error: "Username already taken",
+      });
+    }
+
+    // Upload profile image
     let profileUrl = null;
-    if (profile_url && profile_url.startsWith("data:") && s3) {
+
+    if (
+      profile_url &&
+      profile_url.startsWith("data:") &&
+      s3
+    ) {
       try {
-        const matches = profile_url.match(/^data:(image\/\w+);base64,(.+)$/);
+        const matches =
+          profile_url.match(
+            /^data:(image\/\w+);base64,(.+)$/
+          );
+
         if (matches) {
-          const buffer = await sharp(Buffer.from(matches[2], "base64")).resize(400, 400, { fit: "cover", withoutEnlargement: true }).rotate().jpeg({ quality: 85 }).toBuffer();
-          const s3Key = `profile-pics/${Date.now()}-${username}.jpg`;
-          const result = await uploadBufferToS3(buffer, s3Key, 'image/jpeg');
+          const buffer = await sharp(
+            Buffer.from(matches[2], "base64")
+          )
+            .resize(400, 400, {
+              fit: "cover",
+              withoutEnlargement: true,
+            })
+            .rotate()
+            .jpeg({
+              quality: 85,
+            })
+            .toBuffer();
+
+          const safeUsername =
+            username.replace(
+              /[^a-zA-Z0-9_-]/g,
+              ""
+            );
+
+          const s3Key =
+            `profile-pics/${Date.now()}-${safeUsername}.jpg`;
+
+          const result =
+            await uploadBufferToS3(
+              buffer,
+              s3Key,
+              "image/jpeg"
+            );
+
           profileUrl = result.url;
         }
-      } catch (err) { console.error("Profile upload failed:", err.message); }
+      } catch (err) {
+        console.error(
+          "Profile upload failed:",
+          err.message
+        );
+      }
     }
 
-    const password_hash = await hashPassword(password);
+    const password_hash =
+      await hashPassword(password);
+
     const isKid = age <= 12;
 
+    const preferences = isKid
+      ? {
+          kids_mode: true,
+          restricted: true,
+        }
+      : {};
+
     const { rows } = await pool.query(
-      `INSERT INTO users (username, email, password_hash, dob, profile_url, role, preferences) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, username, email, role, profile_url, dob, preferences`,
-      [username, email, password_hash, dob, profileUrl, isKid ? "kid" : "free", isKid ? { kids_mode: true, restricted: true } : {}]
+      `
+      INSERT INTO users (
+        username,
+        email,
+        password_hash,
+        dob,
+        profile_url,
+        role,
+        preferences
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING
+        id,
+        public_id,
+        username,
+        email,
+        name,
+        display_name,
+        role,
+        profile_url,
+        cover_url,
+        bio,
+        location,
+        website,
+        social_links,
+        is_musician,
+        is_creator,
+        is_admin,
+        is_verified,
+        verified,
+        subscription_plan,
+        subscription_expires,
+        preferences,
+        notification_style,
+        status,
+        followers_count,
+        following_count,
+        created_at,
+        updated_at
+      `,
+      [
+        username,
+        email,
+        password_hash,
+        dob,
+        profileUrl,
+        isKid ? "kid" : "free",
+        preferences,
+      ]
     );
 
-    ensureCreatorStats(rows[0].id);
+    const newUser = rows[0];
 
+    // Creator stats
+    ensureCreatorStats(newUser.id);
+
+    // Welcome email
     if (transporter) {
-      transporter.sendMail({ from: `"MintZa" <${EMAIL_USER}>`, to: email, subject: "Welcome to MintZa!", html: `<h1>Welcome!</h1>` }).catch(() => {});
+      transporter
+        .sendMail({
+          from: `"MintZa" <${EMAIL_USER}>`,
+          to: email,
+          subject: "Welcome to MintZa!",
+          html: `<h1>Welcome to MintZa!</h1>`,
+        })
+        .catch(() => {});
     }
-    
-    pool.query(`INSERT INTO security_logs (event_type, user_id, ip_address, details) VALUES ($1, $2, $3, $4)`, ["register", rows[0].id, req.headers["x-forwarded-for"], { provider: "email" }]).catch(() => {});
 
-    res.status(201).json({ user: rows[0], token: jwt.sign({ id: rows[0].id }, JWT_SECRET, { expiresIn: "7d" }) });
+    // Security log
+    pool
+      .query(
+        `
+        INSERT INTO security_logs (
+          event_type,
+          user_id,
+          ip_address,
+          details
+        )
+        VALUES ($1, $2, $3, $4)
+        `,
+        [
+          "register",
+          newUser.id,
+          req.headers["x-forwarded-for"] ||
+            req.socket.remoteAddress,
+          {
+            provider: "email",
+          },
+        ]
+      )
+      .catch(() => {});
+
+    // JWT
+    const token = jwt.sign(
+      {
+        id: newUser.id,
+      },
+      JWT_SECRET,
+      {
+        expiresIn: "7d",
+      }
+    );
+
+    const publicId = newUser.public_id
+      ? String(newUser.public_id)
+      : null;
+
+    const displayName =
+      newUser.display_name ||
+      newUser.name ||
+      newUser.username ||
+      "";
+
+    const verified =
+      Boolean(newUser.is_verified) ||
+      Boolean(newUser.verified);
+
+    const responseUser = {
+      ...newUser,
+
+      id: newUser.id,
+      user_id: newUser.id,
+
+      public_id: publicId,
+      publicId: publicId,
+      uuid: publicId,
+
+      username: newUser.username,
+      email: newUser.email,
+
+      name: displayName,
+      displayName,
+      display_name:
+        newUser.display_name || "",
+
+      profileUrl:
+        newUser.profile_url || null,
+
+      profile_url:
+        newUser.profile_url || null,
+
+      avatar:
+        newUser.profile_url || null,
+
+      profilePicture:
+        newUser.profile_url || null,
+
+      coverUrl:
+        newUser.cover_url || null,
+
+      cover_url:
+        newUser.cover_url || null,
+
+      coverPhoto:
+        newUser.cover_url || null,
+
+      bio: newUser.bio || "",
+      location: newUser.location || "",
+      website: newUser.website || "",
+
+      socialLinks:
+        newUser.social_links || {},
+
+      social_links:
+        newUser.social_links || {},
+
+      isMusician:
+        Boolean(newUser.is_musician),
+
+      is_musician:
+        Boolean(newUser.is_musician),
+
+      isCreator:
+        Boolean(newUser.is_creator),
+
+      is_creator:
+        Boolean(newUser.is_creator),
+
+      isAdmin:
+        Boolean(newUser.is_admin),
+
+      is_admin:
+        Boolean(newUser.is_admin),
+
+      isVerified: verified,
+      is_verified: verified,
+      verified,
+
+      role: newUser.role || "free",
+
+      subscriptionPlan:
+        newUser.subscription_plan || "free",
+
+      subscription_plan:
+        newUser.subscription_plan || "free",
+
+      subscriptionExpires:
+        newUser.subscription_expires || null,
+
+      subscription_expires:
+        newUser.subscription_expires || null,
+
+      status:
+        newUser.status || "active",
+
+      followersCount:
+        Number(newUser.followers_count || 0),
+
+      followers_count:
+        Number(newUser.followers_count || 0),
+
+      followingCount:
+        Number(newUser.following_count || 0),
+
+      following_count:
+        Number(newUser.following_count || 0),
+
+      isSelf: true,
+    };
+
+    return res.status(201).json({
+      success: true,
+      user: responseUser,
+      token,
+    });
+
   } catch (err) {
     console.error("Register error:", err);
-    if (err.code === "23505") return res.status(409).json({ error: "Account already exists" });
-    res.status(500).json({ error: "Registration failed" });
-  }
-});
 
-// Helper: Create a login session entry
-async function createLoginSession(userId, req) {
-  try {
-    const ip = req.headers["x-forwarded-for"]?.split(',')[0] || req.socket.remoteAddress;
-    const userAgent = req.headers["user-agent"] || "Unknown";
-    // Simple device detection
-    let device = "Desktop";
-    if (/mobile|android|iphone|ipad/i.test(userAgent)) device = "Mobile";
-    if (/mac|windows|linux/i.test(userAgent)) device = "Desktop";
+    if (err.code === "23505") {
+      return res.status(409).json({
+        error: "Account already exists",
+      });
+    }
 
-    await pool.query(
-      `INSERT INTO login_sessions (user_id, device, ip_address, user_agent, is_current) 
-       VALUES ($1, $2, $3, $4, true)`,
-      [userId, device, ip, userAgent]
-    );
-    
-    // Optional: Mark older sessions as not current if you want strict "current device" logic
-    // await pool.query(`UPDATE login_sessions SET is_current = false WHERE user_id = $1 AND id != (SELECT id FROM login_sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1)`, [userId]);
-  } catch (err) {
-    console.error("Login session error:", err);
+    return res.status(500).json({
+      error: "Registration failed",
+    });
   }
-}
+}); 
 
 app.post("/api/auth/login", checkBan, async (req, res) => {
   try {
-    const { email, password, captchaToken } = req.body;
-    if (TURNSTILE_SECRET_KEY) {
-      if (!captchaToken) return res.status(403).json({ error: "Security verification required" });
-      const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
-      if (!await verifyTurnstile(captchaToken, ip)) return res.status(403).json({ error: "Security verification failed" });
+    const {
+      email,
+      password,
+      captchaToken,
+    } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        error: "Email and password are required",
+      });
     }
-    const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
-    if (!rows.length) return res.status(401).json({ error: "Invalid credentials" });
+
+    // Cloudflare Turnstile
+    if (TURNSTILE_SECRET_KEY) {
+      if (!captchaToken) {
+        return res.status(403).json({
+          error: "Security verification required",
+        });
+      }
+
+      const ip =
+        req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+        req.socket.remoteAddress;
+
+      const validCaptcha = await verifyTurnstile(
+        captchaToken,
+        ip
+      );
+
+      if (!validCaptcha) {
+        return res.status(403).json({
+          error: "Security verification failed",
+        });
+      }
+    }
+
+    const { rows } = await pool.query(
+      `
+      SELECT *
+      FROM users
+      WHERE LOWER(email) = LOWER($1)
+      LIMIT 1
+      `,
+      [email]
+    );
+
+    if (!rows.length) {
+      return res.status(401).json({
+        error: "Invalid credentials",
+      });
+    }
+
     const user = rows[0];
-    if (!user.password_hash) return res.status(401).json({ error: "Use OAuth to login" });
-    if (!await verifyPassword(user.password_hash, password)) return res.status(401).json({ error: "Invalid credentials" });
-    
-    await pool.query("UPDATE users SET last_login_at = NOW(), failed_login_count = 0 WHERE id = $1", [user.id]);
-    
-    // Create Login Session
+
+    // Check suspended account
+    if (user.status === "suspended") {
+      if (
+        user.suspend_until &&
+        new Date(user.suspend_until) > new Date()
+      ) {
+        return res.status(403).json({
+          error: "Account suspended",
+          reason: "Your account is temporarily suspended",
+          until: user.suspend_until,
+        });
+      }
+
+      if (!user.suspend_until) {
+        return res.status(403).json({
+          error: "Account permanently suspended",
+          reason: "Your account has been permanently suspended",
+        });
+      }
+
+      // Suspension expired
+      await pool.query(
+        `
+        UPDATE users
+        SET
+          status = 'active',
+          suspend_until = NULL,
+          updated_at = NOW()
+        WHERE id = $1
+        `,
+        [user.id]
+      );
+
+      user.status = "active";
+      user.suspend_until = null;
+    }
+
+    if (!user.password_hash) {
+      return res.status(401).json({
+        error: "Use OAuth to login",
+      });
+    }
+
+    const passwordValid = await verifyPassword(
+      user.password_hash,
+      password
+    );
+
+    if (!passwordValid) {
+      await pool.query(
+        `
+        UPDATE users
+        SET failed_login_count = COALESCE(failed_login_count, 0) + 1
+        WHERE id = $1
+        `,
+        [user.id]
+      );
+
+      return res.status(401).json({
+        error: "Invalid credentials",
+      });
+    }
+
+    // Successful login
+    await pool.query(
+      `
+      UPDATE users
+      SET
+        last_login_at = NOW(),
+        failed_login_count = 0,
+        updated_at = NOW()
+      WHERE id = $1
+      `,
+      [user.id]
+    );
+
+    // Create login session
     await createLoginSession(user.id, req);
-    
-    const { password_hash, ...safeUser } = user;
-    res.json({ user: safeUser, token: jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "7d" }) });
-  } catch (err) { console.error("Login error:", err); res.status(500).json({ error: "Login failed" }); }
+
+    // Never return password hash
+    const {
+      password_hash,
+      ...safeUser
+    } = user;
+
+    // Create JWT
+    const token = jwt.sign(
+      {
+        id: user.id,
+      },
+      JWT_SECRET,
+      {
+        expiresIn: "7d",
+      }
+    );
+
+    // Make sure UUID is available in login response
+    const publicId = user.public_id
+      ? String(user.public_id)
+      : null;
+
+    const displayName =
+      user.display_name ||
+      user.name ||
+      user.username ||
+      "";
+
+    const verified =
+      Boolean(user.is_verified) ||
+      Boolean(user.verified);
+
+    const responseUser = {
+      ...safeUser,
+
+      id: user.id,
+      user_id: user.id,
+
+      public_id: publicId,
+      publicId: publicId,
+      uuid: publicId,
+
+      username: user.username,
+      email: user.email,
+
+      name: displayName,
+      displayName,
+      display_name: user.display_name || "",
+
+      profileUrl: user.profile_url || null,
+      profile_url: user.profile_url || null,
+      avatar: user.profile_url || null,
+      profilePicture: user.profile_url || null,
+
+      coverUrl: user.cover_url || null,
+      cover_url: user.cover_url || null,
+      coverPhoto: user.cover_url || null,
+
+      bio: user.bio || "",
+      location: user.location || "",
+      website: user.website || "",
+
+      socialLinks: user.social_links || {},
+      social_links: user.social_links || {},
+
+      isMusician: Boolean(user.is_musician),
+      is_musician: Boolean(user.is_musician),
+
+      isCreator: Boolean(user.is_creator),
+      is_creator: Boolean(user.is_creator),
+
+      isAdmin: Boolean(user.is_admin),
+      is_admin: Boolean(user.is_admin),
+
+      isVerified: verified,
+      is_verified: verified,
+      verified,
+
+      role: user.role || "free",
+
+      subscriptionPlan:
+        user.subscription_plan || "free",
+
+      subscription_plan:
+        user.subscription_plan || "free",
+
+      subscriptionExpires:
+        user.subscription_expires || null,
+
+      subscription_expires:
+        user.subscription_expires || null,
+
+      status: user.status || "active",
+
+      followersCount:
+        Number(user.followers_count || 0),
+
+      followers_count:
+        Number(user.followers_count || 0),
+
+      followingCount:
+        Number(user.following_count || 0),
+
+      following_count:
+        Number(user.following_count || 0),
+
+      isSelf: true,
+    };
+
+    return res.json({
+      success: true,
+      user: responseUser,
+      token,
+    });
+
+  } catch (err) {
+    console.error("Login error:", err);
+
+    return res.status(500).json({
+      error: "Login failed",
+    });
+  }
 });
 
 app.get("/api/auth/google", passport.authenticate("google", { scope: ["profile", "email"], session: false }));
@@ -12877,10 +13567,230 @@ app.post("/api/reset-password", async (req, res) => {
 
 app.get("/api/users/me", authenticateToken, async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT id, username, email, profile_url, cover_url, bio, is_musician, is_creator, is_verified, role, subscription_plan, preferences, notification_style FROM users WHERE id = $1`, [req.user.id]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json({ user: rows[0] });
-  } catch (err) { console.error("GET /api/users/me error:", err); res.status(500).json({ error: "Failed to fetch user" }); }
+    const userId = Number(
+      req.user?.id || req.userId
+    );
+
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(401).json({
+        success: false,
+        error: "Authentication required",
+      });
+    }
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        id,
+        public_id,
+        username,
+        email,
+        name,
+        display_name,
+        phone,
+        profile_url,
+        cover_url,
+        bio,
+        location,
+        website,
+        social_links,
+        is_musician,
+        is_creator,
+        is_admin,
+        is_verified,
+        verified,
+        role,
+        subscription_plan,
+        subscription_expires,
+        preferences,
+        notification_style,
+        status,
+        followers_count,
+        following_count,
+        created_at,
+        updated_at
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [userId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+    }
+
+    const user = rows[0];
+
+    const publicId = user.public_id
+      ? String(user.public_id)
+      : null;
+
+    const displayName =
+      user.display_name ||
+      user.name ||
+      user.username ||
+      "";
+
+    const verified =
+      Boolean(user.is_verified) ||
+      Boolean(user.verified);
+
+    return res.json({
+      success: true,
+
+      user: {
+        // IDs
+        id: user.id,
+        user_id: user.id,
+
+        public_id: publicId,
+        publicId: publicId,
+        uuid: publicId,
+
+        // Account
+        username: user.username,
+        email: user.email,
+
+        // Name
+        name: displayName,
+        displayName,
+        display_name:
+          user.display_name || "",
+
+        // Profile
+        profileUrl:
+          user.profile_url || null,
+
+        profile_url:
+          user.profile_url || null,
+
+        avatar:
+          user.profile_url || null,
+
+        profilePicture:
+          user.profile_url || null,
+
+        // Cover
+        coverUrl:
+          user.cover_url || null,
+
+        cover_url:
+          user.cover_url || null,
+
+        coverPhoto:
+          user.cover_url || null,
+
+        // Details
+        bio: user.bio || "",
+        location: user.location || "",
+        website: user.website || "",
+
+        // Social
+        socialLinks:
+          user.social_links || {},
+
+        social_links:
+          user.social_links || {},
+
+        // Roles
+        isMusician:
+          Boolean(user.is_musician),
+
+        is_musician:
+          Boolean(user.is_musician),
+
+        isCreator:
+          Boolean(user.is_creator),
+
+        is_creator:
+          Boolean(user.is_creator),
+
+        isAdmin:
+          Boolean(user.is_admin),
+
+        is_admin:
+          Boolean(user.is_admin),
+
+        // Verification
+        isVerified: verified,
+        is_verified: verified,
+        verified,
+
+        // Subscription
+        role:
+          user.role || "free",
+
+        subscriptionPlan:
+          user.subscription_plan || "free",
+
+        subscription_plan:
+          user.subscription_plan || "free",
+
+        subscriptionExpires:
+          user.subscription_expires || null,
+
+        subscription_expires:
+          user.subscription_expires || null,
+
+        // Preferences
+        preferences:
+          user.preferences || {},
+
+        notificationStyle:
+          user.notification_style || "named",
+
+        notification_style:
+          user.notification_style || "named",
+
+        // Status
+        status:
+          user.status || "active",
+
+        // Counts
+        followersCount:
+          Number(user.followers_count || 0),
+
+        followers_count:
+          Number(user.followers_count || 0),
+
+        followingCount:
+          Number(user.following_count || 0),
+
+        following_count:
+          Number(user.following_count || 0),
+
+        // Dates
+        createdAt:
+          user.created_at,
+
+        created_at:
+          user.created_at,
+
+        updatedAt:
+          user.updated_at,
+
+        updated_at:
+          user.updated_at,
+
+        isSelf: true,
+      },
+    });
+
+  } catch (err) {
+    console.error(
+      "GET /api/users/me error:",
+      err
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch user",
+    });
+  }
 });
 
 app.put("/api/users/me", authMiddleware, upload.fields([{ name: 'profile', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), async (req, res) => {
@@ -13090,17 +14000,83 @@ app.get("/api/music", async (req, res) => {
   }
 });
 
-app.get("/api/music/favorites", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith("Bearer ")) return res.json([]);
-    const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
-    const { rows } = await pool.query("SELECT track_id FROM music_favorites WHERE user_id = $1", [decoded.id]);
-    res.json(rows.map(r => r.track_id));
-  } catch (err) {
-    res.json([]);
+app.get(
+  "/api/music/favorites",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId = Number(
+        req.user?.id || req.userId
+      );
+
+      if (!Number.isInteger(userId) || userId <= 0) {
+        return res.status(401).json({
+          success: false,
+          error: "Authentication required",
+        });
+      }
+
+      const { rows } = await pool.query(
+        `
+        SELECT
+          mf.user_id,
+          mf.track_id,
+          mf.created_at AS favorited_at,
+
+          m.id,
+          m.user_id AS creator_id,
+          m.title,
+          m.artist,
+          m.album,
+          m.genre,
+          m.is_explicit,
+          m.explicit,
+          m.audio_url,
+          m.file_url,
+          m.s3_key,
+          m.audio_s3_key,
+          m.cover_url,
+          m.cover_s3_key,
+          m.cover_key,
+          m.duration,
+          m.tags,
+          m.plays,
+          m.listens,
+          m.likes,
+          m.status,
+          m.created_at
+
+        FROM music_favorites mf
+
+        INNER JOIN music m
+          ON m.id = mf.track_id
+
+        WHERE mf.user_id = $1
+
+        ORDER BY mf.created_at DESC
+        `,
+        [userId]
+      );
+
+      return res.json({
+        success: true,
+        favorites: rows,
+        tracks: rows,
+      });
+
+    } catch (err) {
+      console.error(
+        "GET /api/music/favorites error:",
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to fetch favorites",
+      });
+    }
   }
-});
+);
 
 app.post("/api/music/favorites", async (req, res) => {
   try {
