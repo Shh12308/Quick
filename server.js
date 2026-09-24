@@ -6457,123 +6457,149 @@ app.get("/api/users/me", authenticateToken, async (req, res) => {
     }
 
     const { rows } = await pool.query(
-      `
-      SELECT
-        id,
-        public_id,
-        username,
-        email,
-        name,
-        display_name,
-        phone,
-        profile_url,
-        cover_url,
-        bio,
-        location,
-        website,
-        social_links,
-        is_musician,
-        is_creator,
-        is_admin,
-        is_verified,
-        verified,
-        role,
-        subscription_plan,
-        subscription_expires,
-        preferences,
-        notification_style,
-        status,
-        followers_count,
-        following_count,
-        created_at,
-        updated_at
-      FROM users
-      WHERE id = $1
-      LIMIT 1
-      `,
-      [userId]
-    );
+  `
+  SELECT
+    id,
+    public_id,
+    username,
+    email,
+    name,
+    display_name,
+    phone,
+    profile_url,
+    cover_url,
+    bio,
+    location,
+    website,
+    social_links,
+    is_musician,
+    is_creator,
+    is_admin,
+    is_verified,
+    verified,
+    role,
+    subscription_plan,
+    subscription_expires,
+    preferences,
+    notification_style,
+    status,
+    followers_count,
+    following_count,
+    created_at,
+    updated_at
+  FROM users
+  WHERE id = $1
+  LIMIT 1
+  `,
+  [userId]
+);
 
-    if (!rows.length) {
-      return res.status(404).json({
-        success: false,
-        error: "User not found",
-      });
-    }
+ if (!rows.length) {
+  return res.status(404).json({
+    success: false,
+    error: "User not found",
+  });
+}
 
-    const user = rows[0];
+const user = rows[0];
 
-    const displayName =
-      user.display_name ||
-      user.name ||
-      user.username ||
-      "";
+// Always provide a usable identifier.
+// Prefer public_id, but fall back to the numeric database ID.
+const uuid =
+  user.public_id ||
+  user.publicId ||
+  String(user.id);
 
-    const verified =
-      Boolean(user.is_verified) ||
-      Boolean(user.verified);
+const displayName =
+  user.display_name ||
+  user.name ||
+  user.username ||
+  "";
 
-    return res.json({
-      success: true,
+const verified =
+  Boolean(user.is_verified) ||
+  Boolean(user.verified);
 
-      user: {
-        ...user,
+return res.json({
+  success: true,
 
-        id: user.id,
-        user_id: user.id,
+  user: {
+    ...user,
 
-        uuid: user.public_id,
-        publicId: user.public_id,
+    // IDs
+    id: user.id,
+    user_id: user.id,
 
-        username: user.username,
-        email: user.email,
+    uuid,
+    publicId: uuid,
+    public_id: user.public_id || uuid,
 
-        name: displayName,
-        displayName,
-        display_name: user.display_name || "",
+    // Basic account information
+    username: user.username || "",
+    email: user.email || "",
 
-        profileUrl: user.profile_url || null,
-        profile_url: user.profile_url || null,
-        avatar: user.profile_url || null,
-        profilePicture: user.profile_url || null,
+    name: displayName,
+    displayName,
+    display_name: user.display_name || "",
 
-        coverUrl: user.cover_url || null,
-        cover_url: user.cover_url || null,
-        coverPhoto: user.cover_url || null,
+    // Profile
+    profileUrl: user.profile_url || null,
+    profile_url: user.profile_url || null,
 
-        bio: user.bio || "",
-        location: user.location || "",
-        website: user.website || "",
+    avatar:
+      user.profile_url ||
+      user.avatar ||
+      null,
 
-        socialLinks: user.social_links || {},
-        social_links: user.social_links || {},
+    profilePicture:
+      user.profile_url ||
+      user.avatar ||
+      null,
 
-        isMusician: Boolean(user.is_musician),
-        is_musician: Boolean(user.is_musician),
+    coverUrl: user.cover_url || null,
+    cover_url: user.cover_url || null,
+    coverPhoto: user.cover_url || null,
 
-        isCreator: Boolean(user.is_creator),
-        is_creator: Boolean(user.is_creator),
+    // About
+    bio: user.bio || "",
+    location: user.location || "",
+    website: user.website || "",
 
-        isAdmin: Boolean(user.is_admin),
-        is_admin: Boolean(user.is_admin),
+    // Social links
+    socialLinks: user.social_links || {},
+    social_links: user.social_links || {},
 
-        isVerified: verified,
-        is_verified: verified,
-        verified,
+    // Account types
+    isMusician: Boolean(user.is_musician),
+    is_musician: Boolean(user.is_musician),
 
-        role: user.role || "free",
+    isCreator: Boolean(user.is_creator),
+    is_creator: Boolean(user.is_creator),
 
-        subscriptionPlan:
-          user.subscription_plan || "free",
+    isAdmin: Boolean(user.is_admin),
+    is_admin: Boolean(user.is_admin),
 
-        subscriptionExpires:
-          user.subscription_expires || null,
+    // Verification
+    isVerified: verified,
+    is_verified: verified,
+    verified,
 
-        status: user.status || "active",
+    // Subscription
+    role: user.role || "free",
 
-        isSelf: true,
-      },
-    });
+    subscriptionPlan:
+      user.subscription_plan || "free",
+
+    subscriptionExpires:
+      user.subscription_expires || null,
+
+    // Account status
+    status: user.status || "active",
+
+    // Useful frontend flag
+    isSelf: true,
+  },
+});
   } catch (err) {
     console.error("GET /api/users/me error:", err);
 
