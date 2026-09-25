@@ -164,6 +164,12 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET environment variable is required");
+}
+
 // ==========================================
 // POSTGRESQL POOL
 // ==========================================
@@ -2743,111 +2749,47 @@ app.get("/api/health", async (req, res) => {
   } catch (err) { console.error("Health check failed:", err); res.status(503).json({ status: "error", database: "error", message: err.message }); }
 });
 
-// ==========================================
-// ==========================================
-// CONSISTENT AUTH MIDDLEWARE
-// ==========================================
+// ============================================================
+// AUTHENTICATION MIDDLEWARE
+// ============================================================
+
 const authenticateToken = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return res.status(401).json({
-        error: "No token provided",
-        code: "NO_TOKEN",
+        error: "No token provided"
       });
     }
 
-    const token = authHeader.slice(7).trim();
+    const token = authHeader.split(" ")[1];
 
     if (!token) {
       return res.status(401).json({
-        error: "No token provided",
-        code: "NO_TOKEN",
+        error: "No token provided"
       });
     }
 
-    let decoded;
+    const decoded = jwt.verify(token, JWT_SECRET);
 
-    try {
-      decoded = jwt.verify(token, JWT_SECRET);
-    } catch (err) {
-      console.error("[AUTH] JWT verification failed:", {
-        name: err.name,
-        message: err.message,
-      });
+    // The JWT keeps the INTERNAL numeric ID.
+    // This means all existing database relationships continue working.
+    const userId =
+      decoded.id ||
+      decoded.userId ||
+      decoded.sub;
 
-      if (err.name === "TokenExpiredError") {
-        return res.status(401).json({
-          error: "Token expired",
-          code: "TOKEN_EXPIRED",
-        });
-      }
-
-      if (err.name === "JsonWebTokenError") {
-        return res.status(401).json({
-          error: "Invalid token",
-          code: "INVALID_TOKEN",
-        });
-      }
-
+    if (!userId) {
       return res.status(401).json({
-        error: "Invalid authentication token",
-        code: "INVALID_AUTH",
-      });
-    }
-
-    const userId = Number(
-      decoded.id ??
-      decoded.userId ??
-      decoded.sub
-    );
-
-    if (!Number.isInteger(userId) || userId <= 0) {
-      console.error("[AUTH] Invalid JWT payload:", decoded);
-
-      return res.status(401).json({
-        error: "Invalid token payload",
-        code: "INVALID_TOKEN_PAYLOAD",
+        error: "Invalid token payload"
       });
     }
 
     const { rows } = await pool.query(
-      `
-      SELECT
-        id,
-        public_id,
-        username,
-        email,
-        name,
-        display_name,
-        phone,
-        profile_url,
-        cover_url,
-        bio,
-        location,
-        website,
-        social_links,
-        is_musician,
-        is_creator,
-        is_admin,
-        is_verified,
-        verified,
-        role,
-        subscription_plan,
-        subscription_expires,
-        preferences,
-        notification_style,
-        status,
-        suspend_until,
-        followers_count,
-        following_count,
-        created_at,
-        updated_at
-      FROM users
-      WHERE id = $1
-      LIMIT 1
-      `,
+      `SELECT *
+       FROM users
+       WHERE id = $1`,
       [userId]
     );
 
@@ -2857,14 +2799,13 @@ const authenticateToken = async (req, res, next) => {
       );
 
       return res.status(404).json({
-        error: "User not found",
-        code: "USER_NOT_FOUND",
+        error: "User not found"
       });
     }
 
     const user = rows[0];
 
-    // Handle suspended accounts
+    // Check suspension
     if (user.status === "suspended") {
       if (
         user.suspend_until &&
@@ -2873,27 +2814,23 @@ const authenticateToken = async (req, res, next) => {
         return res.status(403).json({
           error: "Account suspended",
           reason: "Your account is temporarily suspended",
-          until: user.suspend_until,
+          until: user.suspend_until
         });
       }
 
       if (!user.suspend_until) {
         return res.status(403).json({
           error: "Account permanently suspended",
-          reason: "Your account has been permanently suspended",
+          reason: "Your account has been permanently suspended"
         });
       }
 
       // Suspension expired
       await pool.query(
-        `
-        UPDATE users
-        SET
-          status = 'active',
-          suspend_until = NULL,
-          updated_at = NOW()
-        WHERE id = $1
-        `,
+        `UPDATE users
+         SET status = 'active',
+             suspend_until = NULL
+         WHERE id = $1`,
         [userId]
       );
 
@@ -2901,20 +2838,905 @@ const authenticateToken = async (req, res, next) => {
       user.suspend_until = null;
     }
 
-    // Make authenticated user available everywhere
+    // IMPORTANT:
+    // req.userId remains the INTERNAL numeric database ID.
+    // Do NOT change this to public_id.
     req.user = user;
     req.userId = user.id;
 
     next();
+
   } catch (err) {
-    console.error("[AUTH] Unexpected authentication error:", err);
+    if (err.name === "JsonWebTokenError") {
+      return res.status(401).json({
+        error: "Invalid token"
+      });
+    }
+
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({
+        error: "Token expired"
+      });
+    }
+
+    console.error("[AUTH] Unexpected error:", err);
 
     return res.status(500).json({
-      error: "Authentication failed",
-      code: "AUTH_ERROR",
+      error: "Authentication failed"
     });
   }
 };
+
+
+// ============================================================
+// LOGIN
+// ============================================================
+
+app.post("/api/auth/login", checkBan, async (req, res) => {
+  try {
+    const {
+      email,
+      password,
+      captchaToken
+    } = req.body;
+
+    // ----------------------------
+    // Turnstile
+    // ----------------------------
+
+    if (TURNSTILE_SECRET_KEY) {
+      if (!captchaToken) {
+        return res.status(403).json({
+          error: "Security verification required"
+        });
+      }
+
+      const ip =
+        req.headers["x-forwarded-for"]?.split(",")[0] ||
+        req.socket.remoteAddress;
+
+      if (!await verifyTurnstile(captchaToken, ip)) {
+        return res.status(403).json({
+          error: "Security verification failed"
+        });
+      }
+    }
+
+    // ----------------------------
+    // Find user
+    // ----------------------------
+
+    const { rows } = await pool.query(
+      `SELECT *
+       FROM users
+       WHERE email = $1`,
+      [email]
+    );
+
+    if (!rows.length) {
+      return res.status(401).json({
+        error: "Invalid credentials"
+      });
+    }
+
+    const user = rows[0];
+
+    // ----------------------------
+    // Password
+    // ----------------------------
+
+    if (!user.password_hash) {
+      return res.status(401).json({
+        error: "Use OAuth to login"
+      });
+    }
+
+    if (!await verifyPassword(
+      user.password_hash,
+      password
+    )) {
+      return res.status(401).json({
+        error: "Invalid credentials"
+      });
+    }
+
+    // ----------------------------
+    // Update login information
+    // ----------------------------
+
+    await pool.query(
+      `UPDATE users
+       SET last_login_at = NOW(),
+           failed_login_count = 0
+       WHERE id = $1`,
+      [user.id]
+    );
+
+    // ----------------------------
+    // Create login session
+    // ----------------------------
+
+    await createLoginSession(
+      user.id,
+      req
+    );
+
+    // ----------------------------
+    // Remove password
+    // ----------------------------
+
+    const {
+      password_hash,
+      ...safeUser
+    } = user;
+
+    // ----------------------------
+    // PUBLIC USER OBJECT
+    //
+    // IMPORTANT:
+    // user.id is now the UUID.
+    // ----------------------------
+
+    const publicUser = {
+      ...safeUser,
+
+      // PUBLIC ID
+      id: user.public_id,
+
+      // UUID aliases for compatibility
+      uuid: user.public_id,
+      publicId: user.public_id,
+      public_id: user.public_id,
+
+      // Keep internal ID available under a different name
+      user_id: user.id,
+
+      username: user.username,
+      email: user.email,
+
+      name:
+        user.display_name ||
+        user.name ||
+        user.username ||
+        "",
+
+      displayName:
+        user.display_name ||
+        user.name ||
+        user.username ||
+        "",
+
+      display_name:
+        user.display_name || "",
+
+      profileUrl:
+        user.profile_url || null,
+
+      profile_url:
+        user.profile_url || null,
+
+      avatar:
+        user.profile_url || null,
+
+      profilePicture:
+        user.profile_url || null,
+
+      coverUrl:
+        user.cover_url || null,
+
+      cover_url:
+        user.cover_url || null,
+
+      coverPhoto:
+        user.cover_url || null,
+
+      bio:
+        user.bio || "",
+
+      location:
+        user.location || "",
+
+      website:
+        user.website || "",
+
+      socialLinks:
+        user.social_links || {},
+
+      social_links:
+        user.social_links || {},
+
+      isMusician:
+        Boolean(user.is_musician),
+
+      is_musician:
+        Boolean(user.is_musician),
+
+      isCreator:
+        Boolean(user.is_creator),
+
+      is_creator:
+        Boolean(user.is_creator),
+
+      isAdmin:
+        Boolean(user.is_admin),
+
+      is_admin:
+        Boolean(user.is_admin),
+
+      isVerified:
+        Boolean(
+          user.is_verified ||
+          user.verified
+        ),
+
+      is_verified:
+        Boolean(
+          user.is_verified ||
+          user.verified
+        ),
+
+      verified:
+        Boolean(
+          user.is_verified ||
+          user.verified
+        ),
+
+      role:
+        user.role || "free",
+
+      subscriptionPlan:
+        user.subscription_plan || "free",
+
+      subscriptionExpires:
+        user.subscription_expires || null,
+
+      status:
+        user.status || "active"
+    };
+
+    // ----------------------------
+    // JWT
+    //
+    // Keep numeric database ID
+    // internally so existing backend
+    // relationships continue working.
+    //
+    // Also include public UUID.
+    // ----------------------------
+
+    const token = jwt.sign(
+      {
+        id: user.id,
+        userId: user.id,
+
+        // Public UUID
+        uuid: user.public_id,
+        publicId: user.public_id
+      },
+      JWT_SECRET,
+      {
+        expiresIn: "7d"
+      }
+    );
+
+    return res.json({
+      user: publicUser,
+      token
+    });
+
+  } catch (err) {
+    console.error(
+      "Login error:",
+      err
+    );
+
+    return res.status(500).json({
+      error: "Login failed"
+    });
+  }
+});
+
+
+// ============================================================
+// REGISTER
+// ============================================================
+
+app.post("/api/auth/register", checkBan, async (req, res) => {
+  try {
+    const {
+      username,
+      email,
+      password,
+      dob,
+      captchaToken,
+      profile_url
+    } = req.body;
+
+    // ----------------------------
+    // Required fields
+    // ----------------------------
+
+    if (!username || !email || !password) {
+      return res.status(400).json({
+        error: "All fields required"
+      });
+    }
+
+    if (!dob) {
+      return res.status(400).json({
+        error: "Date of birth required"
+      });
+    }
+
+    // ----------------------------
+    // Validate DOB
+    // ----------------------------
+
+    const birthDate = new Date(dob);
+
+    if (isNaN(birthDate.getTime())) {
+      return res.status(400).json({
+        error: "Invalid date of birth"
+      });
+    }
+
+    const today = new Date();
+
+    let age =
+      today.getFullYear() -
+      birthDate.getFullYear();
+
+    if (
+      today.getMonth() < birthDate.getMonth() ||
+      (
+        today.getMonth() === birthDate.getMonth() &&
+        today.getDate() < birthDate.getDate()
+      )
+    ) {
+      age--;
+    }
+
+    if (age < 1 || age > 130) {
+      return res.status(400).json({
+        error: "Invalid age"
+      });
+    }
+
+    // ----------------------------
+    // Password validation
+    // ----------------------------
+
+    const passwordValidation =
+      validatePassword(password);
+
+    if (!passwordValidation.valid) {
+      return res.status(400).json({
+        error: "Password does not meet requirements",
+        details: passwordValidation.errors
+      });
+    }
+
+    // ----------------------------
+    // Turnstile
+    // ----------------------------
+
+    if (TURNSTILE_SECRET_KEY) {
+      if (!captchaToken) {
+        return res.status(403).json({
+          error: "Security verification required"
+        });
+      }
+
+      const ip =
+        req.headers["x-forwarded-for"]?.split(",")[0] ||
+        req.socket.remoteAddress;
+
+      if (!await verifyTurnstile(captchaToken, ip)) {
+        return res.status(403).json({
+          error: "Security verification failed"
+        });
+      }
+    }
+
+    // ----------------------------
+    // Check existing email
+    // ----------------------------
+
+    const emailCheck = await pool.query(
+      `SELECT id
+       FROM users
+       WHERE email = $1`,
+      [email]
+    );
+
+    // ----------------------------
+    // Check username
+    // ----------------------------
+
+    const usernameCheck = await pool.query(
+      `SELECT id
+       FROM users
+       WHERE LOWER(username) = LOWER($1)`,
+      [username]
+    );
+
+    if (
+      emailCheck.rows.length &&
+      usernameCheck.rows.length
+    ) {
+      return res.status(409).json({
+        error: "Email and username already taken"
+      });
+    }
+
+    if (emailCheck.rows.length) {
+      return res.status(409).json({
+        error: "Email already registered"
+      });
+    }
+
+    if (usernameCheck.rows.length) {
+      return res.status(409).json({
+        error: "Username already taken"
+      });
+    }
+
+    // ----------------------------
+    // Profile image
+    // ----------------------------
+
+    let profileUrl = null;
+
+    if (
+      profile_url &&
+      profile_url.startsWith("data:") &&
+      s3
+    ) {
+      try {
+        const matches =
+          profile_url.match(
+            /^data:(image\/\w+);base64,(.+)$/
+          );
+
+        if (matches) {
+          const buffer = await sharp(
+            Buffer.from(
+              matches[2],
+              "base64"
+            )
+          )
+            .resize(400, 400, {
+              fit: "cover",
+              withoutEnlargement: true
+            })
+            .rotate()
+            .jpeg({
+              quality: 85
+            })
+            .toBuffer();
+
+          const s3Key =
+            `profile-pics/${Date.now()}-${username}.jpg`;
+
+          const result =
+            await uploadBufferToS3(
+              buffer,
+              s3Key,
+              "image/jpeg"
+            );
+
+          profileUrl = result.url;
+        }
+      } catch (err) {
+        console.error(
+          "Profile upload failed:",
+          err.message
+        );
+      }
+    }
+
+    // ----------------------------
+    // Password
+    // ----------------------------
+
+    const password_hash =
+      await hashPassword(password);
+
+    const isKid = age <= 12;
+
+    // ----------------------------
+    // INSERT USER
+    //
+    // IMPORTANT:
+    // public_id is generated automatically
+    // by PostgreSQL.
+    // ----------------------------
+
+    const { rows } = await pool.query(
+      `INSERT INTO users
+       (
+         username,
+         email,
+         password_hash,
+         dob,
+         profile_url,
+         role,
+         preferences
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING
+         id,
+         public_id,
+         username,
+         email,
+         role,
+         profile_url,
+         dob,
+         preferences`,
+      [
+        username,
+        email,
+        password_hash,
+        dob,
+        profileUrl,
+        isKid ? "kid" : "free",
+        isKid
+          ? {
+              kids_mode: true,
+              restricted: true
+            }
+          : {}
+      ]
+    );
+
+    const newUser = rows[0];
+
+    // ----------------------------
+    // Creator stats
+    // ----------------------------
+
+    ensureCreatorStats(
+      newUser.id
+    );
+
+    // ----------------------------
+    // Welcome email
+    // ----------------------------
+
+    if (transporter) {
+      transporter.sendMail({
+        from: `"MintZa" <${EMAIL_USER}>`,
+        to: email,
+        subject: "Welcome to MintZa!",
+        html: `<h1>Welcome!</h1>`
+      }).catch(() => {});
+    }
+
+    // ----------------------------
+    // Security log
+    // ----------------------------
+
+    pool.query(
+      `
+      INSERT INTO security_logs
+      (
+        event_type,
+        user_id,
+        ip_address,
+        details
+      )
+      VALUES ($1, $2, $3, $4)
+      `,
+      [
+        "register",
+        newUser.id,
+        req.headers["x-forwarded-for"],
+        {
+          provider: "email"
+        }
+      ]
+    ).catch(() => {});
+
+    // ----------------------------
+    // PUBLIC USER
+    // ----------------------------
+
+    const publicUser = {
+      ...newUser,
+
+      // PUBLIC UUID
+      id: newUser.public_id,
+
+      uuid: newUser.public_id,
+      publicId: newUser.public_id,
+      public_id: newUser.public_id,
+
+      // Internal numeric ID
+      user_id: newUser.id,
+
+      username: newUser.username,
+      email: newUser.email,
+
+      profileUrl:
+        newUser.profile_url || null,
+
+      profile_url:
+        newUser.profile_url || null,
+
+      avatar:
+        newUser.profile_url || null,
+
+      role:
+        newUser.role || "free"
+    };
+
+    // ----------------------------
+    // JWT
+    // ----------------------------
+
+    const token = jwt.sign(
+      {
+        // Internal DB ID
+        id: newUser.id,
+        userId: newUser.id,
+
+        // Public UUID
+        uuid: newUser.public_id,
+        publicId: newUser.public_id
+      },
+      JWT_SECRET,
+      {
+        expiresIn: "7d"
+      }
+    );
+
+    return res.status(201).json({
+      user: publicUser,
+      token
+    });
+
+  } catch (err) {
+    console.error(
+      "Register error:",
+      err
+    );
+
+    if (err.code === "23505") {
+      return res.status(409).json({
+        error: "Account already exists"
+      });
+    }
+
+    return res.status(500).json({
+      error: "Registration failed"
+    });
+  }
+});
+
+
+// ============================================================
+// GET CURRENT USER PROFILE
+// ============================================================
+
+app.get(
+  "/api/users/profile",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      // req.userId is the INTERNAL numeric ID
+      const { rows } = await pool.query(
+        `SELECT *
+         FROM users
+         WHERE id = $1`,
+        [req.userId]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({
+          success: false,
+          error: "User not found"
+        });
+      }
+
+      const user = rows[0];
+
+      const displayName =
+        user.display_name ||
+        user.name ||
+        user.username ||
+        "";
+
+      const verified =
+        Boolean(user.is_verified) ||
+        Boolean(user.verified);
+
+      return res.json({
+        success: true,
+
+        user: {
+          ...user,
+
+          // =================================================
+          // PUBLIC UUID
+          // =================================================
+
+          id: user.public_id,
+
+          uuid: user.public_id,
+
+          publicId: user.public_id,
+
+          public_id: user.public_id,
+
+          // Keep internal DB ID separately
+          user_id: user.id,
+
+          username: user.username,
+
+          email: user.email,
+
+          name: displayName,
+
+          displayName,
+
+          display_name:
+            user.display_name || "",
+
+          profileUrl:
+            user.profile_url || null,
+
+          profile_url:
+            user.profile_url || null,
+
+          avatar:
+            user.profile_url || null,
+
+          profilePicture:
+            user.profile_url || null,
+
+          coverUrl:
+            user.cover_url || null,
+
+          cover_url:
+            user.cover_url || null,
+
+          coverPhoto:
+            user.cover_url || null,
+
+          bio:
+            user.bio || "",
+
+          location:
+            user.location || "",
+
+          website:
+            user.website || "",
+
+          socialLinks:
+            user.social_links || {},
+
+          social_links:
+            user.social_links || {},
+
+          isMusician:
+            Boolean(user.is_musician),
+
+          is_musician:
+            Boolean(user.is_musician),
+
+          isCreator:
+            Boolean(user.is_creator),
+
+          is_creator:
+            Boolean(user.is_creator),
+
+          isAdmin:
+            Boolean(user.is_admin),
+
+          is_admin:
+            Boolean(user.is_admin),
+
+          isVerified:
+            verified,
+
+          is_verified:
+            verified,
+
+          verified,
+
+          role:
+            user.role || "free",
+
+          subscriptionPlan:
+            user.subscription_plan || "free",
+
+          subscriptionExpires:
+            user.subscription_expires || null,
+
+          status:
+            user.status || "active",
+
+          isSelf: true
+        }
+      });
+
+    } catch (err) {
+      console.error(
+        "[PROFILE] Error:",
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load profile"
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// CREATE LOGIN SESSION
+// ============================================================
+
+async function createLoginSession(
+  userId,
+  req
+) {
+  try {
+    const ip =
+      req.headers["x-forwarded-for"]?.split(",")[0] ||
+      req.socket.remoteAddress;
+
+    const userAgent =
+      req.headers["user-agent"] ||
+      "Unknown";
+
+    let device = "Desktop";
+
+    if (
+      /mobile|android|iphone|ipad/i.test(
+        userAgent
+      )
+    ) {
+      device = "Mobile";
+    }
+
+    if (
+      /mac|windows|linux/i.test(
+        userAgent
+      )
+    ) {
+      device = "Desktop";
+    }
+
+    await pool.query(
+      `
+      INSERT INTO login_sessions
+      (
+        user_id,
+        device,
+        ip_address,
+        user_agent,
+        is_current
+      )
+      VALUES ($1, $2, $3, $4, true)
+      `,
+      [
+        userId,
+        device,
+        ip,
+        userAgent
+      ]
+    );
+
+  } catch (err) {
+    console.error(
+      "Login session error:",
+      err
+    );
+  }
+}
 
 // ==========================================
 // LIBRARY / USER DATA ROUTES
@@ -12691,6 +13513,398 @@ app.post(
   }
 );
 
+// ============================================================
+// AUTHENTICATION MIDDLEWARE
+// ============================================================
+
+const authenticateToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        error: "No token provided"
+      });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    if (!token) {
+      return res.status(401).json({
+        error: "No token provided"
+      });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    // The JWT keeps the INTERNAL numeric ID.
+    // This means all existing database relationships continue working.
+    const userId =
+      decoded.id ||
+      decoded.userId ||
+      decoded.sub;
+
+    if (!userId) {
+      return res.status(401).json({
+        error: "Invalid token payload"
+      });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT *
+       FROM users
+       WHERE id = $1`,
+      [userId]
+    );
+
+    if (!rows.length) {
+      console.error(
+        `[AUTH] User ${userId} not found in database`
+      );
+
+      return res.status(404).json({
+        error: "User not found"
+      });
+    }
+
+    const user = rows[0];
+
+    // Check suspension
+    if (user.status === "suspended") {
+      if (
+        user.suspend_until &&
+        new Date(user.suspend_until) > new Date()
+      ) {
+        return res.status(403).json({
+          error: "Account suspended",
+          reason: "Your account is temporarily suspended",
+          until: user.suspend_until
+        });
+      }
+
+      if (!user.suspend_until) {
+        return res.status(403).json({
+          error: "Account permanently suspended",
+          reason: "Your account has been permanently suspended"
+        });
+      }
+
+      // Suspension expired
+      await pool.query(
+        `UPDATE users
+         SET status = 'active',
+             suspend_until = NULL
+         WHERE id = $1`,
+        [userId]
+      );
+
+      user.status = "active";
+      user.suspend_until = null;
+    }
+
+    // IMPORTANT:
+    // req.userId remains the INTERNAL numeric database ID.
+    // Do NOT change this to public_id.
+    req.user = user;
+    req.userId = user.id;
+
+    next();
+
+  } catch (err) {
+    if (err.name === "JsonWebTokenError") {
+      return res.status(401).json({
+        error: "Invalid token"
+      });
+    }
+
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({
+        error: "Token expired"
+      });
+    }
+
+    console.error("[AUTH] Unexpected error:", err);
+
+    return res.status(500).json({
+      error: "Authentication failed"
+    });
+  }
+};
+
+
+// ============================================================
+// LOGIN
+// ============================================================
+
+app.post("/api/auth/login", checkBan, async (req, res) => {
+  try {
+    const {
+      email,
+      password,
+      captchaToken
+    } = req.body;
+
+    // ----------------------------
+    // Turnstile
+    // ----------------------------
+
+    if (TURNSTILE_SECRET_KEY) {
+      if (!captchaToken) {
+        return res.status(403).json({
+          error: "Security verification required"
+        });
+      }
+
+      const ip =
+        req.headers["x-forwarded-for"]?.split(",")[0] ||
+        req.socket.remoteAddress;
+
+      if (!await verifyTurnstile(captchaToken, ip)) {
+        return res.status(403).json({
+          error: "Security verification failed"
+        });
+      }
+    }
+
+    // ----------------------------
+    // Find user
+    // ----------------------------
+
+    const { rows } = await pool.query(
+      `SELECT *
+       FROM users
+       WHERE email = $1`,
+      [email]
+    );
+
+    if (!rows.length) {
+      return res.status(401).json({
+        error: "Invalid credentials"
+      });
+    }
+
+    const user = rows[0];
+
+    // ----------------------------
+    // Password
+    // ----------------------------
+
+    if (!user.password_hash) {
+      return res.status(401).json({
+        error: "Use OAuth to login"
+      });
+    }
+
+    if (!await verifyPassword(
+      user.password_hash,
+      password
+    )) {
+      return res.status(401).json({
+        error: "Invalid credentials"
+      });
+    }
+
+    // ----------------------------
+    // Update login information
+    // ----------------------------
+
+    await pool.query(
+      `UPDATE users
+       SET last_login_at = NOW(),
+           failed_login_count = 0
+       WHERE id = $1`,
+      [user.id]
+    );
+
+    // ----------------------------
+    // Create login session
+    // ----------------------------
+
+    await createLoginSession(
+      user.id,
+      req
+    );
+
+    // ----------------------------
+    // Remove password
+    // ----------------------------
+
+    const {
+      password_hash,
+      ...safeUser
+    } = user;
+
+    // ----------------------------
+    // PUBLIC USER OBJECT
+    //
+    // IMPORTANT:
+    // user.id is now the UUID.
+    // ----------------------------
+
+    const publicUser = {
+      ...safeUser,
+
+      // PUBLIC ID
+      id: user.public_id,
+
+      // UUID aliases for compatibility
+      uuid: user.public_id,
+      publicId: user.public_id,
+      public_id: user.public_id,
+
+      // Keep internal ID available under a different name
+      user_id: user.id,
+
+      username: user.username,
+      email: user.email,
+
+      name:
+        user.display_name ||
+        user.name ||
+        user.username ||
+        "",
+
+      displayName:
+        user.display_name ||
+        user.name ||
+        user.username ||
+        "",
+
+      display_name:
+        user.display_name || "",
+
+      profileUrl:
+        user.profile_url || null,
+
+      profile_url:
+        user.profile_url || null,
+
+      avatar:
+        user.profile_url || null,
+
+      profilePicture:
+        user.profile_url || null,
+
+      coverUrl:
+        user.cover_url || null,
+
+      cover_url:
+        user.cover_url || null,
+
+      coverPhoto:
+        user.cover_url || null,
+
+      bio:
+        user.bio || "",
+
+      location:
+        user.location || "",
+
+      website:
+        user.website || "",
+
+      socialLinks:
+        user.social_links || {},
+
+      social_links:
+        user.social_links || {},
+
+      isMusician:
+        Boolean(user.is_musician),
+
+      is_musician:
+        Boolean(user.is_musician),
+
+      isCreator:
+        Boolean(user.is_creator),
+
+      is_creator:
+        Boolean(user.is_creator),
+
+      isAdmin:
+        Boolean(user.is_admin),
+
+      is_admin:
+        Boolean(user.is_admin),
+
+      isVerified:
+        Boolean(
+          user.is_verified ||
+          user.verified
+        ),
+
+      is_verified:
+        Boolean(
+          user.is_verified ||
+          user.verified
+        ),
+
+      verified:
+        Boolean(
+          user.is_verified ||
+          user.verified
+        ),
+
+      role:
+        user.role || "free",
+
+      subscriptionPlan:
+        user.subscription_plan || "free",
+
+      subscriptionExpires:
+        user.subscription_expires || null,
+
+      status:
+        user.status || "active"
+    };
+
+    // ----------------------------
+    // JWT
+    //
+    // Keep numeric database ID
+    // internally so existing backend
+    // relationships continue working.
+    //
+    // Also include public UUID.
+    // ----------------------------
+
+    const token = jwt.sign(
+      {
+        id: user.id,
+        userId: user.id,
+
+        // Public UUID
+        uuid: user.public_id,
+        publicId: user.public_id
+      },
+      JWT_SECRET,
+      {
+        expiresIn: "7d"
+      }
+    );
+
+    return res.json({
+      user: publicUser,
+      token
+    });
+
+  } catch (err) {
+    console.error(
+      "Login error:",
+      err
+    );
+
+    return res.status(500).json({
+      error: "Login failed"
+    });
+  }
+});
+
+
+// ============================================================
+// REGISTER
+// ============================================================
+
 app.post("/api/auth/register", checkBan, async (req, res) => {
   try {
     const {
@@ -12699,26 +13913,34 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
       password,
       dob,
       captchaToken,
-      profile_url,
+      profile_url
     } = req.body;
+
+    // ----------------------------
+    // Required fields
+    // ----------------------------
 
     if (!username || !email || !password) {
       return res.status(400).json({
-        error: "All fields required",
+        error: "All fields required"
       });
     }
 
     if (!dob) {
       return res.status(400).json({
-        error: "Date of birth required",
+        error: "Date of birth required"
       });
     }
+
+    // ----------------------------
+    // Validate DOB
+    // ----------------------------
 
     const birthDate = new Date(dob);
 
     if (isNaN(birthDate.getTime())) {
       return res.status(400).json({
-        error: "Invalid date of birth",
+        error: "Invalid date of birth"
       });
     }
 
@@ -12740,65 +13962,65 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
 
     if (age < 1 || age > 130) {
       return res.status(400).json({
-        error: "Invalid age",
+        error: "Invalid age"
       });
     }
 
+    // ----------------------------
     // Password validation
+    // ----------------------------
+
     const passwordValidation =
       validatePassword(password);
 
     if (!passwordValidation.valid) {
       return res.status(400).json({
         error: "Password does not meet requirements",
-        details: passwordValidation.errors,
+        details: passwordValidation.errors
       });
     }
 
+    // ----------------------------
     // Turnstile
+    // ----------------------------
+
     if (TURNSTILE_SECRET_KEY) {
       if (!captchaToken) {
         return res.status(403).json({
-          error: "Security verification required",
+          error: "Security verification required"
         });
       }
 
       const ip =
-        req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+        req.headers["x-forwarded-for"]?.split(",")[0] ||
         req.socket.remoteAddress;
 
-      const validCaptcha =
-        await verifyTurnstile(
-          captchaToken,
-          ip
-        );
-
-      if (!validCaptcha) {
+      if (!await verifyTurnstile(captchaToken, ip)) {
         return res.status(403).json({
-          error: "Security verification failed",
+          error: "Security verification failed"
         });
       }
     }
 
-    // Check email
+    // ----------------------------
+    // Check existing email
+    // ----------------------------
+
     const emailCheck = await pool.query(
-      `
-      SELECT id
-      FROM users
-      WHERE LOWER(email) = LOWER($1)
-      LIMIT 1
-      `,
+      `SELECT id
+       FROM users
+       WHERE email = $1`,
       [email]
     );
 
+    // ----------------------------
     // Check username
+    // ----------------------------
+
     const usernameCheck = await pool.query(
-      `
-      SELECT id
-      FROM users
-      WHERE LOWER(username) = LOWER($1)
-      LIMIT 1
-      `,
+      `SELECT id
+       FROM users
+       WHERE LOWER(username) = LOWER($1)`,
       [username]
     );
 
@@ -12807,23 +14029,26 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
       usernameCheck.rows.length
     ) {
       return res.status(409).json({
-        error: "Email and username already taken",
+        error: "Email and username already taken"
       });
     }
 
     if (emailCheck.rows.length) {
       return res.status(409).json({
-        error: "Email already registered",
+        error: "Email already registered"
       });
     }
 
     if (usernameCheck.rows.length) {
       return res.status(409).json({
-        error: "Username already taken",
+        error: "Username already taken"
       });
     }
 
-    // Upload profile image
+    // ----------------------------
+    // Profile image
+    // ----------------------------
+
     let profileUrl = null;
 
     if (
@@ -12839,26 +14064,23 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
 
         if (matches) {
           const buffer = await sharp(
-            Buffer.from(matches[2], "base64")
+            Buffer.from(
+              matches[2],
+              "base64"
+            )
           )
             .resize(400, 400, {
               fit: "cover",
-              withoutEnlargement: true,
+              withoutEnlargement: true
             })
             .rotate()
             .jpeg({
-              quality: 85,
+              quality: 85
             })
             .toBuffer();
 
-          const safeUsername =
-            username.replace(
-              /[^a-zA-Z0-9_-]/g,
-              ""
-            );
-
           const s3Key =
-            `profile-pics/${Date.now()}-${safeUsername}.jpg`;
+            `profile-pics/${Date.now()}-${username}.jpg`;
 
           const result =
             await uploadBufferToS3(
@@ -12877,59 +14099,44 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
       }
     }
 
+    // ----------------------------
+    // Password
+    // ----------------------------
+
     const password_hash =
       await hashPassword(password);
 
     const isKid = age <= 12;
 
-    const preferences = isKid
-      ? {
-          kids_mode: true,
-          restricted: true,
-        }
-      : {};
+    // ----------------------------
+    // INSERT USER
+    //
+    // IMPORTANT:
+    // public_id is generated automatically
+    // by PostgreSQL.
+    // ----------------------------
 
     const { rows } = await pool.query(
-      `
-      INSERT INTO users (
-        username,
-        email,
-        password_hash,
-        dob,
-        profile_url,
-        role,
-        preferences
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      RETURNING
-        id,
-        public_id,
-        username,
-        email,
-        name,
-        display_name,
-        role,
-        profile_url,
-        cover_url,
-        bio,
-        location,
-        website,
-        social_links,
-        is_musician,
-        is_creator,
-        is_admin,
-        is_verified,
-        verified,
-        subscription_plan,
-        subscription_expires,
-        preferences,
-        notification_style,
-        status,
-        followers_count,
-        following_count,
-        created_at,
-        updated_at
-      `,
+      `INSERT INTO users
+       (
+         username,
+         email,
+         password_hash,
+         dob,
+         profile_url,
+         role,
+         preferences
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING
+         id,
+         public_id,
+         username,
+         email,
+         role,
+         profile_url,
+         dob,
+         preferences`,
       [
         username,
         email,
@@ -12937,93 +14144,82 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
         dob,
         profileUrl,
         isKid ? "kid" : "free",
-        preferences,
+        isKid
+          ? {
+              kids_mode: true,
+              restricted: true
+            }
+          : {}
       ]
     );
 
     const newUser = rows[0];
 
+    // ----------------------------
     // Creator stats
-    ensureCreatorStats(newUser.id);
+    // ----------------------------
 
-    // Welcome email
-    if (transporter) {
-      transporter
-        .sendMail({
-          from: `"MintZa" <${EMAIL_USER}>`,
-          to: email,
-          subject: "Welcome to MintZa!",
-          html: `<h1>Welcome to MintZa!</h1>`,
-        })
-        .catch(() => {});
-    }
-
-    // Security log
-    pool
-      .query(
-        `
-        INSERT INTO security_logs (
-          event_type,
-          user_id,
-          ip_address,
-          details
-        )
-        VALUES ($1, $2, $3, $4)
-        `,
-        [
-          "register",
-          newUser.id,
-          req.headers["x-forwarded-for"] ||
-            req.socket.remoteAddress,
-          {
-            provider: "email",
-          },
-        ]
-      )
-      .catch(() => {});
-
-    // JWT
-    const token = jwt.sign(
-      {
-        id: newUser.id,
-      },
-      JWT_SECRET,
-      {
-        expiresIn: "7d",
-      }
+    ensureCreatorStats(
+      newUser.id
     );
 
-    const publicId = newUser.public_id
-      ? String(newUser.public_id)
-      : null;
+    // ----------------------------
+    // Welcome email
+    // ----------------------------
 
-    const displayName =
-      newUser.display_name ||
-      newUser.name ||
-      newUser.username ||
-      "";
+    if (transporter) {
+      transporter.sendMail({
+        from: `"MintZa" <${EMAIL_USER}>`,
+        to: email,
+        subject: "Welcome to MintZa!",
+        html: `<h1>Welcome!</h1>`
+      }).catch(() => {});
+    }
 
-    const verified =
-      Boolean(newUser.is_verified) ||
-      Boolean(newUser.verified);
+    // ----------------------------
+    // Security log
+    // ----------------------------
 
-    const responseUser = {
+    pool.query(
+      `
+      INSERT INTO security_logs
+      (
+        event_type,
+        user_id,
+        ip_address,
+        details
+      )
+      VALUES ($1, $2, $3, $4)
+      `,
+      [
+        "register",
+        newUser.id,
+        req.headers["x-forwarded-for"],
+        {
+          provider: "email"
+        }
+      ]
+    ).catch(() => {});
+
+    // ----------------------------
+    // PUBLIC USER
+    // ----------------------------
+
+    const publicUser = {
       ...newUser,
 
-      id: newUser.id,
-      user_id: newUser.id,
+      // PUBLIC UUID
+      id: newUser.public_id,
 
-      public_id: publicId,
-      publicId: publicId,
-      uuid: publicId,
+      uuid: newUser.public_id,
+      publicId: newUser.public_id,
+      public_id: newUser.public_id,
+
+      // Internal numeric ID
+      user_id: newUser.id,
 
       username: newUser.username,
       email: newUser.email,
-
-      name: displayName,
-      displayName,
-      display_name:
-        newUser.display_name || "",
 
       profileUrl:
         newUser.profile_url || null,
@@ -13034,361 +14230,277 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
       avatar:
         newUser.profile_url || null,
 
-      profilePicture:
-        newUser.profile_url || null,
-
-      coverUrl:
-        newUser.cover_url || null,
-
-      cover_url:
-        newUser.cover_url || null,
-
-      coverPhoto:
-        newUser.cover_url || null,
-
-      bio: newUser.bio || "",
-      location: newUser.location || "",
-      website: newUser.website || "",
-
-      socialLinks:
-        newUser.social_links || {},
-
-      social_links:
-        newUser.social_links || {},
-
-      isMusician:
-        Boolean(newUser.is_musician),
-
-      is_musician:
-        Boolean(newUser.is_musician),
-
-      isCreator:
-        Boolean(newUser.is_creator),
-
-      is_creator:
-        Boolean(newUser.is_creator),
-
-      isAdmin:
-        Boolean(newUser.is_admin),
-
-      is_admin:
-        Boolean(newUser.is_admin),
-
-      isVerified: verified,
-      is_verified: verified,
-      verified,
-
-      role: newUser.role || "free",
-
-      subscriptionPlan:
-        newUser.subscription_plan || "free",
-
-      subscription_plan:
-        newUser.subscription_plan || "free",
-
-      subscriptionExpires:
-        newUser.subscription_expires || null,
-
-      subscription_expires:
-        newUser.subscription_expires || null,
-
-      status:
-        newUser.status || "active",
-
-      followersCount:
-        Number(newUser.followers_count || 0),
-
-      followers_count:
-        Number(newUser.followers_count || 0),
-
-      followingCount:
-        Number(newUser.following_count || 0),
-
-      following_count:
-        Number(newUser.following_count || 0),
-
-      isSelf: true,
+      role:
+        newUser.role || "free"
     };
 
-    return res.status(201).json({
-      success: true,
-      user: responseUser,
-      token,
-    });
+    // ----------------------------
+    // JWT
+    // ----------------------------
 
-  } catch (err) {
-    console.error("Register error:", err);
-
-    if (err.code === "23505") {
-      return res.status(409).json({
-        error: "Account already exists",
-      });
-    }
-
-    return res.status(500).json({
-      error: "Registration failed",
-    });
-  }
-}); 
-
-app.post("/api/auth/login", checkBan, async (req, res) => {
-  try {
-    const {
-      email,
-      password,
-      captchaToken,
-    } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({
-        error: "Email and password are required",
-      });
-    }
-
-    // Cloudflare Turnstile
-    if (TURNSTILE_SECRET_KEY) {
-      if (!captchaToken) {
-        return res.status(403).json({
-          error: "Security verification required",
-        });
-      }
-
-      const ip =
-        req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-        req.socket.remoteAddress;
-
-      const validCaptcha = await verifyTurnstile(
-        captchaToken,
-        ip
-      );
-
-      if (!validCaptcha) {
-        return res.status(403).json({
-          error: "Security verification failed",
-        });
-      }
-    }
-
-    const { rows } = await pool.query(
-      `
-      SELECT *
-      FROM users
-      WHERE LOWER(email) = LOWER($1)
-      LIMIT 1
-      `,
-      [email]
-    );
-
-    if (!rows.length) {
-      return res.status(401).json({
-        error: "Invalid credentials",
-      });
-    }
-
-    const user = rows[0];
-
-    // Check suspended account
-    if (user.status === "suspended") {
-      if (
-        user.suspend_until &&
-        new Date(user.suspend_until) > new Date()
-      ) {
-        return res.status(403).json({
-          error: "Account suspended",
-          reason: "Your account is temporarily suspended",
-          until: user.suspend_until,
-        });
-      }
-
-      if (!user.suspend_until) {
-        return res.status(403).json({
-          error: "Account permanently suspended",
-          reason: "Your account has been permanently suspended",
-        });
-      }
-
-      // Suspension expired
-      await pool.query(
-        `
-        UPDATE users
-        SET
-          status = 'active',
-          suspend_until = NULL,
-          updated_at = NOW()
-        WHERE id = $1
-        `,
-        [user.id]
-      );
-
-      user.status = "active";
-      user.suspend_until = null;
-    }
-
-    if (!user.password_hash) {
-      return res.status(401).json({
-        error: "Use OAuth to login",
-      });
-    }
-
-    const passwordValid = await verifyPassword(
-      user.password_hash,
-      password
-    );
-
-    if (!passwordValid) {
-      await pool.query(
-        `
-        UPDATE users
-        SET failed_login_count = COALESCE(failed_login_count, 0) + 1
-        WHERE id = $1
-        `,
-        [user.id]
-      );
-
-      return res.status(401).json({
-        error: "Invalid credentials",
-      });
-    }
-
-    // Successful login
-    await pool.query(
-      `
-      UPDATE users
-      SET
-        last_login_at = NOW(),
-        failed_login_count = 0,
-        updated_at = NOW()
-      WHERE id = $1
-      `,
-      [user.id]
-    );
-
-    // Create login session
-    await createLoginSession(user.id, req);
-
-    // Never return password hash
-    const {
-      password_hash,
-      ...safeUser
-    } = user;
-
-    // Create JWT
     const token = jwt.sign(
       {
-        id: user.id,
+        // Internal DB ID
+        id: newUser.id,
+        userId: newUser.id,
+
+        // Public UUID
+        uuid: newUser.public_id,
+        publicId: newUser.public_id
       },
       JWT_SECRET,
       {
-        expiresIn: "7d",
+        expiresIn: "7d"
       }
     );
 
-    // Make sure UUID is available in login response
-    const publicId = user.public_id
-      ? String(user.public_id)
-      : null;
-
-    const displayName =
-      user.display_name ||
-      user.name ||
-      user.username ||
-      "";
-
-    const verified =
-      Boolean(user.is_verified) ||
-      Boolean(user.verified);
-
-    const responseUser = {
-      ...safeUser,
-
-      id: user.id,
-      user_id: user.id,
-
-      public_id: publicId,
-      publicId: publicId,
-      uuid: publicId,
-
-      username: user.username,
-      email: user.email,
-
-      name: displayName,
-      displayName,
-      display_name: user.display_name || "",
-
-      profileUrl: user.profile_url || null,
-      profile_url: user.profile_url || null,
-      avatar: user.profile_url || null,
-      profilePicture: user.profile_url || null,
-
-      coverUrl: user.cover_url || null,
-      cover_url: user.cover_url || null,
-      coverPhoto: user.cover_url || null,
-
-      bio: user.bio || "",
-      location: user.location || "",
-      website: user.website || "",
-
-      socialLinks: user.social_links || {},
-      social_links: user.social_links || {},
-
-      isMusician: Boolean(user.is_musician),
-      is_musician: Boolean(user.is_musician),
-
-      isCreator: Boolean(user.is_creator),
-      is_creator: Boolean(user.is_creator),
-
-      isAdmin: Boolean(user.is_admin),
-      is_admin: Boolean(user.is_admin),
-
-      isVerified: verified,
-      is_verified: verified,
-      verified,
-
-      role: user.role || "free",
-
-      subscriptionPlan:
-        user.subscription_plan || "free",
-
-      subscription_plan:
-        user.subscription_plan || "free",
-
-      subscriptionExpires:
-        user.subscription_expires || null,
-
-      subscription_expires:
-        user.subscription_expires || null,
-
-      status: user.status || "active",
-
-      followersCount:
-        Number(user.followers_count || 0),
-
-      followers_count:
-        Number(user.followers_count || 0),
-
-      followingCount:
-        Number(user.following_count || 0),
-
-      following_count:
-        Number(user.following_count || 0),
-
-      isSelf: true,
-    };
-
-    return res.json({
-      success: true,
-      user: responseUser,
-      token,
+    return res.status(201).json({
+      user: publicUser,
+      token
     });
 
   } catch (err) {
-    console.error("Login error:", err);
+    console.error(
+      "Register error:",
+      err
+    );
+
+    if (err.code === "23505") {
+      return res.status(409).json({
+        error: "Account already exists"
+      });
+    }
 
     return res.status(500).json({
-      error: "Login failed",
+      error: "Registration failed"
     });
   }
 });
+
+
+// ============================================================
+// GET CURRENT USER PROFILE
+// ============================================================
+
+app.get(
+  "/api/users/profile",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      // req.userId is the INTERNAL numeric ID
+      const { rows } = await pool.query(
+        `SELECT *
+         FROM users
+         WHERE id = $1`,
+        [req.userId]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({
+          success: false,
+          error: "User not found"
+        });
+      }
+
+      const user = rows[0];
+
+      const displayName =
+        user.display_name ||
+        user.name ||
+        user.username ||
+        "";
+
+      const verified =
+        Boolean(user.is_verified) ||
+        Boolean(user.verified);
+
+      return res.json({
+        success: true,
+
+        user: {
+          ...user,
+
+          // =================================================
+          // PUBLIC UUID
+          // =================================================
+
+          id: user.public_id,
+
+          uuid: user.public_id,
+
+          publicId: user.public_id,
+
+          public_id: user.public_id,
+
+          // Keep internal DB ID separately
+          user_id: user.id,
+
+          username: user.username,
+
+          email: user.email,
+
+          name: displayName,
+
+          displayName,
+
+          display_name:
+            user.display_name || "",
+
+          profileUrl:
+            user.profile_url || null,
+
+          profile_url:
+            user.profile_url || null,
+
+          avatar:
+            user.profile_url || null,
+
+          profilePicture:
+            user.profile_url || null,
+
+          coverUrl:
+            user.cover_url || null,
+
+          cover_url:
+            user.cover_url || null,
+
+          coverPhoto:
+            user.cover_url || null,
+
+          bio:
+            user.bio || "",
+
+          location:
+            user.location || "",
+
+          website:
+            user.website || "",
+
+          socialLinks:
+            user.social_links || {},
+
+          social_links:
+            user.social_links || {},
+
+          isMusician:
+            Boolean(user.is_musician),
+
+          is_musician:
+            Boolean(user.is_musician),
+
+          isCreator:
+            Boolean(user.is_creator),
+
+          is_creator:
+            Boolean(user.is_creator),
+
+          isAdmin:
+            Boolean(user.is_admin),
+
+          is_admin:
+            Boolean(user.is_admin),
+
+          isVerified:
+            verified,
+
+          is_verified:
+            verified,
+
+          verified,
+
+          role:
+            user.role || "free",
+
+          subscriptionPlan:
+            user.subscription_plan || "free",
+
+          subscriptionExpires:
+            user.subscription_expires || null,
+
+          status:
+            user.status || "active",
+
+          isSelf: true
+        }
+      });
+
+    } catch (err) {
+      console.error(
+        "[PROFILE] Error:",
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load profile"
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// CREATE LOGIN SESSION
+// ============================================================
+
+async function createLoginSession(
+  userId,
+  req
+) {
+  try {
+    const ip =
+      req.headers["x-forwarded-for"]?.split(",")[0] ||
+      req.socket.remoteAddress;
+
+    const userAgent =
+      req.headers["user-agent"] ||
+      "Unknown";
+
+    let device = "Desktop";
+
+    if (
+      /mobile|android|iphone|ipad/i.test(
+        userAgent
+      )
+    ) {
+      device = "Mobile";
+    }
+
+    if (
+      /mac|windows|linux/i.test(
+        userAgent
+      )
+    ) {
+      device = "Desktop";
+    }
+
+    await pool.query(
+      `
+      INSERT INTO login_sessions
+      (
+        user_id,
+        device,
+        ip_address,
+        user_agent,
+        is_current
+      )
+      VALUES ($1, $2, $3, $4, true)
+      `,
+      [
+        userId,
+        device,
+        ip,
+        userAgent
+      ]
+    );
+
+  } catch (err) {
+    console.error(
+      "Login session error:",
+      err
+    );
+  }
+}
 
 app.get("/api/auth/google", passport.authenticate("google", { scope: ["profile", "email"], session: false }));
 app.get("/api/auth/google/callback", passport.authenticate("google", { failureRedirect: "/login", session: false }), (req, res) => { const token = jwt.sign({ id: req.user.id }, JWT_SECRET, { expiresIn: "7d" }); res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`); });
