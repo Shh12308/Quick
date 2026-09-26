@@ -6581,18 +6581,119 @@ app.post(
       }
 
       if (!s3) {
+        console.error("S3 client is not configured");
+
         return res.status(500).json({
           success: false,
           error: "S3 not configured",
         });
       }
 
+      // IMPORTANT: multer must have received the file
       if (!req.file) {
+        console.error("No cover file received", {
+          contentType: req.headers["content-type"],
+          bodyKeys: Object.keys(req.body || {}),
+        });
+
         return res.status(400).json({
           success: false,
           error: "No file uploaded",
         });
       }
+
+      console.log("Cover upload received:", {
+        originalname: req.file.originalname,
+        mimetype: req.file.mimetype,
+        size: req.file.size,
+      });
+
+      // --------------------------------------------------
+      // Validate actual image contents
+      // --------------------------------------------------
+
+      const metadata = await sharp(
+        req.file.buffer
+      ).metadata();
+
+      const allowedFormats = [
+        "jpeg",
+        "jpg",
+        "png",
+        "webp",
+        "gif",
+      ];
+
+      if (
+        !metadata.format ||
+        !allowedFormats.includes(
+          metadata.format.toLowerCase()
+        )
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Unsupported image format",
+        });
+      }
+
+      if (
+        !metadata.width ||
+        !metadata.height ||
+        metadata.width < 100 ||
+        metadata.height < 100
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Image dimensions are too small",
+        });
+      }
+
+      // Optional: prevent absurdly large images
+      if (
+        metadata.width > 10000 ||
+        metadata.height > 10000
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Image dimensions are too large",
+        });
+      }
+
+      // --------------------------------------------------
+      // IMAGE MODERATION
+      // --------------------------------------------------
+
+      let moderationResult;
+
+      try {
+        moderationResult = await moderateImage(
+          req.file.buffer
+        );
+      } catch (moderationError) {
+        console.error(
+          "Cover moderation error:",
+          moderationError
+        );
+
+        return res.status(500).json({
+          success: false,
+          error: "Image moderation failed",
+          code: "IMAGE_MODERATION_ERROR",
+        });
+      }
+
+      if (!moderationResult?.allowed) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "This image cannot be used as a cover photo",
+          code: "IMAGE_MODERATION_FAILED",
+        });
+      }
+
+      // --------------------------------------------------
+      // SAFE FILENAME
+      // --------------------------------------------------
 
       const safeName = String(
         req.file.originalname || "cover"
@@ -6602,14 +6703,27 @@ app.post(
 
       const key =
         `cover-photos/${userId}/` +
-        `${Date.now()}-${safeName}`;
+        `${Date.now()}-${safeName}.png`;
 
-      const buffer = await sharp(req.file.buffer)
+      // --------------------------------------------------
+      // PROCESS IMAGE
+      // --------------------------------------------------
+
+      const buffer = await sharp(
+        req.file.buffer
+      )
         .resize(1500, 500, {
           fit: "cover",
+          position: "centre",
         })
-        .png()
+        .png({
+          quality: 90,
+        })
         .toBuffer();
+
+      // --------------------------------------------------
+      // UPLOAD TO S3
+      // --------------------------------------------------
 
       await s3.send(
         new PutObjectCommand({
@@ -6617,12 +6731,22 @@ app.post(
           Key: key,
           Body: buffer,
           ContentType: "image/png",
+          CacheControl:
+            "public, max-age=31536000, immutable",
         })
       );
+
+      // --------------------------------------------------
+      // PUBLIC URL
+      // --------------------------------------------------
 
       const url = AWS_CLOUDFRONT_DOMAIN
         ? `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`
         : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+
+      // --------------------------------------------------
+      // DATABASE
+      // --------------------------------------------------
 
       await pool.query(
         `
@@ -6635,6 +6759,10 @@ app.post(
         [url, userId]
       );
 
+      console.log(
+        `Cover uploaded successfully for user ${userId}: ${url}`
+      );
+
       return res.json({
         success: true,
         cover_url: url,
@@ -6642,7 +6770,12 @@ app.post(
         coverPhoto: url,
       });
     } catch (err) {
-      console.error("Upload cover error:", err);
+      console.error("Upload cover error:", {
+        message: err?.message,
+        stack: err?.stack,
+        name: err?.name,
+        code: err?.code,
+      });
 
       return res.status(500).json({
         success: false,
@@ -6661,6 +6794,10 @@ app.post(
     try {
       const userId = Number(req.user?.id);
 
+      // --------------------------------------------------
+      // AUTH
+      // --------------------------------------------------
+
       if (!userId || Number.isNaN(userId)) {
         return res.status(401).json({
           success: false,
@@ -6668,36 +6805,177 @@ app.post(
         });
       }
 
+      // --------------------------------------------------
+      // S3
+      // --------------------------------------------------
+
       if (!s3) {
+        console.error(
+          "S3 client is not configured"
+        );
+
         return res.status(500).json({
           success: false,
           error: "S3 not configured",
         });
       }
 
+      // --------------------------------------------------
+      // FILE
+      // --------------------------------------------------
+
       if (!req.file) {
+        console.error(
+          "No profile picture received",
+          {
+            contentType:
+              req.headers["content-type"],
+            bodyKeys: Object.keys(
+              req.body || {}
+            ),
+          }
+        );
+
         return res.status(400).json({
           success: false,
           error: "No file uploaded",
         });
       }
 
+      console.log(
+        "Profile picture received:",
+        {
+          originalname:
+            req.file.originalname,
+          mimetype:
+            req.file.mimetype,
+          size: req.file.size,
+        }
+      );
+
+      // --------------------------------------------------
+      // VALIDATE ACTUAL IMAGE
+      // --------------------------------------------------
+
+      const metadata = await sharp(
+        req.file.buffer
+      ).metadata();
+
+      const allowedFormats = [
+        "jpeg",
+        "jpg",
+        "png",
+        "webp",
+        "gif",
+      ];
+
+      const format =
+        metadata.format?.toLowerCase();
+
+      if (
+        !format ||
+        !allowedFormats.includes(format)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Unsupported image format",
+        });
+      }
+
+      if (
+        !metadata.width ||
+        !metadata.height ||
+        metadata.width < 100 ||
+        metadata.height < 100
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Image dimensions are too small",
+        });
+      }
+
+      if (
+        metadata.width > 10000 ||
+        metadata.height > 10000
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Image dimensions are too large",
+        });
+      }
+
+      // --------------------------------------------------
+      // IMAGE MODERATION
+      // --------------------------------------------------
+
+      let moderationResult;
+
+      try {
+        moderationResult =
+          await moderateImage(
+            req.file.buffer
+          );
+      } catch (moderationError) {
+        console.error(
+          "Profile image moderation error:",
+          moderationError
+        );
+
+        return res.status(500).json({
+          success: false,
+          error: "Image moderation failed",
+          code: "IMAGE_MODERATION_ERROR",
+        });
+      }
+
+      if (!moderationResult?.allowed) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "This image cannot be used as a profile picture",
+          code: "IMAGE_MODERATION_FAILED",
+        });
+      }
+
+      // --------------------------------------------------
+      // SAFE FILE NAME
+      // --------------------------------------------------
+
       const safeName = String(
-        req.file.originalname || "profile"
+        req.file.originalname ||
+          "profile"
       )
-        .replace(/[^a-zA-Z0-9._-]/g, "_")
+        .replace(
+          /[^a-zA-Z0-9._-]/g,
+          "_"
+        )
         .slice(0, 100);
 
       const key =
         `profile-pics/${userId}/` +
-        `${Date.now()}-${safeName}`;
+        `${Date.now()}-${safeName}.png`;
 
-      const buffer = await sharp(req.file.buffer)
+      // --------------------------------------------------
+      // PROCESS IMAGE
+      // --------------------------------------------------
+
+      const buffer = await sharp(
+        req.file.buffer
+      )
         .resize(400, 400, {
           fit: "cover",
+          position: "centre",
         })
-        .png()
+        .png({
+          quality: 90,
+        })
         .toBuffer();
+
+      // --------------------------------------------------
+      // UPLOAD TO S3
+      // --------------------------------------------------
 
       await s3.send(
         new PutObjectCommand({
@@ -6705,12 +6983,23 @@ app.post(
           Key: key,
           Body: buffer,
           ContentType: "image/png",
-        })
+          CacheControl:
+            "public, max-age=31536000, immutable",
+        }),
       );
 
-      const url = AWS_CLOUDFRONT_DOMAIN
-        ? `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`
-        : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+      // --------------------------------------------------
+      // PUBLIC URL
+      // --------------------------------------------------
+
+      const url =
+        AWS_CLOUDFRONT_DOMAIN
+          ? `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`
+          : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+
+      // --------------------------------------------------
+      // DATABASE
+      // --------------------------------------------------
 
       await pool.query(
         `
@@ -6723,8 +7012,17 @@ app.post(
         [url, userId]
       );
 
+      console.log(
+        `Profile picture uploaded successfully for user ${userId}`
+      );
+
+      // --------------------------------------------------
+      // RESPONSE
+      // --------------------------------------------------
+
       return res.json({
         success: true,
+
         profile_url: url,
         profileUrl: url,
         avatar: url,
@@ -6733,12 +7031,18 @@ app.post(
     } catch (err) {
       console.error(
         "Upload profile pic error:",
-        err
+        {
+          message: err?.message,
+          stack: err?.stack,
+          name: err?.name,
+          code: err?.code,
+        }
       );
 
       return res.status(500).json({
         success: false,
-        error: "Failed to upload profile picture",
+        error:
+          "Failed to upload profile picture",
       });
     }
   }
