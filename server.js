@@ -6566,110 +6566,9 @@ app.post("/api/livestreams/cleanup", authenticateToken, async (req, res) => {
 // POST /api/users/profile/pic
 // ============================================================
 app.post(
-  "/api/users/profile/pic",
-  authenticateToken,
-  async (req, res) => {
-    try {
-      const userId = Number(req.user?.id);
-
-      if (!userId || Number.isNaN(userId)) {
-        return res.status(401).json({
-          success: false,
-          error: "Authentication required",
-        });
-      }
-
-      if (!s3) {
-        return res.status(500).json({
-          success: false,
-          error: "S3 not configured",
-        });
-      }
-
-      if (!req.file) {
-        return res.status(400).json({
-          success: false,
-          error: "No file uploaded",
-        });
-      }
-
-      const safeName = String(
-        req.file.originalname || "profile"
-      )
-        .replace(/[^a-zA-Z0-9._-]/g, "_")
-        .slice(0, 100);
-
-      const key =
-        `profile-pics/${userId}/` +
-        `${Date.now()}-${safeName}`;
-
-      const buffer = await sharp(
-        req.file.buffer
-      )
-        .resize(400, 400, {
-          fit: "cover",
-        })
-        .png()
-        .toBuffer();
-
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: S3_BUCKET_NAME,
-          Key: key,
-          Body: buffer,
-          ContentType: "image/png",
-        })
-      );
-
-      const url =
-        AWS_CLOUDFRONT_DOMAIN
-          ? `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`
-          : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
-
-      await pool.query(
-        `
-        UPDATE users
-        SET
-          profile_url = $1,
-          updated_at = NOW()
-        WHERE id = $2
-        `,
-        [
-          url,
-          userId,
-        ]
-      );
-
-      return res.json({
-        success: true,
-
-        profile_url: url,
-        profileUrl: url,
-        avatar: url,
-        profilePicture: url,
-      });
-    } catch (err) {
-      console.error(
-        "Upload profile pic error:",
-        err
-      );
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to upload profile picture",
-      });
-    }
-  }
-);
-
-
-// ============================================================
-// UPLOAD COVER PHOTO
-// POST /api/users/cover
-// ============================================================
-app.post(
   "/api/users/cover",
   authenticateToken,
+  upload.single("cover_photo"),
   async (req, res) => {
     try {
       const userId = Number(req.user?.id);
@@ -6705,9 +6604,7 @@ app.post(
         `cover-photos/${userId}/` +
         `${Date.now()}-${safeName}`;
 
-      const buffer = await sharp(
-        req.file.buffer
-      )
+      const buffer = await sharp(req.file.buffer)
         .resize(1500, 500, {
           fit: "cover",
         })
@@ -6723,10 +6620,9 @@ app.post(
         })
       );
 
-      const url =
-        AWS_CLOUDFRONT_DOMAIN
-          ? `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`
-          : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+      const url = AWS_CLOUDFRONT_DOMAIN
+        ? `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`
+        : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
 
       await pool.query(
         `
@@ -6736,28 +6632,113 @@ app.post(
           updated_at = NOW()
         WHERE id = $2
         `,
-        [
-          url,
-          userId,
-        ]
+        [url, userId]
       );
 
       return res.json({
         success: true,
-
         cover_url: url,
         coverUrl: url,
         coverPhoto: url,
       });
     } catch (err) {
+      console.error("Upload cover error:", err);
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to upload cover photo",
+      });
+    }
+  }
+);
+
+
+app.post(
+  "/api/users/profile/pic",
+  authenticateToken,
+  upload.single("profile_pic"),
+  async (req, res) => {
+    try {
+      const userId = Number(req.user?.id);
+
+      if (!userId || Number.isNaN(userId)) {
+        return res.status(401).json({
+          success: false,
+          error: "Authentication required",
+        });
+      }
+
+      if (!s3) {
+        return res.status(500).json({
+          success: false,
+          error: "S3 not configured",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          error: "No file uploaded",
+        });
+      }
+
+      const safeName = String(
+        req.file.originalname || "profile"
+      )
+        .replace(/[^a-zA-Z0-9._-]/g, "_")
+        .slice(0, 100);
+
+      const key =
+        `profile-pics/${userId}/` +
+        `${Date.now()}-${safeName}`;
+
+      const buffer = await sharp(req.file.buffer)
+        .resize(400, 400, {
+          fit: "cover",
+        })
+        .png()
+        .toBuffer();
+
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: S3_BUCKET_NAME,
+          Key: key,
+          Body: buffer,
+          ContentType: "image/png",
+        })
+      );
+
+      const url = AWS_CLOUDFRONT_DOMAIN
+        ? `https://${AWS_CLOUDFRONT_DOMAIN}/${key}`
+        : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+
+      await pool.query(
+        `
+        UPDATE users
+        SET
+          profile_url = $1,
+          updated_at = NOW()
+        WHERE id = $2
+        `,
+        [url, userId]
+      );
+
+      return res.json({
+        success: true,
+        profile_url: url,
+        profileUrl: url,
+        avatar: url,
+        profilePicture: url,
+      });
+    } catch (err) {
       console.error(
-        "Upload cover error:",
+        "Upload profile pic error:",
         err
       );
 
       return res.status(500).json({
         success: false,
-        error: "Failed to upload cover photo",
+        error: "Failed to upload profile picture",
       });
     }
   }
