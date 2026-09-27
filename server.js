@@ -9465,6 +9465,115 @@ app.options("/api/hls-proxy", (req, res) => {
   res.status(204).end();
 });
 
+// ============================================================
+// FOLLOWERS
+// ============================================================
+
+app.get(
+  "/api/users/:userId/followers",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId = Number(req.params.userId);
+
+      if (!userId || Number.isNaN(userId)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid user ID",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        SELECT
+          u.id,
+          u.username,
+          u.display_name,
+          u.profile_url,
+          u.is_verified
+        FROM follows f
+        INNER JOIN users u
+          ON u.id = f.follower_id
+        WHERE f.following_id = $1
+        ORDER BY f.created_at DESC
+        `,
+        [userId]
+      );
+
+      return res.json({
+        success: true,
+        users: result.rows,
+        count: result.rows.length,
+      });
+    } catch (err) {
+      console.error(
+        "Get followers error:",
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load followers",
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// FOLLOWING
+// ============================================================
+
+app.get(
+  "/api/users/:userId/following",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId = Number(req.params.userId);
+
+      if (!userId || Number.isNaN(userId)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid user ID",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        SELECT
+          u.id,
+          u.username,
+          u.display_name,
+          u.profile_url,
+          u.is_verified
+        FROM follows f
+        INNER JOIN users u
+          ON u.id = f.following_id
+        WHERE f.follower_id = $1
+        ORDER BY f.created_at DESC
+        `,
+        [userId]
+      );
+
+      return res.json({
+        success: true,
+        users: result.rows,
+        count: result.rows.length,
+      });
+    } catch (err) {
+      console.error(
+        "Get following error:",
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load following",
+      });
+    }
+  }
+);
+
 app.post('/api/support/report', async (req, res) => {
   const { category, description, email } = req.body;
   // Report can be sent anonymously (no authenticateToken middleware)
