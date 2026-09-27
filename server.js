@@ -7406,12 +7406,33 @@ app.post("/api/livestreams/end/:streamId", authenticateToken, async (req, res) =
 // AGORA TOKEN ROUTE
 app.post("/api/agora/token", authenticateToken, async (req, res) => {
   try {
+    console.log("========================================");
+    console.log("📡 AGORA TOKEN REQUEST");
+    console.log("========================================");
+
+    console.log("AGORA_APP_ID exists:", !!AGORA_APP_ID);
+    console.log(
+      "AGORA_APP_CERTIFICATE exists:",
+      !!AGORA_APP_CERTIFICATE
+    );
+
     const { channelName } = req.body;
+
+    console.log("Channel:", channelName);
+    console.log("Authenticated user ID:", req.user?.id);
 
     if (!channelName) {
       return res.status(400).json({
         error: "Channel name is required"
       });
+    }
+
+    if (!AGORA_APP_ID) {
+      throw new Error("AGORA_APP_ID is missing");
+    }
+
+    if (!AGORA_APP_CERTIFICATE) {
+      throw new Error("AGORA_APP_CERTIFICATE is missing");
     }
 
     const { rows } = await pool.query(
@@ -7423,6 +7444,8 @@ app.post("/api/agora/token", authenticateToken, async (req, res) => {
       [req.user.id]
     );
 
+    console.log("Database users found:", rows.length);
+
     if (!rows.length) {
       return res.status(401).json({
         error: "Authenticated user not found"
@@ -7431,44 +7454,63 @@ app.post("/api/agora/token", authenticateToken, async (req, res) => {
 
     const user = rows[0];
 
+    console.log("User:", {
+      id: user.id,
+      username: user.username,
+      hasPublicId: !!user.public_id
+    });
+
     const uuid = String(user.public_id);
+
+    console.log("UUID:", uuid);
 
     const agoraUid = uuidToAgoraUid(uuid);
 
+    console.log("Agora UID:", agoraUid);
+
     const expirationTimeInSeconds = 86400;
-    const currentTimestamp = Math.floor(Date.now() / 1000);
+
+    const currentTimestamp =
+      Math.floor(Date.now() / 1000);
+
     const privilegeExpiredTs =
       currentTimestamp + expirationTimeInSeconds;
+
+    console.log("Generating Agora token...");
 
     const token = RtcTokenBuilder.buildTokenWithUid(
       AGORA_APP_ID,
       AGORA_APP_CERTIFICATE,
-      channelName.toString(),
+      String(channelName),
       agoraUid,
       RtcRole.PUBLISHER,
       privilegeExpiredTs
     );
 
-    res.json({
+    console.log("✅ Agora token generated");
+
+    return res.json({
       appId: AGORA_APP_ID,
       token,
-      channelName,
+      channelName: String(channelName),
       uid: agoraUid,
-
-      // Application identity
       uuid,
-
-      // Useful for debugging/server-side mapping
       userId: user.id,
       username: user.username,
-
       expiresIn: expirationTimeInSeconds
     });
-  } catch (err) {
-    console.error("Agora token error:", err);
 
-    res.status(500).json({
-      error: "Failed to generate Agora token"
+  } catch (err) {
+    console.error("========================================");
+    console.error("❌ AGORA TOKEN ERROR");
+    console.error("========================================");
+    console.error("Error:", err);
+    console.error("Message:", err?.message);
+    console.error("Stack:", err?.stack);
+
+    return res.status(500).json({
+      error: "Failed to generate Agora token",
+      debug: err?.message || "Unknown error"
     });
   }
 });
