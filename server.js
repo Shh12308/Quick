@@ -7403,7 +7403,21 @@ app.post("/api/livestreams/end/:streamId", authenticateToken, async (req, res) =
   }
 });
 
-// AGORA TOKEN ROUTE
+function uuidToAgoraUid(uuid) {
+  if (!uuid) {
+    throw new Error("UUID is required");
+  }
+
+  let hash = 0;
+
+  for (let i = 0; i < uuid.length; i++) {
+    hash = ((hash << 5) - hash) + uuid.charCodeAt(i);
+    hash |= 0;
+  }
+
+  return Math.abs(hash) || 1;
+}
+
 app.post("/api/agora/token", authenticateToken, async (req, res) => {
   try {
     const { channelName } = req.body;
