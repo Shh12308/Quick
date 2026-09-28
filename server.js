@@ -4112,109 +4112,393 @@ app.post("/api/uploadv", authenticateToken, async (req, res) => {
 
 
 
-app.post("/api/uploads", authenticateToken, shortsUpload.single("video"), async (req, res) => {
-  const userId = req.userId;
+app.post(
+  "/api/uploads",
+  authenticateToken,
+  shortsUpload.single("video"),
+  async (req, res) => {
+    const userId = req.userId;
 
-  const {
-    title,
-    description = "",
-    category = "general",
-    is_short = "true",
-    isPublic = "true",
-    ageRestriction = "none",
-  } = req.body;
+    const {
+      title,
+      description = "",
+      category = "general",
+      is_short = "true",
+      isPublic = "true",
+      ageRestriction = "none",
+      sound_id = null,
+      sound_name = null,
+      video_type = "original",
+      parent_video_id = null,
+      allow_duets = "true",
+      allow_reactions = "true",
+      allow_stitches = "true",
+    } = req.body;
 
-  const videoFile = req.file;
+    const videoFile = req.file;
 
-  // --- Validation ---
-  if (!videoFile) {
-    return res.status(400).json({ error: "Video file is required." });
-  }
-  if (!title || !title.trim()) {
-    return res.status(400).json({ error: "Title is required." });
-  }
+    console.log("[/api/uploads] Starting upload");
+    console.log("[/api/uploads] userId:", userId);
+    console.log("[/api/uploads] file:", videoFile?.originalname);
 
-  const validCategories = ["general", "gaming", "music", "comedy", "education"];
-  if (!validCategories.includes(category)) {
-    return res.status(400).json({ error: `Invalid category. Must be one of: ${validCategories.join(", ")}` });
-  }
-  const validRestrictions = ["none", "moderate", "strict"];
-  if (!validRestrictions.includes(ageRestriction)) {
-    return res.status(400).json({ error: `Invalid ageRestriction. Must be one of: ${validRestrictions.join(", ")}` });
-  }
+    // ---------------------------------------------------------
+    // Validation
+    // ---------------------------------------------------------
 
-  try {
-    // Verify user exists
-    const { rows: userRows } = await pool.query(
-      "SELECT id, username FROM users WHERE id = $1",
-      [userId]
-    );
-    if (!userRows.length) {
-      return res.status(404).json({ error: "User not found." });
+    if (!videoFile) {
+      return res.status(400).json({
+        error: "Video file is required."
+      });
     }
 
-    // --- Upload to S3 ---
-    if (!s3) {
-      return res.status(503).json({ error: "Cloud storage is not configured." });
+    if (!title || !title.trim()) {
+      return res.status(400).json({
+        error: "Title is required."
+      });
     }
 
-    const ext = videoFile.originalname?.split(".").pop() || "mp4";
-    const s3Key = `shorts/${userId}/${Date.now()}-${uuidv4()}.${ext}`;
+    const validCategories = [
+      "general",
+      "gaming",
+      "music",
+      "comedy",
+      "education"
+    ];
 
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: S3_BUCKET_NAME,
-        Key: s3Key,
-        Body: videoFile.buffer,
-        ContentType: videoFile.mimetype,
-      })
-    );
+    if (!validCategories.includes(category)) {
+      return res.status(400).json({
+        error: `Invalid category. Must be one of: ${validCategories.join(", ")}`
+      });
+    }
 
-    const fileUrl = AWS_CLOUDFRONT_DOMAIN
-      ? `https://${AWS_CLOUDFRONT_DOMAIN}/${s3Key}`
-      : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`;
+    const validRestrictions = [
+      "none",
+      "moderate",
+      "strict"
+    ];
 
-    // --- Insert into database ---
-    const { rows } = await pool.query(
-      `INSERT INTO videos (
-        user_id, title, description, category,
-        s3_key, file_url,
-        is_short, is_public, age_restriction, status, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-      RETURNING id, title, created_at`,
-      [
-        userId,
-        title.trim(),
-        description.trim(),
-        category,
-        s3Key,
-        fileUrl,
-        is_short === "true",
-        isPublic === "true",
-        ageRestriction,
-        "processing",
-      ]
-    );
+    if (!validRestrictions.includes(ageRestriction)) {
+      return res.status(400).json({
+        error: `Invalid ageRestriction. Must be one of: ${validRestrictions.join(", ")}`
+      });
+    }
 
-    // Clear cache
-    cache.del(`user-videos:${userId}`);
-    cache.del(`shorts-feed`);
+    const validVideoTypes = [
+      "original",
+      "repost",
+      "duet",
+      "stitch",
+      "remix"
+    ];
 
-    res.status(201).json({
-      success: true,
-      video: {
-        id: rows[0].id,
-        title: rows[0].title,
-        fileUrl,
-        status: "processing",
-        created_at: rows[0].created_at,
-      },
-    });
-  } catch (err) {
-    console.error("[/api/uploads] Error:", err);
-    res.status(500).json({ error: "Failed to upload short. Please try again." });
+    if (!validVideoTypes.includes(video_type)) {
+      return res.status(400).json({
+        error: "Invalid video_type."
+      });
+    }
+
+    try {
+      // -------------------------------------------------------
+      // Verify user
+      // -------------------------------------------------------
+
+      const { rows: userRows } = await pool.query(
+        `
+        SELECT
+          id,
+          username,
+          profile_url
+        FROM users
+        WHERE id = $1
+        `,
+        [userId]
+      );
+
+      if (!userRows.length) {
+        return res.status(404).json({
+          error: "User not found."
+        });
+      }
+
+      const user = userRows[0];
+
+      // -------------------------------------------------------
+      // Check S3
+      // -------------------------------------------------------
+
+      if (!s3) {
+        return res.status(503).json({
+          error: "Cloud storage is not configured."
+        });
+      }
+
+      if (!S3_BUCKET_NAME) {
+        return res.status(503).json({
+          error: "S3 bucket is not configured."
+        });
+      }
+
+      if (!AWS_REGION) {
+        return res.status(503).json({
+          error: "AWS region is not configured."
+        });
+      }
+
+      // -------------------------------------------------------
+      // Create S3 key
+      // -------------------------------------------------------
+
+      const originalName =
+        videoFile.originalname || "video.mp4";
+
+      const extension =
+        originalName.includes(".")
+          ? originalName.split(".").pop().toLowerCase()
+          : "mp4";
+
+      const s3Key =
+        `shorts/${userId}/${Date.now()}-${uuidv4()}.${extension}`;
+
+      console.log("[/api/uploads] Uploading to S3:", s3Key);
+
+      // -------------------------------------------------------
+      // Upload to S3
+      // -------------------------------------------------------
+
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: S3_BUCKET_NAME,
+          Key: s3Key,
+          Body: videoFile.buffer,
+          ContentType: videoFile.mimetype || "video/mp4",
+        })
+      );
+
+      console.log("[/api/uploads] S3 upload successful");
+
+      // -------------------------------------------------------
+      // Build URL
+      // -------------------------------------------------------
+
+      const fileUrl = AWS_CLOUDFRONT_DOMAIN
+        ? `https://${AWS_CLOUDFRONT_DOMAIN}/${s3Key}`
+        : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`;
+
+      // -------------------------------------------------------
+      // Insert video
+      // -------------------------------------------------------
+
+      const { rows } = await pool.query(
+        `
+        INSERT INTO videos (
+          user_id,
+          title,
+          description,
+          category,
+          s3_key,
+          file_url,
+          is_short,
+          is_public,
+          age_restriction,
+          status,
+          video_type,
+          sound_id,
+          sound_name,
+          parent_video_id,
+          allow_duets,
+          allow_reactions,
+          allow_stitches,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          $8,
+          $9,
+          $10,
+          $11,
+          $12,
+          $13,
+          $14,
+          $15,
+          $16,
+          $17,
+          NOW(),
+          NOW()
+        )
+        RETURNING
+          id,
+          title,
+          description,
+          file_url,
+          is_short,
+          is_public,
+          age_restriction,
+          status,
+          video_type,
+          sound_id,
+          sound_name,
+          parent_video_id,
+          allow_duets,
+          allow_reactions,
+          allow_stitches,
+          created_at
+        `,
+        [
+          userId,
+          title.trim(),
+          description.trim(),
+          category,
+          s3Key,
+          fileUrl,
+
+          is_short === "true" || is_short === true,
+
+          isPublic === "true" || isPublic === true,
+
+          ageRestriction,
+
+          "processing",
+
+          video_type,
+
+          sound_id
+            ? Number(sound_id)
+            : null,
+
+          sound_name
+            ? String(sound_name).trim()
+            : null,
+
+          parent_video_id
+            ? Number(parent_video_id)
+            : null,
+
+          allow_duets === "true" || allow_duets === true,
+
+          allow_reactions === "true" || allow_reactions === true,
+
+          allow_stitches === "true" || allow_stitches === true,
+        ]
+      );
+
+      const video = rows[0];
+
+      console.log(
+        "[/api/uploads] Database insert successful:",
+        video.id
+      );
+
+      // -------------------------------------------------------
+      // Clear cache
+      // -------------------------------------------------------
+
+      if (cache) {
+        cache.del(`user-videos:${userId}`);
+        cache.del("shorts-feed");
+      }
+
+      // -------------------------------------------------------
+      // Response
+      // -------------------------------------------------------
+
+      return res.status(201).json({
+        success: true,
+
+        video: {
+          id: video.id,
+
+          video_url: video.file_url,
+
+          file_url: video.file_url,
+
+          is_short: video.is_short,
+
+          user_id: user.id,
+
+          username: user.username,
+
+          avatar: user.profile_url,
+
+          caption: video.description || video.title,
+
+          sound_name:
+            video.sound_name ||
+            `Original sound - ${user.username}`,
+
+          likes: 0,
+
+          comments_count: 0,
+
+          shares: 0,
+
+          reposts: 0,
+
+          saves: 0,
+
+          is_liked: false,
+
+          allow_download: true,
+
+          type: video.video_type,
+
+          parent_video_id:
+            video.parent_video_id,
+
+          parent_username: null,
+
+          allow_duets:
+            video.allow_duets,
+
+          allow_reactions:
+            video.allow_reactions,
+
+          allow_stitches:
+            video.allow_stitches,
+
+          status: video.status,
+
+          created_at: video.created_at,
+        }
+      });
+
+    } catch (err) {
+      console.error(
+        "[/api/uploads] ERROR:",
+        err
+      );
+
+      console.error(
+        "[/api/uploads] ERROR MESSAGE:",
+        err?.message
+      );
+
+      console.error(
+        "[/api/uploads] ERROR CODE:",
+        err?.code
+      );
+
+      console.error(
+        "[/api/uploads] ERROR DETAIL:",
+        err?.detail
+      );
+
+      return res.status(500).json({
+        error: "Failed to upload short.",
+        message:
+          process.env.NODE_ENV === "production"
+            ? "Internal server error"
+            : err?.message || "Unknown error"
+      });
+    }
   }
-});
+);
 
 app.post("/api/chats/dm", authenticateToken, async (req, res) => {
   try {
