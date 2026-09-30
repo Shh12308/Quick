@@ -4376,7 +4376,10 @@ app.post(
       const s3Key =
         `shorts/${userId}/${Date.now()}-${uuidv4()}.${extension}`;
 
-      console.log("[/api/uploads] Uploading to S3:", s3Key);
+      console.log(
+        "[/api/uploads] Uploading to S3:",
+        s3Key
+      );
 
       // -------------------------------------------------------
       // Upload to S3
@@ -4387,19 +4390,26 @@ app.post(
           Bucket: S3_BUCKET_NAME,
           Key: s3Key,
           Body: videoFile.buffer,
-          ContentType: videoFile.mimetype || "video/mp4",
+          ContentType:
+            videoFile.mimetype || "video/mp4",
         })
       );
 
-      console.log("[/api/uploads] S3 upload successful");
+      console.log(
+        "[/api/uploads] S3 upload successful"
+      );
 
       // -------------------------------------------------------
-      // Build URL
+      // Build PUBLIC S3 URL
       // -------------------------------------------------------
 
-      const fileUrl = AWS_CLOUDFRONT_DOMAIN
-        ? `https://${AWS_CLOUDFRONT_DOMAIN}/${s3Key}`
-        : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`;
+      const fileUrl =
+        `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`;
+
+      console.log(
+        "[/api/uploads] Public file URL:",
+        fileUrl
+      );
 
       // -------------------------------------------------------
       // Insert video
@@ -4475,9 +4485,11 @@ app.post(
           s3Key,
           fileUrl,
 
-          is_short === "true" || is_short === true,
+          is_short === "true" ||
+            is_short === true,
 
-          isPublic === "true" || isPublic === true,
+          isPublic === "true" ||
+            isPublic === true,
 
           ageRestriction,
 
@@ -4497,11 +4509,14 @@ app.post(
             ? Number(parent_video_id)
             : null,
 
-          allow_duets === "true" || allow_duets === true,
+          allow_duets === "true" ||
+            allow_duets === true,
 
-          allow_reactions === "true" || allow_reactions === true,
+          allow_reactions === "true" ||
+            allow_reactions === true,
 
-          allow_stitches === "true" || allow_stitches === true,
+          allow_stitches === "true" ||
+            allow_stitches === true,
         ]
       );
 
@@ -4543,7 +4558,9 @@ app.post(
 
           avatar: user.profile_url,
 
-          caption: video.description || video.title,
+          caption:
+            video.description ||
+            video.title,
 
           sound_name:
             video.sound_name ||
@@ -4581,7 +4598,8 @@ app.post(
 
           status: video.status,
 
-          created_at: video.created_at,
+          created_at:
+            video.created_at,
         }
       });
 
@@ -4607,11 +4625,14 @@ app.post(
       );
 
       return res.status(500).json({
-        error: "Failed to upload short.",
+        error:
+          "Failed to upload short.",
+
         message:
           process.env.NODE_ENV === "production"
             ? "Internal server error"
-            : err?.message || "Unknown error"
+            : err?.message ||
+              "Unknown error"
       });
     }
   }
