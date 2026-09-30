@@ -5084,49 +5084,400 @@ RETURNING *
 // ==========================================
 app.get('/api/videos', authenticateToken, async (req, res) => {
   try {
-    const { filter, q, page = 1, limit = 10 } = req.query;
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-    const userId = req.userId;
+    const {
+      filter,
+      q,
+      page = 1,
+      limit = 10
+    } = req.query;
+
+    const pageNumber = Math.max(
+      1,
+      parseInt(page) || 1
+    );
+
+    const limitNumber = Math.min(
+      50,
+      Math.max(1, parseInt(limit) || 10)
+    );
+
+    const offset =
+      (pageNumber - 1) * limitNumber;
+
+    const userId = req.userId || null;
+
+    // -------------------------------------------------------
+    // Search
+    // -------------------------------------------------------
 
     if (q && q.trim()) {
+      const searchTerm = `%${q.trim()}%`;
+
       const { rows } = await pool.query(
-        `SELECT v.id, v.title, v.thumbnail_url, v.duration, v.views, v.created_at, v.category, v.is_short,
-                u.id as "userId", u.username, u.profile_url as avatar, CASE WHEN v.is_live = true THEN true ELSE false END as is_live
-         FROM videos v JOIN users u ON v.user_id = u.id
-         WHERE v.status = 'ready' AND v.is_public = true AND (v.title ILIKE $1 OR v.description ILIKE $1 OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(v.tags) tag WHERE tag ILIKE $2))
-         ORDER BY v.views DESC LIMIT $3 OFFSET $4`,
-        [`%${q.trim()}%`, `%${q.trim()}%`, parseInt(limit), offset]
+        `
+        SELECT
+          v.id,
+          v.title,
+          v.description,
+
+          -- IMPORTANT: return both URLs
+          v.video_url,
+          v.file_url,
+
+          v.thumbnail_url,
+          v.duration,
+          v.views,
+          v.likes,
+          v.dislikes,
+          v.created_at,
+          v.category,
+          v.is_short,
+          v.is_public,
+          v.status,
+
+          u.id AS "userId",
+          u.username,
+          u.profile_url AS avatar,
+
+          CASE
+            WHEN v.is_live = true THEN true
+            ELSE false
+          END AS is_live
+
+        FROM videos v
+
+        JOIN users u
+          ON v.user_id = u.id
+
+        WHERE
+          v.status = 'ready'
+          AND v.is_public = true
+          AND (
+            v.title ILIKE $1
+            OR v.description ILIKE $1
+          )
+
+        ORDER BY v.views DESC
+
+        LIMIT $2
+        OFFSET $3
+        `,
+        [
+          searchTerm,
+          limitNumber,
+          offset
+        ]
       );
-      return res.json({ data: rows });
+
+      const videos = rows.map((video) => ({
+        ...video,
+
+        // Use video_url if it exists,
+        // otherwise use the S3 file_url.
+        video_url:
+          video.video_url ||
+          video.file_url,
+
+        file_url:
+          video.file_url ||
+          video.video_url,
+
+        src:
+          video.video_url ||
+          video.file_url,
+
+        thumbnail:
+          video.thumbnail_url,
+
+        channelName:
+          video.username,
+
+        channelAvatar:
+          video.avatar,
+
+        is_short:
+          video.is_short === true
+      }));
+
+      return res.json({
+        data: videos
+      });
     }
 
-    let query = '', params = [], orderBy = 'v.created_at DESC';
-    if (filter === 'Shorts') { query = `WHERE v.status = 'ready' AND v.is_public = true AND v.is_short = true`; orderBy = 'v.views DESC'; }
-    else if (filter === 'Live') { query = `WHERE v.is_live = true AND v.is_public = true`; orderBy = 'v.viewers DESC NULLS LAST'; }
-    else if (['Gaming','Music','News','Sports','Podcasts','Education','Tech','Shopping'].includes(filter)) {
-      query = `WHERE v.status = 'ready' AND v.is_public = true AND v.category ILIKE $1`; params.push(filter);
-    } else if (filter === 'All') { query = `WHERE v.status = 'ready' AND v.is_public = true`; }
-    else { // Recommended
+    // -------------------------------------------------------
+    // Build filter
+    // -------------------------------------------------------
+
+    let whereClause = `
+      WHERE
+        v.status = 'ready'
+        AND v.is_public = true
+    `;
+
+    const params = [];
+
+    let orderBy =
+      "v.created_at DESC";
+
+    // -------------------------------------------------------
+    // Shorts
+    // -------------------------------------------------------
+
+    if (filter === "Shorts") {
+      whereClause += `
+        AND v.is_short = true
+      `;
+
+      orderBy =
+        "v.created_at DESC";
+    }
+
+    // -------------------------------------------------------
+    // Live
+    // -------------------------------------------------------
+
+    else if (filter === "Live") {
+      whereClause += `
+        AND v.is_live = true
+      `;
+
+      orderBy =
+        "v.viewers DESC NULLS LAST";
+    }
+
+    // -------------------------------------------------------
+    // Categories
+    // -------------------------------------------------------
+
+    else if (
+      [
+        "Gaming",
+        "Music",
+        "News",
+        "Sports",
+        "Podcasts",
+        "Education",
+        "Tech",
+        "Shopping"
+      ].includes(filter)
+    ) {
+      params.push(filter);
+
+      whereClause += `
+        AND v.category ILIKE $${params.length}
+      `;
+    }
+
+    // -------------------------------------------------------
+    // All
+    // -------------------------------------------------------
+
+    else if (filter === "All") {
+      orderBy =
+        "v.created_at DESC";
+    }
+
+    // -------------------------------------------------------
+    // Recommended
+    // -------------------------------------------------------
+
+    else {
       if (userId) {
-        query = `WHERE v.status = 'ready' AND v.is_public = true AND v.user_id != $1 AND NOT EXISTS (SELECT 1 FROM hidden_videos hv WHERE hv.video_id = v.id AND hv.user_id = $1) AND NOT EXISTS (SELECT 1 FROM blocks bu WHERE (bu.blocker_id = $1 AND bu.blocked_id = v.user_id) OR (bu.blocker_id = v.user_id AND bu.blocked_id = $1))`;
         params.push(userId);
-        orderBy = `EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.following_id = v.user_id) DESC, (v.views + COALESCE(v.likes, 0) * 2) * POWER(0.95, EXTRACT(EPOCH FROM (NOW() - v.created_at)) / 3600) DESC`;
+
+        whereClause += `
+          AND v.user_id != $${params.length}
+
+          AND NOT EXISTS (
+            SELECT 1
+            FROM hidden_videos hv
+            WHERE
+              hv.video_id = v.id
+              AND hv.user_id = $${params.length}
+          )
+
+          AND NOT EXISTS (
+            SELECT 1
+            FROM blocks bu
+            WHERE
+              (
+                bu.blocker_id = $${params.length}
+                AND bu.blocked_id = v.user_id
+              )
+              OR
+              (
+                bu.blocker_id = v.user_id
+                AND bu.blocked_id = $${params.length}
+              )
+          )
+        `;
+
+        orderBy = `
+          EXISTS (
+            SELECT 1
+            FROM follows f
+            WHERE
+              f.follower_id = $${params.length}
+              AND f.following_id = v.user_id
+          ) DESC,
+
+          (
+            v.views +
+            COALESCE(v.likes, 0) * 2
+          )
+          *
+          POWER(
+            0.95,
+            EXTRACT(
+              EPOCH FROM
+              (NOW() - v.created_at)
+            ) / 3600
+          ) DESC
+        `;
       } else {
-        query = `WHERE v.status = 'ready' AND v.is_public = true`;
-        orderBy = `(v.views + COALESCE(v.likes, 0) * 2) * POWER(0.95, EXTRACT(EPOCH FROM (NOW() - v.created_at)) / 3600) DESC`;
+        orderBy = `
+          (
+            v.views +
+            COALESCE(v.likes, 0) * 2
+          )
+          *
+          POWER(
+            0.95,
+            EXTRACT(
+              EPOCH FROM
+              (NOW() - v.created_at)
+            ) / 3600
+          ) DESC
+        `;
       }
     }
 
-    params.push(userId || null, parseInt(limit), offset);
+    // -------------------------------------------------------
+    // Pagination
+    // -------------------------------------------------------
+
+    const limitParam =
+      params.length + 1;
+
+    const offsetParam =
+      params.length + 2;
+
+    params.push(limitNumber);
+    params.push(offset);
+
+    // -------------------------------------------------------
+    // Get videos
+    // -------------------------------------------------------
+
     const { rows } = await pool.query(
-      `SELECT v.id, v.title, v.thumbnail_url, v.duration, v.views, v.created_at, v.category, v.is_short, v.likes,
-              u.id as "userId", u.username, u.profile_url as avatar, CASE WHEN v.is_live = true THEN true ELSE false END as is_live
-       FROM videos v JOIN users u ON v.user_id = u.id ${query} ORDER BY ${orderBy} LIMIT $${params.length - 1} OFFSET $${params.length}`, params
+      `
+      SELECT
+        v.id,
+        v.title,
+        v.description,
+
+        -- IMPORTANT
+        v.video_url,
+        v.file_url,
+
+        v.thumbnail_url,
+        v.duration,
+        v.views,
+        v.likes,
+        v.dislikes,
+        v.created_at,
+        v.category,
+        v.is_short,
+        v.is_public,
+        v.status,
+
+        u.id AS "userId",
+        u.username,
+        u.profile_url AS avatar,
+
+        CASE
+          WHEN v.is_live = true
+          THEN true
+          ELSE false
+        END AS is_live
+
+      FROM videos v
+
+      JOIN users u
+        ON v.user_id = u.id
+
+      ${whereClause}
+
+      ORDER BY ${orderBy}
+
+      LIMIT $${limitParam}
+      OFFSET $${offsetParam}
+      `,
+      params
     );
-    res.json({ data: rows });
+
+    // -------------------------------------------------------
+    // Format response
+    // -------------------------------------------------------
+
+    const videos = rows.map((video) => ({
+      ...video,
+
+      // Your newer uploads have video_url = null.
+      // Therefore file_url is the fallback.
+      video_url:
+        video.video_url ||
+        video.file_url,
+
+      file_url:
+        video.file_url ||
+        video.video_url,
+
+      src:
+        video.video_url ||
+        video.file_url,
+
+      thumbnail:
+        video.thumbnail_url,
+
+      channelName:
+        video.username,
+
+      channelAvatar:
+        video.avatar,
+
+      is_short:
+        video.is_short === true
+    }));
+
+    console.log(
+      "[/api/videos] Returning:",
+      videos.length,
+      "videos"
+    );
+
+    console.log(
+      "[/api/videos] Shorts:",
+      videos.filter(
+        (v) => v.is_short
+      ).length
+    );
+
+    return res.json({
+      data: videos
+    });
+
   } catch (err) {
-    console.error('Get videos error:', err);
-    res.status(500).json({ error: "Failed to fetch videos", data: [] });
+    console.error(
+      "Get videos error:",
+      err
+    );
+
+    return res.status(500).json({
+      error: true,
+      msg: "Failed to fetch videos",
+      data: []
+    });
   }
 });
 
