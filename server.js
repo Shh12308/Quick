@@ -3935,40 +3935,6 @@ app.patch('/api/settings/privacy', authenticateToken, async (req, res) => {
 // VIDEO & CONTENT ROUTES
 // ==========================================
 
-// 1. GET /api/videos - List all videos (Feed)
-app.get('/api/videos', async (req, res) => {
-  try {
-    const query = `
-      SELECT 
-        v.id, v.title, v.description, v.video_url, v.thumbnail_url, 
-        v.duration, v.views, v.likes, v.dislikes, v.created_at,
-        u.id as user_id, u.username, u.profile_url, 
-        (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as subscriber_count
-      FROM videos v
-      JOIN users u ON v.user_id = u.id
-      ORDER BY v.created_at DESC
-      LIMIT 50;
-    `;
-
-    const { rows } = await pool.query(query);
-    
-    // Format to match frontend expectations loosely
-    const videos = rows.map(v => ({
-      ...v,
-      src: v.video_url,
-      thumbnail: v.thumbnail_url,
-      channelName: v.username,
-      channelAvatar: v.profile_url,
-      channelSubscribers: parseInt(v.subscriber_count),
-    }));
-
-    res.json({ data: videos });
-  } catch (err) {
-    console.error("Get videos error:", err);
-    res.status(500).json({ error: true, msg: "Server error" });
-  }
-});
-
 app.get('/api/me/friends', async (req, res) => {
   try {
     // replace this with your actual authenticated user ID
