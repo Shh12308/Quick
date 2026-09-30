@@ -3969,6 +3969,123 @@ app.get('/api/videos', async (req, res) => {
   }
 });
 
+app.get('/api/me/friends', async (req, res) => {
+  try {
+    // replace this with your actual authenticated user ID
+    const userId = req.user.id;
+
+    const { rows } = await pool.query(`
+      SELECT
+        u.id,
+        u.username,
+        u.profile_url
+      FROM friends f
+      JOIN users u ON u.id = f.friend_id
+      WHERE f.user_id = $1
+      ORDER BY u.username ASC
+    `, [userId]);
+
+    res.json({ data: rows });
+  } catch (err) {
+    console.error("Get friends error:", err);
+    res.status(500).json({
+      error: true,
+      msg: "Server error"
+    });
+  }
+});
+
+app.get('/api/communities', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT *
+      FROM communities
+      ORDER BY created_at DESC
+    `);
+
+    res.json({ data: rows });
+  } catch (err) {
+    console.error("Get communities error:", err);
+    res.status(500).json({
+      error: true,
+      msg: "Server error"
+    });
+  }
+});
+
+app.get('/api/videos/recommended', async (req, res) => {
+  try {
+    const query = `
+      SELECT
+        v.id,
+        v.title,
+        v.description,
+        v.video_url,
+        v.file_url,
+        v.thumbnail_url,
+        v.duration,
+        v.views,
+        v.likes,
+        v.dislikes,
+        v.created_at,
+        v.is_short,
+        v.status,
+        v.processing_status,
+        u.id AS user_id,
+        u.username,
+        u.profile_url,
+        (
+          SELECT COUNT(*)
+          FROM follows
+          WHERE following_id = u.id
+        ) AS subscriber_count
+      FROM videos v
+      JOIN users u ON v.user_id = u.id
+      WHERE v.is_public = true
+        AND v.is_short = true
+        AND COALESCE(v.video_url, v.file_url) IS NOT NULL
+        AND (
+          v.status = 'ready'
+          OR v.processing_status = 'ready'
+        )
+      ORDER BY v.created_at DESC
+      LIMIT 50;
+    `;
+
+    const { rows } = await pool.query(query);
+
+    const videos = rows.map(v => ({
+      ...v,
+
+      src: v.video_url || v.file_url,
+      thumbnail: v.thumbnail_url,
+
+      channelName: v.username,
+      channelAvatar: v.profile_url,
+
+      channelSubscribers:
+        parseInt(v.subscriber_count || 0, 10),
+    }));
+
+    res.json({
+      success: true,
+      data: videos,
+    });
+
+  } catch (err) {
+    console.error(
+      "Get recommended videos error:",
+      err
+    );
+
+    res.status(500).json({
+      success: false,
+      error: true,
+      msg: "Server error",
+    });
+  }
+});
+
 // ==========================================
 // 1. GET /api/users/me
 // ==========================================
