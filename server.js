@@ -4364,7 +4364,7 @@ app.post(
 
           ageRestriction,
 
-          "processing",
+          "ready",
 
           video_type,
 
