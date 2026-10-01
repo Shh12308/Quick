@@ -7412,7 +7412,7 @@ app.post(
         INSERT INTO chat_participants (
           chat_id,
           user_id,
-          joined_at
+          created_at
         )
         VALUES
           ($1, $2, NOW()),
