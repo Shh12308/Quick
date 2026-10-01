@@ -13748,28 +13748,19 @@ app.post("/auth/check-vpn", async (req, res) => {
 });
 
 // ============================================================
-// CHAT ROUTES
-// IMPORTANT:
-// Keep ONLY ONE GET /api/chats route in your backend.
-// Keep ONLY ONE POST /api/chats/:chatId/accept route.
-// Keep ONLY ONE POST /api/chats/:chatId/read route.
-// Keep ONLY ONE POST /api/chats/:chatId/messages route.
+// GET ALL CHATS
 // ============================================================
-
-
-// ============================================================
-// GET /api/chats
-// Returns:
+// A chat is a MESSAGE REQUEST when:
+//   - the current user does NOT follow the other user
+//
+// A chat is an INBOX chat when:
+//   - the current user DOES follow the other user
+//
+// Response:
 // {
 //   inbox: [...],
 //   requests: [...]
 // }
-//
-// A request is a chat where the current user does NOT follow
-// the other participant.
-//
-// Unread state comes from chat_read_states.
-// There is NO messages.is_read column in your schema.
 // ============================================================
 
 app.get("/api/chats", authenticateToken, async (req, res) => {
@@ -13781,6 +13772,10 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
         error: "Invalid authenticated user",
       });
     }
+
+    console.log(
+      `[CHATS] Loading chats for user ${userId}`
+    );
 
     const result = await pool.query(
       `
@@ -13805,27 +13800,33 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
         COALESCE(unread.unread_count, 0) AS unread_count,
 
         /*
-         * IMPORTANT:
-         * A message is a REQUEST when the recipient
-         * does NOT already follow the sender.
+         * Does the CURRENT USER follow the OTHER USER?
          *
-         * Current user = recipient
-         * Other user = sender
+         * If yes:
+         *   inbox
+         *
+         * If no:
+         *   request
          */
         EXISTS (
           SELECT 1
           FROM follows f
-          WHERE f.follower_id = userId
+          WHERE f.follower_id = $1
             AND f.following_id = other_user.id
-            AND f.status = 'accepted'
         ) AS i_follow
 
       FROM chats c
 
+      /*
+       * Make sure current user belongs to this chat.
+       */
       INNER JOIN chat_participants me
         ON me.chat_id = c.id
        AND me.user_id = $1
 
+      /*
+       * Find the other participant.
+       */
       LEFT JOIN LATERAL (
         SELECT
           u.id,
@@ -13834,43 +13835,74 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
           u.display_name,
           u.profile_url,
           u.is_verified
+
         FROM chat_participants cp
+
         INNER JOIN users u
           ON u.id = cp.user_id
+
         WHERE cp.chat_id = c.id
           AND cp.user_id <> $1
+
         ORDER BY cp.joined_at ASC
         LIMIT 1
       ) other_user ON true
 
+      /*
+       * Count unread messages from the other person.
+       */
       LEFT JOIN LATERAL (
-        SELECT COUNT(*)::integer AS unread_count
+        SELECT
+          COUNT(*)::integer AS unread_count
+
         FROM messages m
+
         LEFT JOIN chat_read_states rs
           ON rs.chat_id = c.id
          AND rs.user_id = $1
+
         WHERE m.chat_id = c.id::text
+
           AND m.sender_id <> $1
+
           AND (
             rs.last_read_at IS NULL
-            OR COALESCE(m.timestamp, m.created_at) > rs.last_read_at
+            OR COALESCE(
+              m.timestamp,
+              m.created_at
+            ) > rs.last_read_at
           )
       ) unread ON true
 
+      /*
+       * Don't show archived chats.
+       */
       WHERE c.is_archived = false
 
       ORDER BY
-        COALESCE(c.last_message_at, c.created_at) DESC
+        COALESCE(
+          c.last_message_at,
+          c.updated_at,
+          c.created_at
+        ) DESC
       `,
       [userId]
     );
 
+    // --------------------------------------------------------
+    // FORMAT CHATS
+    // --------------------------------------------------------
+
     const chats = result.rows.map((chat) => {
-      const isRequest = !Boolean(chat.i_follow);
+      const isRequest =
+        !Boolean(chat.i_follow);
 
       return {
         id: chat.id,
-        type: chat.type || "private",
+
+        type:
+          chat.type ||
+          "private",
 
         name:
           chat.name ||
@@ -13882,72 +13914,161 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
           chat.other_profile_url ||
           "",
 
-        otherUserId: chat.other_user_id,
+        // --------------------------------------------------
+        // OTHER USER
+        // --------------------------------------------------
 
-        otherUser: chat.other_user_id
-          ? {
-              id: chat.other_user_id,
-              username: chat.other_username || "Unknown user",
-              name: chat.other_name || "",
-              displayName:
-                chat.other_display_name ||
-                chat.other_username ||
-                "",
-              profile_url:
-                chat.other_profile_url || "",
-              isVerified:
-                Boolean(chat.other_is_verified),
-            }
-          : null,
+        otherUserId:
+          chat.other_user_id || null,
 
-        lastMessage: chat.last_message
-          ? {
-              id: chat.last_message_id || null,
-              text: chat.last_message,
-              content: chat.last_message,
-              timestamp: chat.last_message_at,
-            }
-          : null,
+        other_username:
+          chat.other_username || null,
 
-        lastMessageAt:
+        other_profile_url:
+          chat.other_profile_url || null,
+
+        otherUser:
+          chat.other_user_id
+            ? {
+                id: chat.other_user_id,
+
+                username:
+                  chat.other_username ||
+                  "Unknown user",
+
+                name:
+                  chat.other_name ||
+                  "",
+
+                displayName:
+                  chat.other_display_name ||
+                  chat.other_username ||
+                  "",
+
+                profile_url:
+                  chat.other_profile_url ||
+                  "",
+
+                profileUrl:
+                  chat.other_profile_url ||
+                  "",
+
+                isVerified:
+                  Boolean(
+                    chat.other_is_verified
+                  ),
+              }
+            : null,
+
+        // --------------------------------------------------
+        // LAST MESSAGE
+        // --------------------------------------------------
+
+        lastMessage:
+          chat.last_message
+            ? {
+                id:
+                  chat.last_message_id ||
+                  null,
+
+                text:
+                  chat.last_message,
+
+                content:
+                  chat.last_message,
+
+                timestamp:
+                  chat.last_message_at ||
+                  null,
+              }
+            : null,
+
+        last_message:
+          chat.last_message ||
+          null,
+
+        last_message_at:
           chat.last_message_at ||
-          chat.created_at,
+          null,
 
-        unreadCount:
-          Number(chat.unread_count || 0),
-
-        unread:
-          Number(chat.unread_count || 0) > 0,
+        // --------------------------------------------------
+        // REQUEST STATUS
+        // --------------------------------------------------
 
         isRequest,
 
-        createdAt: chat.created_at,
-        updatedAt: chat.updated_at,
+        // --------------------------------------------------
+        // UNREAD
+        // --------------------------------------------------
+
+        unreadCount:
+          Number(
+            chat.unread_count || 0
+          ),
+
+        unread:
+          Number(
+            chat.unread_count || 0
+          ) > 0,
+
+        // --------------------------------------------------
+        // DATES
+        // --------------------------------------------------
+
+        createdAt:
+          chat.created_at,
+
+        updatedAt:
+          chat.updated_at,
+
+        // --------------------------------------------------
+        // DEFAULT CHAT FLAGS
+        // --------------------------------------------------
 
         pinned: false,
+
         muted: false,
+
         archived: false,
       };
     });
 
-    return res.json({
-      inbox: chats.filter(
-        (chat) => !chat.isRequest
-      ),
+    // --------------------------------------------------------
+    // SPLIT INTO INBOX + REQUESTS
+    // --------------------------------------------------------
 
-      requests: chats.filter(
-        (chat) => chat.isRequest
-      ),
+    const inbox = chats.filter(
+      (chat) =>
+        chat.isRequest === false
+    );
+
+    const requests = chats.filter(
+      (chat) =>
+        chat.isRequest === true
+    );
+
+    console.log(
+      `[CHATS] User ${userId}: ${inbox.length} inbox, ${requests.length} requests`
+    );
+
+    // --------------------------------------------------------
+    // RETURN
+    // --------------------------------------------------------
+
+    return res.json({
+      inbox,
+      requests,
     });
 
   } catch (err) {
     console.error(
-      "GET /api/chats failed:",
+      "GET /api/chats error:",
       err
     );
 
     return res.status(500).json({
       error: "Failed to load chats",
+
       details:
         process.env.NODE_ENV === "production"
           ? undefined
