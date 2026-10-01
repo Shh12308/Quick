@@ -14612,10 +14612,10 @@ app.post(
       // but keeps old data synchronized.
       await pool.query(
         `
-        UPDATE chat_participants
-        SET last_read_at = NOW()
-        WHERE chat_id = $1
-          AND user_id = $2
+        INSERT INTO chat_read_states (chat_id, user_id, last_read_at)
+VALUES ($1, $2, NOW())
+ON CONFLICT (chat_id, user_id)
+DO UPDATE SET last_read_at = NOW()
         `,
         [chatId, myId]
       );
