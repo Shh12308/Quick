@@ -7224,12 +7224,49 @@ app.post("/api/chats/direct", authenticateREST, async (req, res) => {
     }
 
     // Create DM
-    const created = await pool.query(
-      `INSERT INTO chats (participants, type, created_at)
-       VALUES (ARRAY[$1::int, $2::int], 'private', NOW())
-       RETURNING id`,
-      [myId, targetId]
-    );
+    // Create DM
+const created = await pool.query(
+  `
+  INSERT INTO chats (
+    participants,
+    type,
+    created_at,
+    updated_at
+  )
+  VALUES (
+    ARRAY[$1::int, $2::int],
+    'private',
+    NOW(),
+    NOW()
+  )
+  RETURNING id
+  `,
+  [myId, targetId]
+);
+
+const chatId = created.rows[0].id;
+
+// IMPORTANT:
+// Add BOTH users to the modern participant table.
+await pool.query(
+  `
+  INSERT INTO chat_participants (
+    chat_id,
+    user_id,
+    joined_at
+  )
+  VALUES
+    ($1, $2, NOW()),
+    ($1, $3, NOW())
+  ON CONFLICT (chat_id, user_id)
+  DO NOTHING
+  `,
+  [chatId, myId, targetId]
+);
+
+return res.json({
+  id: chatId,
+});
 
     res.json({ id: created.rows[0].id });
   } catch (err) {
@@ -13737,256 +13774,155 @@ app.post("/auth/check-vpn", async (req, res) => {
 
 app.get("/api/chats", authenticateToken, async (req, res) => {
   try {
-    const myId = Number(req.user.id);
+    const userId = Number(req.userId || req.user?.id);
 
-    if (!Number.isInteger(myId)) {
+    if (!Number.isInteger(userId)) {
       return res.status(401).json({
         error: "Invalid authenticated user",
       });
     }
 
-    const { rows } = await pool.query(
+    const result = await pool.query(
       `
       SELECT
         c.id,
         c.type,
         c.name,
         c.avatar,
-        c.created_at,
-        c.updated_at,
         c.last_message,
         c.last_message_id,
         c.last_message_at,
+        c.created_at,
+        c.updated_at,
 
-        -- Find the other participant.
-        -- Prefer chat_participants, then fall back to
-        -- the legacy chats.participants array.
-        COALESCE(
-          (
-            SELECT cp.user_id
-            FROM chat_participants cp
-            WHERE cp.chat_id = c.id
-              AND cp.user_id <> $1
-            ORDER BY cp.id
-            LIMIT 1
-          ),
-          (
-            SELECT p
-            FROM unnest(COALESCE(c.participants, ARRAY[]::integer[])) AS p
-            WHERE p <> $1
-            LIMIT 1
-          )
-        ) AS other_user_id,
+        other_user.id AS other_user_id,
+        other_user.username AS other_username,
+        other_user.name AS other_name,
+        other_user.display_name AS other_display_name,
+        other_user.profile_url AS other_profile_url,
+        other_user.is_verified AS other_is_verified,
 
-        COALESCE(
-          (
-            SELECT u.username
-            FROM chat_participants cp
-            JOIN users u ON u.id = cp.user_id
-            WHERE cp.chat_id = c.id
-              AND cp.user_id <> $1
-            ORDER BY cp.id
-            LIMIT 1
-          ),
-          (
-            SELECT u.username
-            FROM users u
-            WHERE u.id = (
-              SELECT p
-              FROM unnest(COALESCE(c.participants, ARRAY[]::integer[])) AS p
-              WHERE p <> $1
-              LIMIT 1
-            )
-          )
-        ) AS other_username,
+        COALESCE(unread.unread_count, 0) AS unread_count,
 
-        COALESCE(
-          (
-            SELECT u.profile_url
-            FROM chat_participants cp
-            JOIN users u ON u.id = cp.user_id
-            WHERE cp.chat_id = c.id
-              AND cp.user_id <> $1
-            ORDER BY cp.id
-            LIMIT 1
-          ),
-          (
-            SELECT u.profile_url
-            FROM users u
-            WHERE u.id = (
-              SELECT p
-              FROM unnest(COALESCE(c.participants, ARRAY[]::integer[])) AS p
-              WHERE p <> $1
-              LIMIT 1
-            )
-          )
-        ) AS other_avatar,
-
-        -- Do I follow the other person?
+        /*
+         * IMPORTANT:
+         * A message is a REQUEST when the recipient
+         * does NOT already follow the sender.
+         *
+         * Current user = recipient
+         * Other user = sender
+         */
         EXISTS (
           SELECT 1
           FROM follows f
-          WHERE f.follower_id = $1
-            AND f.following_id = COALESCE(
-              (
-                SELECT cp.user_id
-                FROM chat_participants cp
-                WHERE cp.chat_id = c.id
-                  AND cp.user_id <> $1
-                ORDER BY cp.id
-                LIMIT 1
-              ),
-              (
-                SELECT p
-                FROM unnest(
-                  COALESCE(c.participants, ARRAY[]::integer[])
-                ) AS p
-                WHERE p <> $1
-                LIMIT 1
-              )
-            )
+          WHERE f.follower_id = userId
+            AND f.following_id = other_user.id
             AND f.status = 'accepted'
-        ) AS i_follow,
-
-        -- Last message.
-        lm.id AS last_msg_id,
-        lm.content AS last_msg_content,
-        lm.type AS last_msg_type,
-        lm.media_url AS last_msg_media_url,
-        lm.sender_id AS last_msg_sender_id,
-        lm.timestamp AS last_msg_timestamp,
-
-        -- Read state for THIS user.
-        crs.last_read_at,
-
-        -- Number of messages from the other person after
-        -- this user's last_read_at.
-        (
-          SELECT COUNT(*)
-          FROM messages m
-          WHERE m.chat_id = c.id::text
-            AND m.sender_id <> $1
-            AND m.created_at >
-                COALESCE(crs.last_read_at, 'epoch'::timestamp)
-        ) AS unread_count
+        ) AS i_follow
 
       FROM chats c
 
-      LEFT JOIN chat_read_states crs
-        ON crs.chat_id = c.id
-       AND crs.user_id = $1
+      INNER JOIN chat_participants me
+        ON me.chat_id = c.id
+       AND me.user_id = $1
 
       LEFT JOIN LATERAL (
         SELECT
-          m.id,
-          m.content,
-          m.type,
-          m.media_url,
-          m.sender_id,
-          m.timestamp
-        FROM messages m
-        WHERE m.chat_id = c.id::text
-        ORDER BY m.created_at DESC, m.id DESC
+          u.id,
+          u.username,
+          u.name,
+          u.display_name,
+          u.profile_url,
+          u.is_verified
+        FROM chat_participants cp
+        INNER JOIN users u
+          ON u.id = cp.user_id
+        WHERE cp.chat_id = c.id
+          AND cp.user_id <> $1
+        ORDER BY cp.joined_at ASC
         LIMIT 1
-      ) lm ON true
+      ) other_user ON true
 
-      WHERE
-        (
-          -- Modern participant records
-          EXISTS (
-            SELECT 1
-            FROM chat_participants cp
-            WHERE cp.chat_id = c.id
-              AND cp.user_id = $1
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::integer AS unread_count
+        FROM messages m
+        LEFT JOIN chat_read_states rs
+          ON rs.chat_id = c.id
+         AND rs.user_id = $1
+        WHERE m.chat_id = c.id::text
+          AND m.sender_id <> $1
+          AND (
+            rs.last_read_at IS NULL
+            OR COALESCE(m.timestamp, m.created_at) > rs.last_read_at
           )
+      ) unread ON true
 
-          OR
-
-          -- Legacy participant array
-          $1 = ANY(
-            COALESCE(c.participants, ARRAY[]::integer[])
-          )
-        )
+      WHERE c.is_archived = false
 
       ORDER BY
-        COALESCE(
-          lm.timestamp,
-          c.last_message_at,
-          c.created_at
-        ) DESC
+        COALESCE(c.last_message_at, c.created_at) DESC
       `,
-      [myId]
+      [userId]
     );
 
-    const chats = rows.map((r) => {
-      const otherUserId = r.other_user_id
-        ? Number(r.other_user_id)
-        : null;
-
-      const unreadCount = Number(r.unread_count || 0);
+    const chats = result.rows.map((chat) => {
+      const isRequest = !Boolean(chat.i_follow);
 
       return {
-        id: r.id,
-
-        type: r.type || "private",
+        id: chat.id,
+        type: chat.type || "private",
 
         name:
-          r.name ||
-          r.other_username ||
+          chat.name ||
+          chat.other_username ||
           "Chat",
 
         avatar:
-          r.avatar ||
-          r.other_avatar ||
+          chat.avatar ||
+          chat.other_profile_url ||
           "",
 
-        otherUserId,
+        otherUserId: chat.other_user_id,
 
-        otherUser: otherUserId
+        otherUser: chat.other_user_id
           ? {
-              id: otherUserId,
-              username: r.other_username || "Unknown user",
-              profile_url: r.other_avatar || "",
+              id: chat.other_user_id,
+              username: chat.other_username || "Unknown user",
+              name: chat.other_name || "",
+              displayName:
+                chat.other_display_name ||
+                chat.other_username ||
+                "",
+              profile_url:
+                chat.other_profile_url || "",
+              isVerified:
+                Boolean(chat.other_is_verified),
             }
           : null,
 
-        lastMessage: r.last_msg_id
+        lastMessage: chat.last_message
           ? {
-              id: Number(r.last_msg_id),
-              text: r.last_msg_content || "",
-              content: r.last_msg_content || "",
-              type: r.last_msg_type || "text",
-              media_url: r.last_msg_media_url || null,
-              senderId: r.last_msg_sender_id
-                ? Number(r.last_msg_sender_id)
-                : null,
-              timestamp: r.last_msg_timestamp || null,
+              id: chat.last_message_id || null,
+              text: chat.last_message,
+              content: chat.last_message,
+              timestamp: chat.last_message_at,
             }
-          : r.last_message
-            ? {
-                id: r.last_message_id
-                  ? Number(r.last_message_id)
-                  : null,
-                text: r.last_message,
-                content: r.last_message,
-                timestamp: r.last_message_at || null,
-              }
-            : null,
+          : null,
 
         lastMessageAt:
-          r.last_msg_timestamp ||
-          r.last_message_at ||
-          r.created_at,
+          chat.last_message_at ||
+          chat.created_at,
 
-        unread: unreadCount,
-        unreadCount,
+        unreadCount:
+          Number(chat.unread_count || 0),
 
-        // IMPORTANT:
-        // If I don't follow them, it is a request.
-        isRequest: !Boolean(r.i_follow),
+        unread:
+          Number(chat.unread_count || 0) > 0,
 
-        createdAt: r.created_at,
-        updatedAt: r.updated_at,
+        isRequest,
+
+        createdAt: chat.created_at,
+        updatedAt: chat.updated_at,
 
         pinned: false,
         muted: false,
@@ -13994,19 +13930,28 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
       };
     });
 
-    res.json({
-      inbox: chats.filter((chat) => !chat.isRequest),
-      requests: chats.filter((chat) => chat.isRequest),
-    });
-  } catch (err) {
-    console.error("GET /api/chats failed:", err);
+    return res.json({
+      inbox: chats.filter(
+        (chat) => !chat.isRequest
+      ),
 
-    res.status(500).json({
+      requests: chats.filter(
+        (chat) => chat.isRequest
+      ),
+    });
+
+  } catch (err) {
+    console.error(
+      "GET /api/chats failed:",
+      err
+    );
+
+    return res.status(500).json({
       error: "Failed to load chats",
-      detail:
-        process.env.NODE_ENV === "development"
-          ? String(err?.message || err)
-          : undefined,
+      details:
+        process.env.NODE_ENV === "production"
+          ? undefined
+          : err.message,
     });
   }
 });
