@@ -7193,87 +7193,321 @@ app.post("/api/chats/:chatId/messages", authenticateREST, async (req, res) => {
   }
 });
 
-app.post("/api/chats/direct", authenticateREST, async (req, res) => {
-  try {
-    const myId = req.user.id;
-    const targetId = parseInt(req.body?.userId, 10);
+// ============================================================
+// CREATE / GET DIRECT CHAT
+// ============================================================
 
-    if (!targetId || isNaN(targetId)) {
-      return res.status(400).json({ error: "Invalid user" });
+app.post(
+  "/api/chats/direct",
+  authenticateToken,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const myId = Number(
+        req.userId || req.user?.id
+      );
+
+      const targetId = Number(
+        req.body?.userId ||
+        req.body?.targetUserId ||
+        req.body?.otherUserId
+      );
+
+      console.log(
+        "[CHAT DIRECT] Request:",
+        {
+          myId,
+          targetId,
+        }
+      );
+
+      if (!Number.isInteger(myId)) {
+        return res.status(401).json({
+          error:
+            "Invalid authenticated user",
+        });
+      }
+
+      if (!Number.isInteger(targetId)) {
+        return res.status(400).json({
+          error:
+            "Valid userId is required",
+        });
+      }
+
+      if (myId === targetId) {
+        return res.status(400).json({
+          error:
+            "You cannot message yourself",
+        });
+      }
+
+      // --------------------------------------------------------
+      // CHECK TARGET USER
+      // --------------------------------------------------------
+
+      const targetResult =
+        await client.query(
+          `
+          SELECT
+            id,
+            username,
+            name,
+            display_name,
+            profile_url,
+            is_verified
+          FROM users
+          WHERE id = $1
+          LIMIT 1
+          `,
+          [targetId]
+        );
+
+      if (
+        targetResult.rows.length === 0
+      ) {
+        return res.status(404).json({
+          error: "User not found",
+        });
+      }
+
+      const targetUser =
+        targetResult.rows[0];
+
+      // --------------------------------------------------------
+      // FIND EXISTING DIRECT CHAT
+      // --------------------------------------------------------
+
+      const existingResult =
+        await client.query(
+          `
+          SELECT c.id
+          FROM chats c
+
+          INNER JOIN chat_participants cp1
+            ON cp1.chat_id = c.id
+           AND cp1.user_id = $1
+
+          INNER JOIN chat_participants cp2
+            ON cp2.chat_id = c.id
+           AND cp2.user_id = $2
+
+          WHERE c.type = 'private'
+            AND c.is_archived = false
+
+          LIMIT 1
+          `,
+          [myId, targetId]
+        );
+
+      if (
+        existingResult.rows.length > 0
+      ) {
+        const chatId =
+          existingResult.rows[0].id;
+
+        console.log(
+          "[CHAT DIRECT] Existing chat:",
+          chatId
+        );
+
+        // Make absolutely sure both participants exist.
+        await client.query(
+          `
+          INSERT INTO chat_participants (
+            chat_id,
+            user_id,
+            joined_at
+          )
+          VALUES
+            ($1, $2, NOW()),
+            ($1, $3, NOW())
+          ON CONFLICT (
+            chat_id,
+            user_id
+          )
+          DO NOTHING
+          `,
+          [
+            chatId,
+            myId,
+            targetId,
+          ]
+        );
+
+        return res.json({
+          id: chatId,
+
+          chatId,
+
+          otherUser: {
+            id: targetUser.id,
+            username:
+              targetUser.username ||
+              "",
+            name:
+              targetUser.name ||
+              "",
+            displayName:
+              targetUser.display_name ||
+              targetUser.username ||
+              "",
+            profile_url:
+              targetUser.profile_url ||
+              "",
+            isVerified:
+              Boolean(
+                targetUser.is_verified
+              ),
+          },
+        });
+      }
+
+      // --------------------------------------------------------
+      // CREATE NEW CHAT
+      // --------------------------------------------------------
+
+      await client.query(
+        "BEGIN"
+      );
+
+      const createdResult =
+        await client.query(
+          `
+          INSERT INTO chats (
+            participants,
+            type,
+            created_at,
+            updated_at,
+            is_archived
+          )
+          VALUES (
+            ARRAY[$1::integer, $2::integer],
+            'private',
+            NOW(),
+            NOW(),
+            false
+          )
+          RETURNING id
+          `,
+          [
+            myId,
+            targetId,
+          ]
+        );
+
+      const chatId =
+        createdResult.rows[0].id;
+
+      console.log(
+        "[CHAT DIRECT] Created chat:",
+        chatId
+      );
+
+      // --------------------------------------------------------
+      // IMPORTANT:
+      // ADD BOTH USERS TO chat_participants
+      // --------------------------------------------------------
+
+      await client.query(
+        `
+        INSERT INTO chat_participants (
+          chat_id,
+          user_id,
+          joined_at
+        )
+        VALUES
+          ($1, $2, NOW()),
+          ($1, $3, NOW())
+        ON CONFLICT (
+          chat_id,
+          user_id
+        )
+        DO NOTHING
+        `,
+        [
+          chatId,
+          myId,
+          targetId,
+        ]
+      );
+
+      await client.query(
+        "COMMIT"
+      );
+
+      console.log(
+        "[CHAT DIRECT] Participants created:",
+        {
+          chatId,
+          myId,
+          targetId,
+        }
+      );
+
+      return res.status(201).json({
+        id: chatId,
+
+        chatId,
+
+        type: "private",
+
+        otherUser: {
+          id: targetUser.id,
+
+          username:
+            targetUser.username ||
+            "",
+
+          name:
+            targetUser.name ||
+            "",
+
+          displayName:
+            targetUser.display_name ||
+            targetUser.username ||
+            "",
+
+          profile_url:
+            targetUser.profile_url ||
+            "",
+
+          isVerified:
+            Boolean(
+              targetUser.is_verified
+            ),
+        },
+      });
+
+    } catch (err) {
+      try {
+        await client.query(
+          "ROLLBACK"
+        );
+      } catch {}
+
+      console.error(
+        "POST /api/chats/direct failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          "Failed to create direct chat",
+
+        details:
+          process.env.NODE_ENV ===
+          "production"
+            ? undefined
+            : err.message,
+      });
+
+    } finally {
+      client.release();
     }
-    if (targetId === myId) {
-      return res.status(400).json({ error: "Cannot chat with yourself" });
-    }
-
-    const targetUser = await pool.query(
-      "SELECT id FROM users WHERE id = $1", [targetId]
-    );
-    if (targetUser.rows.length === 0) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    // Find existing DM
-    const existing = await pool.query(
-      `SELECT id FROM chats
-       WHERE type = 'private' AND $1 = ANY(participants) AND $2 = ANY(participants)
-       LIMIT 1`,
-      [myId, targetId]
-    );
-    if (existing.rows.length > 0) {
-      return res.json({ id: existing.rows[0].id });
-    }
-
-    // Create DM
-    // Create DM
-const created = await pool.query(
-  `
-  INSERT INTO chats (
-    participants,
-    type,
-    created_at,
-    updated_at
-  )
-  VALUES (
-    ARRAY[$1::int, $2::int],
-    'private',
-    NOW(),
-    NOW()
-  )
-  RETURNING id
-  `,
-  [myId, targetId]
-);
-
-const chatId = created.rows[0].id;
-
-// IMPORTANT:
-// Add BOTH users to the modern participant table.
-await pool.query(
-  `
-  INSERT INTO chat_participants (
-    chat_id,
-    user_id,
-    joined_at
-  )
-  VALUES
-    ($1, $2, NOW()),
-    ($1, $3, NOW())
-  ON CONFLICT (chat_id, user_id)
-  DO NOTHING
-  `,
-  [chatId, myId, targetId]
-);
-
-return res.json({
-  id: chatId,
-});
-
-    res.json({ id: created.rows[0].id });
-  } catch (err) {
-    console.error("Direct chat error:", err.message);
-    res.status(500).json({ error: "Failed to create chat" });
   }
-});
+);
 
 // ============================================================
 // TEST DATABASE CONNECTION
