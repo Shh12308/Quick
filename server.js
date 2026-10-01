@@ -7372,30 +7372,27 @@ app.post(
         "BEGIN"
       );
 
-      const createdResult =
-        await client.query(
-          `
-          INSERT INTO chats (
-            participants,
-            type,
-            created_at,
-            updated_at,
-            is_archived
-          )
-          VALUES (
-            ARRAY[$1::integer, $2::integer],
-            'private',
-            NOW(),
-            NOW(),
-            false
-          )
-          RETURNING id
-          `,
-          [
-            myId,
-            targetId,
-          ]
-        );
+      const createdResult = await client.query(
+  `
+  INSERT INTO chats (
+    participants,
+    type,
+    created_at,
+    is_archived
+  )
+  VALUES (
+    ARRAY[$1::integer, $2::integer],
+    'private',
+    NOW(),
+    false
+  )
+  RETURNING id
+  `,
+  [
+    myId,
+    targetId,
+  ]
+);
 
       const chatId =
         createdResult.rows[0].id;
@@ -14022,7 +14019,6 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
         c.last_message_id,
         c.last_message_at,
         c.created_at,
-        c.updated_at,
 
         other_user.id AS other_user_id,
         other_user.username AS other_username,
@@ -14116,7 +14112,6 @@ app.get("/api/chats", authenticateToken, async (req, res) => {
       ORDER BY
         COALESCE(
           c.last_message_at,
-          c.updated_at,
           c.created_at
         ) DESC
       `,
