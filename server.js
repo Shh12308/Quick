@@ -6081,6 +6081,36 @@ app.get("/api/users/:username", async (req, res) => {
   }
 });
 
+app.post("/api/test-notification", authMiddleware, async (req, res) => {
+  try {
+    await createNotification(
+      req.user.id,
+      null,
+      "system",
+      "Test Notification",
+      "Notifications are working!",
+      {
+        test: true,
+      }
+    );
+
+    res.json({
+      success: true,
+      message: "Test notification created",
+    });
+  } catch (error) {
+    console.error(
+      "[TEST NOTIFICATION] Error:",
+      error
+    );
+
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
 // ==========================================
 // WALLET / COIN PURCHASE ENDPOINTS
 // ==========================================
