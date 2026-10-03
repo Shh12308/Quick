@@ -7244,115 +7244,236 @@ app.post(
         req.body?.otherUserId
       );
 
-      console.log(
-        "[CHAT DIRECT] Request:",
-        {
-          myId,
-          targetId,
-        }
-      );
+      console.log("[CHAT DIRECT] Request:", {
+        myId,
+        targetId,
+      });
 
       if (!Number.isInteger(myId)) {
         return res.status(401).json({
-          error:
-            "Invalid authenticated user",
+          error: "Invalid authenticated user",
         });
       }
 
       if (!Number.isInteger(targetId)) {
         return res.status(400).json({
-          error:
-            "Valid userId is required",
+          error: "Valid userId is required",
         });
       }
 
       if (myId === targetId) {
         return res.status(400).json({
-          error:
-            "You cannot message yourself",
+          error: "You cannot message yourself",
         });
       }
+
+      await client.query("BEGIN");
 
       // --------------------------------------------------------
       // CHECK TARGET USER
       // --------------------------------------------------------
 
-      const targetResult =
-        await client.query(
-          `
-          SELECT
-            id,
-            username,
-            name,
-            display_name,
-            profile_url,
-            is_verified
-          FROM users
-          WHERE id = $1
-          LIMIT 1
-          `,
-          [targetId]
-        );
+      const targetResult = await client.query(
+        `
+        SELECT
+          id,
+          username,
+          name,
+          display_name,
+          profile_url,
+          is_verified
+        FROM users
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [targetId]
+      );
 
-      if (
-        targetResult.rows.length === 0
-      ) {
+      if (targetResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
         return res.status(404).json({
           error: "User not found",
         });
       }
 
-      const targetUser =
-        targetResult.rows[0];
+      const targetUser = targetResult.rows[0];
 
       // --------------------------------------------------------
-      // FIND EXISTING DIRECT CHAT
+      // CHECK BLOCKS
       // --------------------------------------------------------
 
-      const existingResult =
-        await client.query(
-          `
-          SELECT c.id
-          FROM chats c
+      const blockResult = await client.query(
+        `
+        SELECT 1
+        FROM blocks
+        WHERE
+          (blocker_id = $1 AND blocked_id = $2)
+          OR
+          (blocker_id = $2 AND blocked_id = $1)
 
-          INNER JOIN chat_participants cp1
-            ON cp1.chat_id = c.id
-           AND cp1.user_id = $1
+        UNION
 
-          INNER JOIN chat_participants cp2
-            ON cp2.chat_id = c.id
-           AND cp2.user_id = $2
+        SELECT 1
+        FROM blocked_users
+        WHERE
+          (blocker_id = $1 AND blocked_id = $2)
+          OR
+          (blocker_id = $2 AND blocked_id = $1)
 
-          WHERE c.type = 'private'
-            AND c.is_archived = false
+        LIMIT 1
+        `,
+        [myId, targetId]
+      );
 
-          LIMIT 1
-          `,
-          [myId, targetId]
-        );
+      if (blockResult.rows.length > 0) {
+        await client.query("ROLLBACK");
 
-      if (
-        existingResult.rows.length > 0
-      ) {
-        const chatId =
-          existingResult.rows[0].id;
+        return res.status(403).json({
+          error: "You cannot message this user",
+        });
+      }
 
-        console.log(
-          "[CHAT DIRECT] Existing chat:",
-          chatId
-        );
+      // --------------------------------------------------------
+      // CHECK IF WE ALREADY FOLLOW EACH OTHER
+      // --------------------------------------------------------
 
-        // Make absolutely sure both participants exist.
+      const followResult = await client.query(
+        `
+        SELECT
+          EXISTS (
+            SELECT 1
+            FROM follows
+            WHERE follower_id = $1
+              AND following_id = $2
+              AND status = 'accepted'
+          ) AS i_follow_them,
+
+          EXISTS (
+            SELECT 1
+            FROM follows
+            WHERE follower_id = $2
+              AND following_id = $1
+              AND status = 'accepted'
+          ) AS they_follow_me
+        `,
+        [myId, targetId]
+      );
+
+      const iFollowThem =
+        followResult.rows[0]?.i_follow_them === true;
+
+      const theyFollowMe =
+        followResult.rows[0]?.they_follow_me === true;
+
+      /*
+       * NORMAL CHAT RULE
+       *
+       * If both users follow each other:
+       *     normal chat
+       *
+       * If they don't follow each other:
+       *     message request
+       *
+       * This means the first message is allowed but
+       * the conversation stays in Message Requests.
+       */
+
+      const isMutualFollow =
+        iFollowThem && theyFollowMe;
+
+      const requestStatus =
+        isMutualFollow ? "accepted" : "pending";
+
+      console.log("[CHAT DIRECT] Relationship:", {
+        myId,
+        targetId,
+        iFollowThem,
+        theyFollowMe,
+        isMutualFollow,
+        requestStatus,
+      });
+
+      // --------------------------------------------------------
+      // FIND EXISTING CHAT
+      // --------------------------------------------------------
+
+      const existingResult = await client.query(
+        `
+        SELECT
+          c.id,
+          c.request_from_id,
+          c.request_to_id,
+          c.request_status,
+          c.is_archived
+
+        FROM chats c
+
+        INNER JOIN chat_participants cp1
+          ON cp1.chat_id = c.id
+         AND cp1.user_id = $1
+
+        INNER JOIN chat_participants cp2
+          ON cp2.chat_id = c.id
+         AND cp2.user_id = $2
+
+        WHERE c.type = 'private'
+          AND c.is_archived = false
+
+        ORDER BY c.created_at DESC
+
+        LIMIT 1
+        `,
+        [myId, targetId]
+      );
+
+      if (existingResult.rows.length > 0) {
+        const existingChat = existingResult.rows[0];
+
+        let finalRequestStatus =
+          existingChat.request_status || "accepted";
+
+        /*
+         * If the existing chat was a request and both users
+         * now follow each other, automatically accept it.
+         */
+
+        if (
+          finalRequestStatus === "pending" &&
+          isMutualFollow
+        ) {
+          finalRequestStatus = "accepted";
+
+          await client.query(
+            `
+            UPDATE chats
+            SET
+              request_status = 'accepted',
+              request_from_id = NULL,
+              request_to_id = NULL
+            WHERE id = $1
+            `,
+            [existingChat.id]
+          );
+
+          console.log(
+            "[CHAT DIRECT] Existing request accepted automatically:",
+            existingChat.id
+          );
+        }
+
+        // Make sure participants exist.
         await client.query(
           `
           INSERT INTO chat_participants (
             chat_id,
             user_id,
-            joined_at
+            created_at
           )
           VALUES
             ($1, $2, NOW()),
             ($1, $3, NOW())
+
           ON CONFLICT (
             chat_id,
             user_id
@@ -7360,32 +7481,50 @@ app.post(
           DO NOTHING
           `,
           [
-            chatId,
+            existingChat.id,
             myId,
             targetId,
           ]
         );
 
-        return res.json({
-          id: chatId,
+        await client.query("COMMIT");
 
-          chatId,
+        console.log(
+          "[CHAT DIRECT] Existing chat:",
+          existingChat.id,
+          "status:",
+          finalRequestStatus
+        );
+
+        return res.json({
+          id: existingChat.id,
+
+          chatId: existingChat.id,
+
+          type: "private",
+
+          requestStatus: finalRequestStatus,
+
+          isMessageRequest:
+            finalRequestStatus === "pending",
 
           otherUser: {
             id: targetUser.id,
+
             username:
-              targetUser.username ||
-              "",
+              targetUser.username || "",
+
             name:
-              targetUser.name ||
-              "",
+              targetUser.name || "",
+
             displayName:
               targetUser.display_name ||
               targetUser.username ||
               "",
+
             profile_url:
-              targetUser.profile_url ||
-              "",
+              targetUser.profile_url || "",
+
             isVerified:
               Boolean(
                 targetUser.is_verified
@@ -7398,43 +7537,54 @@ app.post(
       // CREATE NEW CHAT
       // --------------------------------------------------------
 
-      await client.query(
-        "BEGIN"
-      );
-
       const createdResult = await client.query(
-  `
-  INSERT INTO chats (
-    participants,
-    type,
-    created_at,
-    is_archived
-  )
-  VALUES (
-    ARRAY[$1::integer, $2::integer],
-    'private',
-    NOW(),
-    false
-  )
-  RETURNING id
-  `,
-  [
-    myId,
-    targetId,
-  ]
-);
+        `
+        INSERT INTO chats (
+          creator_id,
+          participants,
+          type,
+          created_at,
+          is_archived,
+          status,
+          request_from_id,
+          request_to_id,
+          request_status
+        )
+        VALUES (
+          $1,
+          ARRAY[$1::integer, $2::integer],
+          'private',
+          NOW(),
+          false,
+          'active',
+          $1,
+          $2,
+          $3
+        )
+        RETURNING id
+        `,
+        [
+          myId,
+          targetId,
+          requestStatus,
+        ]
+      );
 
       const chatId =
         createdResult.rows[0].id;
 
       console.log(
         "[CHAT DIRECT] Created chat:",
-        chatId
+        {
+          chatId,
+          myId,
+          targetId,
+          requestStatus,
+        }
       );
 
       // --------------------------------------------------------
-      // IMPORTANT:
-      // ADD BOTH USERS TO chat_participants
+      // ADD BOTH PARTICIPANTS
       // --------------------------------------------------------
 
       await client.query(
@@ -7447,6 +7597,7 @@ app.post(
         VALUES
           ($1, $2, NOW()),
           ($1, $3, NOW())
+
         ON CONFLICT (
           chat_id,
           user_id
@@ -7460,18 +7611,60 @@ app.post(
         ]
       );
 
-      await client.query(
-        "COMMIT"
-      );
+      // --------------------------------------------------------
+      // CREATE NOTIFICATION FOR MESSAGE REQUEST
+      // --------------------------------------------------------
 
-      console.log(
-        "[CHAT DIRECT] Participants created:",
-        {
-          chatId,
-          myId,
-          targetId,
-        }
-      );
+      if (requestStatus === "pending") {
+        await client.query(
+          `
+          INSERT INTO notifications (
+            user_id,
+            sender_id,
+            actor_id,
+            type,
+            title,
+            message,
+            text,
+            data,
+            is_read,
+            created_at
+          )
+          VALUES (
+            $1,
+            $2,
+            $2,
+            'message_request',
+            'New message request',
+            $3,
+            $3,
+            $4::json,
+            false,
+            NOW()
+          )
+          `,
+          [
+            targetId,
+            myId,
+            `${targetUser.username || "Someone"} sent you a message request`,
+            JSON.stringify({
+              chatId: String(chatId),
+              senderId: myId,
+              type: "message_request",
+            }),
+          ]
+        );
+
+        console.log(
+          "[CHAT DIRECT] Message request notification created:",
+          {
+            targetId,
+            chatId,
+          }
+        );
+      }
+
+      await client.query("COMMIT");
 
       return res.status(201).json({
         id: chatId,
@@ -7480,16 +7673,19 @@ app.post(
 
         type: "private",
 
+        requestStatus,
+
+        isMessageRequest:
+          requestStatus === "pending",
+
         otherUser: {
           id: targetUser.id,
 
           username:
-            targetUser.username ||
-            "",
+            targetUser.username || "",
 
           name:
-            targetUser.name ||
-            "",
+            targetUser.name || "",
 
           displayName:
             targetUser.display_name ||
@@ -7497,8 +7693,7 @@ app.post(
             "",
 
           profile_url:
-            targetUser.profile_url ||
-            "",
+            targetUser.profile_url || "",
 
           isVerified:
             Boolean(
@@ -7509,9 +7704,7 @@ app.post(
 
     } catch (err) {
       try {
-        await client.query(
-          "ROLLBACK"
-        );
+        await client.query("ROLLBACK");
       } catch {}
 
       console.error(
@@ -7520,18 +7713,268 @@ app.post(
       );
 
       return res.status(500).json({
-        error:
-          "Failed to create direct chat",
+        error: "Failed to create direct chat",
 
         details:
-          process.env.NODE_ENV ===
-          "production"
+          process.env.NODE_ENV === "production"
             ? undefined
             : err.message,
       });
 
     } finally {
       client.release();
+    }
+  }
+);
+
+// ============================================================
+// GET MESSAGE REQUESTS
+// ============================================================
+
+app.get(
+  "/api/chats/requests",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const myId = Number(
+        req.userId || req.user?.id
+      );
+
+      if (!Number.isInteger(myId)) {
+        return res.status(401).json({
+          error: "Invalid authenticated user",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        SELECT
+          c.id,
+          c.created_at,
+          c.request_from_id,
+          c.request_to_id,
+          c.request_status,
+
+          u.id AS user_id,
+          u.username,
+          u.name,
+          u.display_name,
+          u.profile_url,
+          u.is_verified
+
+        FROM chats c
+
+        INNER JOIN users u
+          ON u.id = c.request_from_id
+
+        WHERE c.request_to_id = $1
+          AND c.type = 'private'
+          AND c.is_archived = false
+          AND c.request_status = 'pending'
+
+        ORDER BY c.created_at DESC
+        `,
+        [myId]
+      );
+
+      return res.json({
+        requests: result.rows.map((row) => ({
+          id: row.id,
+
+          chatId: row.id,
+
+          createdAt: row.created_at,
+
+          requestStatus:
+            row.request_status,
+
+          user: {
+            id: row.user_id,
+
+            username:
+              row.username || "",
+
+            name:
+              row.name || "",
+
+            displayName:
+              row.display_name ||
+              row.username ||
+              "",
+
+            profile_url:
+              row.profile_url || "",
+
+            isVerified:
+              Boolean(row.is_verified),
+          },
+        })),
+      });
+
+    } catch (err) {
+      console.error(
+        "GET /api/chats/requests failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error: "Failed to load message requests",
+      });
+    }
+  }
+);
+
+// ============================================================
+// ACCEPT MESSAGE REQUEST
+// ============================================================
+
+app.post(
+  "/api/chats/requests/:chatId/accept",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const myId = Number(
+        req.userId || req.user?.id
+      );
+
+      const chatId = req.params.chatId;
+
+      if (!Number.isInteger(myId)) {
+        return res.status(401).json({
+          error: "Invalid authenticated user",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        UPDATE chats
+        SET
+          request_status = 'accepted',
+          request_from_id = NULL,
+          request_to_id = NULL
+        WHERE id = $1
+          AND request_to_id = $2
+          AND request_status = 'pending'
+          AND is_archived = false
+
+        RETURNING id
+        `,
+        [chatId, myId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          error: "Message request not found",
+        });
+      }
+
+      // Mark the request notification as read.
+      await pool.query(
+        `
+        UPDATE notifications
+        SET is_read = true
+        WHERE user_id = $1
+          AND type = 'message_request'
+          AND data->>'chatId' = $2
+        `,
+        [
+          myId,
+          String(chatId),
+        ]
+      );
+
+      return res.json({
+        success: true,
+
+        chatId,
+
+        requestStatus: "accepted",
+      });
+
+    } catch (err) {
+      console.error(
+        "Accept message request error:",
+        err
+      );
+
+      return res.status(500).json({
+        error: "Failed to accept message request",
+      });
+    }
+  }
+);
+
+// ============================================================
+// DECLINE MESSAGE REQUEST
+// ============================================================
+
+app.post(
+  "/api/chats/requests/:chatId/decline",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const myId = Number(
+        req.userId || req.user?.id
+      );
+
+      const chatId = req.params.chatId;
+
+      if (!Number.isInteger(myId)) {
+        return res.status(401).json({
+          error: "Invalid authenticated user",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        UPDATE chats
+        SET
+          request_status = 'declined',
+          is_archived = true
+        WHERE id = $1
+          AND request_to_id = $2
+          AND request_status = 'pending'
+
+        RETURNING id
+        `,
+        [chatId, myId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          error: "Message request not found",
+        });
+      }
+
+      await pool.query(
+        `
+        UPDATE notifications
+        SET is_read = true
+        WHERE user_id = $1
+          AND type = 'message_request'
+          AND data->>'chatId' = $2
+        `,
+        [
+          myId,
+          String(chatId),
+        ]
+      );
+
+      return res.json({
+        success: true,
+        chatId,
+        requestStatus: "declined",
+      });
+
+    } catch (err) {
+      console.error(
+        "Decline message request error:",
+        err
+      );
+
+      return res.status(500).json({
+        error: "Failed to decline message request",
+      });
     }
   }
 );
