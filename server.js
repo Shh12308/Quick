@@ -7227,6 +7227,36 @@ app.post("/api/chats/:chatId/messages", authenticateREST, async (req, res) => {
 // CREATE / GET DIRECT CHAT
 // ============================================================
 
+// ============================================================
+// CREATE / GET DIRECT CHAT
+//
+// RULE:
+//
+// BOTH users follow each other
+//     -> normal inbox
+//
+// NOT mutual
+//     -> message request
+//
+// Examples:
+//
+// Me follows them       = false
+// They follow me        = false
+// => REQUEST
+//
+// Me follows them       = true
+// They follow me        = false
+// => REQUEST
+//
+// Me follows them       = false
+// They follow me        = true
+// => REQUEST
+//
+// Me follows them       = true
+// They follow me        = true
+// => NORMAL CHAT
+// ============================================================
+
 app.post(
   "/api/chats/direct",
   authenticateToken,
@@ -7269,9 +7299,9 @@ app.post(
 
       await client.query("BEGIN");
 
-      // --------------------------------------------------------
-      // CHECK TARGET USER
-      // --------------------------------------------------------
+      // ========================================================
+      // GET TARGET USER
+      // ========================================================
 
       const targetResult = await client.query(
         `
@@ -7289,7 +7319,7 @@ app.post(
         [targetId]
       );
 
-      if (targetResult.rows.length === 0) {
+      if (!targetResult.rowCount) {
         await client.query("ROLLBACK");
 
         return res.status(404).json({
@@ -7299,9 +7329,9 @@ app.post(
 
       const targetUser = targetResult.rows[0];
 
-      // --------------------------------------------------------
+      // ========================================================
       // CHECK BLOCKS
-      // --------------------------------------------------------
+      // ========================================================
 
       const blockResult = await client.query(
         `
@@ -7326,7 +7356,7 @@ app.post(
         [myId, targetId]
       );
 
-      if (blockResult.rows.length > 0) {
+      if (blockResult.rowCount > 0) {
         await client.query("ROLLBACK");
 
         return res.status(403).json({
@@ -7334,13 +7364,14 @@ app.post(
         });
       }
 
-      // --------------------------------------------------------
-      // CHECK IF WE ALREADY FOLLOW EACH OTHER
-      // --------------------------------------------------------
+      // ========================================================
+      // CHECK FOLLOW RELATIONSHIP
+      // ========================================================
 
       const followResult = await client.query(
         `
         SELECT
+
           EXISTS (
             SELECT 1
             FROM follows
@@ -7366,37 +7397,36 @@ app.post(
       const theyFollowMe =
         followResult.rows[0]?.they_follow_me === true;
 
-      /*
-       * NORMAL CHAT RULE
-       *
-       * If both users follow each other:
-       *     normal chat
-       *
-       * If they don't follow each other:
-       *     message request
-       *
-       * This means the first message is allowed but
-       * the conversation stays in Message Requests.
-       */
+      // ========================================================
+      // MESSAGE REQUEST RULE
+      //
+      // ONLY mutual follows = normal inbox
+      // EVERYTHING ELSE = request
+      // ========================================================
 
       const isMutualFollow =
         iFollowThem && theyFollowMe;
 
       const requestStatus =
-        isMutualFollow ? "accepted" : "pending";
+        isMutualFollow
+          ? "accepted"
+          : "pending";
 
-      console.log("[CHAT DIRECT] Relationship:", {
-        myId,
-        targetId,
-        iFollowThem,
-        theyFollowMe,
-        isMutualFollow,
-        requestStatus,
-      });
+      console.log(
+        "[CHAT DIRECT] Relationship:",
+        {
+          myId,
+          targetId,
+          iFollowThem,
+          theyFollowMe,
+          isMutualFollow,
+          requestStatus,
+        }
+      );
 
-      // --------------------------------------------------------
+      // ========================================================
       // FIND EXISTING CHAT
-      // --------------------------------------------------------
+      // ========================================================
 
       const existingResult = await client.query(
         `
@@ -7406,7 +7436,6 @@ app.post(
           c.request_to_id,
           c.request_status,
           c.is_archived
-
         FROM chats c
 
         INNER JOIN chat_participants cp1
@@ -7427,16 +7456,22 @@ app.post(
         [myId, targetId]
       );
 
-      if (existingResult.rows.length > 0) {
-        const existingChat = existingResult.rows[0];
+      // ========================================================
+      // EXISTING CHAT
+      // ========================================================
+
+      if (existingResult.rowCount > 0) {
+        const existingChat =
+          existingResult.rows[0];
 
         let finalRequestStatus =
-          existingChat.request_status || "accepted";
+          existingChat.request_status ||
+          "accepted";
 
-        /*
-         * If the existing chat was a request and both users
-         * now follow each other, automatically accept it.
-         */
+        // ------------------------------------------------------
+        // If users are now mutual followers,
+        // automatically accept the old request.
+        // ------------------------------------------------------
 
         if (
           finalRequestStatus === "pending" &&
@@ -7457,12 +7492,15 @@ app.post(
           );
 
           console.log(
-            "[CHAT DIRECT] Existing request accepted automatically:",
+            "[CHAT DIRECT] Request automatically accepted:",
             existingChat.id
           );
         }
 
-        // Make sure participants exist.
+        // ------------------------------------------------------
+        // Make sure participants exist
+        // ------------------------------------------------------
+
         await client.query(
           `
           INSERT INTO chat_participants (
@@ -7489,21 +7527,13 @@ app.post(
 
         await client.query("COMMIT");
 
-        console.log(
-          "[CHAT DIRECT] Existing chat:",
-          existingChat.id,
-          "status:",
-          finalRequestStatus
-        );
-
         return res.json({
           id: existingChat.id,
-
           chatId: existingChat.id,
-
           type: "private",
 
-          requestStatus: finalRequestStatus,
+          requestStatus:
+            finalRequestStatus,
 
           isMessageRequest:
             finalRequestStatus === "pending",
@@ -7526,55 +7556,54 @@ app.post(
               targetUser.profile_url || "",
 
             isVerified:
-              Boolean(
-                targetUser.is_verified
-              ),
+              Boolean(targetUser.is_verified),
           },
         });
       }
 
-      // --------------------------------------------------------
+      // ========================================================
       // CREATE NEW CHAT
-      // --------------------------------------------------------
+      // ========================================================
 
-      const createdResult = await client.query(
-        `
-        INSERT INTO chats (
-          creator_id,
-          participants,
-          type,
-          created_at,
-          is_archived,
-          status,
-          request_from_id,
-          request_to_id,
-          request_status
-        )
-        VALUES (
-          $1,
-          ARRAY[$1::integer, $2::integer],
-          'private',
-          NOW(),
-          false,
-          'active',
-          $1,
-          $2,
-          $3
-        )
-        RETURNING id
-        `,
-        [
-          myId,
-          targetId,
-          requestStatus,
-        ]
-      );
+      const createdResult =
+        await client.query(
+          `
+          INSERT INTO chats (
+            creator_id,
+            participants,
+            type,
+            created_at,
+            is_archived,
+            status,
+            request_from_id,
+            request_to_id,
+            request_status
+          )
+          VALUES (
+            $1,
+            ARRAY[$1::integer, $2::integer],
+            'private',
+            NOW(),
+            false,
+            'active',
+            $1,
+            $2,
+            $3
+          )
+          RETURNING id
+          `,
+          [
+            myId,
+            targetId,
+            requestStatus,
+          ]
+        );
 
       const chatId =
         createdResult.rows[0].id;
 
       console.log(
-        "[CHAT DIRECT] Created chat:",
+        "[CHAT DIRECT] Created:",
         {
           chatId,
           myId,
@@ -7583,9 +7612,9 @@ app.post(
         }
       );
 
-      // --------------------------------------------------------
+      // ========================================================
       // ADD BOTH PARTICIPANTS
-      // --------------------------------------------------------
+      // ========================================================
 
       await client.query(
         `
@@ -7611,9 +7640,9 @@ app.post(
         ]
       );
 
-      // --------------------------------------------------------
-      // CREATE NOTIFICATION FOR MESSAGE REQUEST
-      // --------------------------------------------------------
+      // ========================================================
+      // MESSAGE REQUEST NOTIFICATION
+      // ========================================================
 
       if (requestStatus === "pending") {
         await client.query(
@@ -7646,7 +7675,12 @@ app.post(
           [
             targetId,
             myId,
-            `${targetUser.username || "Someone"} sent you a message request`,
+
+            `${
+              targetUser.username ||
+              "Someone"
+            } sent you a message request`,
+
             JSON.stringify({
               chatId: String(chatId),
               senderId: myId,
@@ -7668,9 +7702,7 @@ app.post(
 
       return res.status(201).json({
         id: chatId,
-
         chatId,
-
         type: "private",
 
         requestStatus,
@@ -14453,331 +14485,362 @@ app.post("/auth/check-vpn", async (req, res) => {
 
 // ============================================================
 // GET ALL CHATS
-// ============================================================
-// A chat is a MESSAGE REQUEST when:
-//   - the current user does NOT follow the other user
 //
-// A chat is an INBOX chat when:
-//   - the current user DOES follow the other user
+// RESPONSE:
 //
-// Response:
 // {
-//   inbox: [...],
-//   requests: [...]
+//   inbox: [],
+//   requests: []
 // }
+//
+// REQUEST RULE:
+//
+// Mutual follow
+//     -> inbox
+//
+// Not mutual
+//     -> requests
 // ============================================================
 
-app.get("/api/chats", authenticateToken, async (req, res) => {
-  try {
-    const userId = Number(req.userId || req.user?.id);
+app.get(
+  "/api/chats",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const userId = Number(
+        req.userId || req.user?.id
+      );
 
-    if (!Number.isInteger(userId)) {
-      return res.status(401).json({
-        error: "Invalid authenticated user",
-      });
-    }
+      if (!Number.isInteger(userId)) {
+        return res.status(401).json({
+          error: "Invalid authenticated user",
+        });
+      }
 
-    console.log(
-      `[CHATS] Loading chats for user ${userId}`
-    );
+      console.log(
+        "[CHATS] Loading chats for user:",
+        userId
+      );
 
-    const result = await pool.query(
-      `
-      SELECT
-        c.id,
-        c.type,
-        c.name,
-        c.avatar,
-        c.last_message,
-        c.last_message_id,
-        c.last_message_at,
-        c.created_at,
+      const result = await pool.query(
+        `
+        SELECT
+          c.id,
+          c.type,
+          c.name,
+          c.avatar,
+          c.last_message,
+          c.last_message_id,
+          c.last_message_at,
+          c.created_at,
+          c.request_status,
+          c.request_from_id,
+          c.request_to_id,
 
-        other_user.id AS other_user_id,
-        other_user.username AS other_username,
-        other_user.name AS other_name,
-        other_user.display_name AS other_display_name,
-        other_user.profile_url AS other_profile_url,
-        other_user.is_verified AS other_is_verified,
+          other_user.id AS other_user_id,
+          other_user.username AS other_username,
+          other_user.name AS other_name,
+          other_user.display_name AS other_display_name,
+          other_user.profile_url AS other_profile_url,
+          other_user.is_verified AS other_is_verified,
 
-        COALESCE(unread.unread_count, 0) AS unread_count,
+          COALESCE(
+            unread.unread_count,
+            0
+          ) AS unread_count,
+
+          /*
+           * Does CURRENT USER follow OTHER USER?
+           */
+          EXISTS (
+            SELECT 1
+            FROM follows f
+            WHERE f.follower_id = $1
+              AND f.following_id =
+                  other_user.id
+              AND f.status = 'accepted'
+          ) AS i_follow_them,
+
+          /*
+           * Does OTHER USER follow CURRENT USER?
+           */
+          EXISTS (
+            SELECT 1
+            FROM follows f
+            WHERE f.follower_id =
+                  other_user.id
+              AND f.following_id = $1
+              AND f.status = 'accepted'
+          ) AS they_follow_me
+
+        FROM chats c
 
         /*
-         * Does the CURRENT USER follow the OTHER USER?
-         *
-         * If yes:
-         *   inbox
-         *
-         * If no:
-         *   request
+         * Current user must belong to chat
          */
-        EXISTS (
-          SELECT 1
-          FROM follows f
-          WHERE f.follower_id = $1
-            AND f.following_id = other_user.id
-        ) AS i_follow
+        INNER JOIN chat_participants me
+          ON me.chat_id = c.id
+         AND me.user_id = $1
 
-      FROM chats c
+        /*
+         * Find other participant
+         */
+        LEFT JOIN LATERAL (
+          SELECT
+            u.id,
+            u.username,
+            u.name,
+            u.display_name,
+            u.profile_url,
+            u.is_verified
 
-      /*
-       * Make sure current user belongs to this chat.
-       */
-      INNER JOIN chat_participants me
-        ON me.chat_id = c.id
-       AND me.user_id = $1
+          FROM chat_participants cp
 
-      /*
-       * Find the other participant.
-       */
-      LEFT JOIN LATERAL (
-        SELECT
-          u.id,
-          u.username,
-          u.name,
-          u.display_name,
-          u.profile_url,
-          u.is_verified
+          INNER JOIN users u
+            ON u.id = cp.user_id
 
-        FROM chat_participants cp
+          WHERE cp.chat_id = c.id
+            AND cp.user_id <> $1
 
-        INNER JOIN users u
-          ON u.id = cp.user_id
+          ORDER BY cp.created_at ASC
 
-        WHERE cp.chat_id = c.id
-          AND cp.user_id <> $1
+          LIMIT 1
+        ) other_user ON true
 
-        ORDER BY cp.joined_at ASC
-        LIMIT 1
-      ) other_user ON true
+        /*
+         * UNREAD COUNT
+         */
+        LEFT JOIN LATERAL (
+          SELECT
+            COUNT(*)::integer AS unread_count
 
-      /*
-       * Count unread messages from the other person.
-       */
-      LEFT JOIN LATERAL (
-        SELECT
-          COUNT(*)::integer AS unread_count
+          FROM messages m
 
-        FROM messages m
+          LEFT JOIN chat_read_states rs
+            ON rs.chat_id = c.id
+           AND rs.user_id = $1
 
-        LEFT JOIN chat_read_states rs
-          ON rs.chat_id = c.id
-         AND rs.user_id = $1
+          WHERE m.chat_id = c.id::text
+            AND m.sender_id <> $1
+            AND (
+              rs.last_read_at IS NULL
+              OR COALESCE(
+                m.timestamp,
+                m.created_at
+              ) > rs.last_read_at
+            )
+        ) unread ON true
 
-        WHERE m.chat_id = c.id::text
+        WHERE c.is_archived = false
 
-          AND m.sender_id <> $1
+        ORDER BY
+          COALESCE(
+            c.last_message_at,
+            c.created_at
+          ) DESC
+        `,
+        [userId]
+      );
 
-          AND (
-            rs.last_read_at IS NULL
-            OR COALESCE(
-              m.timestamp,
-              m.created_at
-            ) > rs.last_read_at
-          )
-      ) unread ON true
+      // ========================================================
+      // FORMAT
+      // ========================================================
 
-      /*
-       * Don't show archived chats.
-       */
-      WHERE c.is_archived = false
+      const chats =
+        result.rows.map((chat) => {
 
-      ORDER BY
-        COALESCE(
-          c.last_message_at,
-          c.created_at
-        ) DESC
-      `,
-      [userId]
-    );
+          /*
+           * NORMAL CHAT ONLY WHEN BOTH FOLLOW
+           */
+          const mutualFollow =
+            Boolean(
+              chat.i_follow_them
+            ) &&
+            Boolean(
+              chat.they_follow_me
+            );
 
-    // --------------------------------------------------------
-    // FORMAT CHATS
-    // --------------------------------------------------------
+          /*
+           * Pending request if NOT mutual.
+           *
+           * This also protects us if an old row has
+           * request_status incorrectly set.
+           */
+          const isRequest =
+            !mutualFollow;
 
-    const chats = result.rows.map((chat) => {
-      const isRequest =
-        !Boolean(chat.i_follow);
+          return {
+            id: chat.id,
 
-      return {
-        id: chat.id,
+            chatId: chat.id,
 
-        type:
-          chat.type ||
-          "private",
+            type:
+              chat.type || "private",
 
-        name:
-          chat.name ||
-          chat.other_username ||
-          "Chat",
+            name:
+              chat.name ||
+              chat.other_username ||
+              "Chat",
 
-        avatar:
-          chat.avatar ||
-          chat.other_profile_url ||
-          "",
+            avatar:
+              chat.avatar ||
+              chat.other_profile_url ||
+              "",
 
-        // --------------------------------------------------
-        // OTHER USER
-        // --------------------------------------------------
+            otherUserId:
+              chat.other_user_id || null,
 
-        otherUserId:
-          chat.other_user_id || null,
+            otherUser:
+              chat.other_user_id
+                ? {
+                    id:
+                      chat.other_user_id,
 
-        other_username:
-          chat.other_username || null,
+                    username:
+                      chat.other_username ||
+                      "",
 
-        other_profile_url:
-          chat.other_profile_url || null,
+                    name:
+                      chat.other_name ||
+                      "",
 
-        otherUser:
-          chat.other_user_id
-            ? {
-                id: chat.other_user_id,
+                    displayName:
+                      chat.other_display_name ||
+                      chat.other_username ||
+                      "",
 
-                username:
-                  chat.other_username ||
-                  "Unknown user",
+                    profile_url:
+                      chat.other_profile_url ||
+                      "",
 
-                name:
-                  chat.other_name ||
-                  "",
+                    profileUrl:
+                      chat.other_profile_url ||
+                      "",
 
-                displayName:
-                  chat.other_display_name ||
-                  chat.other_username ||
-                  "",
+                    isVerified:
+                      Boolean(
+                        chat.other_is_verified
+                      ),
+                  }
+                : null,
 
-                profile_url:
-                  chat.other_profile_url ||
-                  "",
+            lastMessage:
+              chat.last_message
+                ? {
+                    id:
+                      chat.last_message_id ||
+                      null,
 
-                profileUrl:
-                  chat.other_profile_url ||
-                  "",
+                    text:
+                      chat.last_message,
 
-                isVerified:
-                  Boolean(
-                    chat.other_is_verified
-                  ),
-              }
-            : null,
+                    content:
+                      chat.last_message,
 
-        // --------------------------------------------------
-        // LAST MESSAGE
-        // --------------------------------------------------
+                    timestamp:
+                      chat.last_message_at ||
+                      null,
+                  }
+                : null,
 
-        lastMessage:
-          chat.last_message
-            ? {
-                id:
-                  chat.last_message_id ||
-                  null,
+            last_message:
+              chat.last_message ||
+              null,
 
-                text:
-                  chat.last_message,
+            last_message_at:
+              chat.last_message_at ||
+              null,
 
-                content:
-                  chat.last_message,
+            requestStatus:
+              isRequest
+                ? "pending"
+                : "accepted",
 
-                timestamp:
-                  chat.last_message_at ||
-                  null,
-              }
-            : null,
+            isRequest,
 
-        last_message:
-          chat.last_message ||
-          null,
+            isMessageRequest:
+              isRequest,
 
-        last_message_at:
-          chat.last_message_at ||
-          null,
+            iFollowThem:
+              Boolean(
+                chat.i_follow_them
+              ),
 
-        // --------------------------------------------------
-        // REQUEST STATUS
-        // --------------------------------------------------
+            theyFollowMe:
+              Boolean(
+                chat.they_follow_me
+              ),
 
-        isRequest,
+            mutualFollow,
 
-        // --------------------------------------------------
-        // UNREAD
-        // --------------------------------------------------
+            unreadCount:
+              Number(
+                chat.unread_count || 0
+              ),
 
-        unreadCount:
-          Number(
-            chat.unread_count || 0
-          ),
+            unread:
+              Number(
+                chat.unread_count || 0
+              ) > 0,
 
-        unread:
-          Number(
-            chat.unread_count || 0
-          ) > 0,
+            createdAt:
+              chat.created_at,
 
-        // --------------------------------------------------
-        // DATES
-        // --------------------------------------------------
+            pinned: false,
+            muted: false,
+            archived: false,
+          };
+        });
 
-        createdAt:
-          chat.created_at,
+      // ========================================================
+      // SPLIT
+      // ========================================================
 
-        updatedAt:
-          chat.updated_at,
+      const inbox =
+        chats.filter(
+          (chat) =>
+            chat.isRequest === false
+        );
 
-        // --------------------------------------------------
-        // DEFAULT CHAT FLAGS
-        // --------------------------------------------------
+      const requests =
+        chats.filter(
+          (chat) =>
+            chat.isRequest === true
+        );
 
-        pinned: false,
+      console.log(
+        "[CHATS] Result:",
+        {
+          userId,
+          total: chats.length,
+          inbox: inbox.length,
+          requests: requests.length,
+        }
+      );
 
-        muted: false,
+      return res.json({
+        inbox,
+        requests,
+      });
 
-        archived: false,
-      };
-    });
+    } catch (err) {
+      console.error(
+        "GET /api/chats failed:",
+        err
+      );
 
-    // --------------------------------------------------------
-    // SPLIT INTO INBOX + REQUESTS
-    // --------------------------------------------------------
+      return res.status(500).json({
+        error: "Failed to load chats",
 
-    const inbox = chats.filter(
-      (chat) =>
-        chat.isRequest === false
-    );
-
-    const requests = chats.filter(
-      (chat) =>
-        chat.isRequest === true
-    );
-
-    console.log(
-      `[CHATS] User ${userId}: ${inbox.length} inbox, ${requests.length} requests`
-    );
-
-    // --------------------------------------------------------
-    // RETURN
-    // --------------------------------------------------------
-
-    return res.json({
-      inbox,
-      requests,
-    });
-
-  } catch (err) {
-    console.error(
-      "GET /api/chats error:",
-      err
-    );
-
-    return res.status(500).json({
-      error: "Failed to load chats",
-
-      details:
-        process.env.NODE_ENV === "production"
-          ? undefined
-          : err.message,
-    });
+        details:
+          process.env.NODE_ENV ===
+          "production"
+            ? undefined
+            : err.message,
+      });
+    }
   }
-});
+);
 
 
 // ============================================================
