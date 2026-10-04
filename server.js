@@ -7817,12 +7817,7 @@ async function uploadSnapMedia(file) {
    * https://quick-production-b60d.up.railway.app
    */
 
-  const backendUrl =
-    process.env.BACKEND_URL ||
-    "https://quick-production-b60d.up.railway.app";
 
-  return `${backendUrl}/uploads/${filename}`;
-}
 
 
 // ============================================================
