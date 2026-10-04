@@ -7759,6 +7759,111 @@ app.post(
   }
 );
 
+router.post(
+  "/chats/:chatId/snaps",
+  authenticateToken,
+  upload.single("media"),
+  async (req, res) => {
+    try {
+      const { chatId } = req.params;
+      const { type, caption } = req.body;
+
+      const userId = req.user.id;
+
+      console.log("[SNAP] Request:", {
+        chatId,
+        userId,
+        type,
+        caption,
+        file: req.file
+          ? {
+              originalname: req.file.originalname,
+              mimetype: req.file.mimetype,
+              size: req.file.size,
+            }
+          : null,
+      });
+
+      if (!req.file) {
+        return res.status(400).json({
+          error: "Snap media is required",
+        });
+      }
+
+      // -----------------------------------------
+      // VERIFY USER IS IN CHAT
+      // -----------------------------------------
+
+      const chat = await Chat.findOne({
+        where: {
+          id: chatId,
+        },
+      });
+
+      if (!chat) {
+        return res.status(404).json({
+          error: "Chat not found",
+        });
+      }
+
+      if (
+        chat.user1_id !== userId &&
+        chat.user2_id !== userId
+      ) {
+        return res.status(403).json({
+          error: "You are not a member of this chat",
+        });
+      }
+
+      // -----------------------------------------
+      // UPLOAD MEDIA
+      // -----------------------------------------
+
+      // Replace this with however your existing
+      // video/image uploads are handled.
+
+      const mediaUrl = await uploadFile(req.file);
+
+      // -----------------------------------------
+      // CREATE SNAP
+      // -----------------------------------------
+
+      const snap = await Snap.create({
+        chat_id: chatId,
+        sender_id: userId,
+        media_url: mediaUrl,
+        media_type: type === "video"
+          ? "video"
+          : "image",
+        caption: caption || null,
+        opened: false,
+        expires_at: null,
+      });
+
+      console.log("[SNAP] Created:", snap.id);
+
+      return res.status(201).json({
+        success: true,
+        snap: {
+          id: snap.id,
+          chatId: snap.chat_id,
+          senderId: snap.sender_id,
+          mediaUrl: snap.media_url,
+          type: snap.media_type,
+          caption: snap.caption,
+        },
+      });
+
+    } catch (error) {
+      console.error("[SNAP] Failed:", error);
+
+      return res.status(500).json({
+        error: "Failed to send Snap",
+      });
+    }
+  }
+);
+
 // ============================================================
 // GET MESSAGE REQUESTS
 // ============================================================
