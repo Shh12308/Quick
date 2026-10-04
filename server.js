@@ -7759,600 +7759,692 @@ app.post(
   }
 );
 
-// ============================================================
-// SNAP MESSAGE
-// ============================================================
-//
-// POST
-// /api/chats/:chatId/snaps
-//
-// FormData:
-//   media   = image/video
-//   type    = image/video
-//   caption = optional
-//
-// Auth:
-//   Authorization: Bearer <mintza_token>
-//
-// Creates a normal message with:
-//   type = "snap"
-//
-// The actual media is stored in S3.
+ // ============================================================
+// SNAP MESSAGES
+// POST /api/chats/:chatId/snaps
+// GET  /api/chats/:chatId/snaps
+// POST /api/chats/:chatId/snaps/:messageId/open
+// DELETE /api/chats/:chatId/snaps/:messageId
 // ============================================================
 
-const snapUpload = multer({
-  storage: multer.memoryStorage(),
+app.post("/api/chats/:chatId/snaps", async (req, res) => {
+  try {
+    const { chatId } = req.params;
 
-  limits: {
-    fileSize: 50 * 1024 * 1024,
-  },
+    const {
+      mediaUrl,
+      content,
+      caption,
+      duration,
+      expiresIn,
+      type
+    } = req.body || {};
 
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = [
-      // Images
-      "image/jpeg",
-      "image/png",
-      "image/gif",
-      "image/webp",
+    // --------------------------------------------------------
+    // Get authenticated user
+    // --------------------------------------------------------
+    const userId =
+      req.user?.id ||
+      req.user?.userId ||
+      req.auth?.userId ||
+      req.session?.userId;
 
-      // Videos
-      "video/mp4",
-      "video/webm",
-      "video/quicktime",
-    ];
+    if (!userId) {
+      return res.status(401).json({
+        error: "Unauthorized"
+      });
+    }
 
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
+    // --------------------------------------------------------
+    // Validate chat ID
+    // --------------------------------------------------------
+    if (!chatId) {
+      return res.status(400).json({
+        error: "chatId is required"
+      });
+    }
+
+    // --------------------------------------------------------
+    // Validate media
+    // --------------------------------------------------------
+    if (!mediaUrl) {
+      return res.status(400).json({
+        error: "mediaUrl is required"
+      });
+    }
+
+    // --------------------------------------------------------
+    // Validate duration
+    // --------------------------------------------------------
+    let snapDuration = Number(duration);
+
+    if (!Number.isFinite(snapDuration)) {
+      snapDuration = 10;
+    }
+
+    snapDuration = Math.max(1, Math.min(snapDuration, 86400));
+
+    // --------------------------------------------------------
+    // Calculate expiration
+    //
+    // expiresIn is in seconds.
+    // If omitted, use duration.
+    // --------------------------------------------------------
+    let expirationSeconds = Number(expiresIn);
+
+    if (!Number.isFinite(expirationSeconds)) {
+      expirationSeconds = snapDuration;
+    }
+
+    expirationSeconds = Math.max(
+      1,
+      Math.min(expirationSeconds, 86400)
+    );
+
+    // --------------------------------------------------------
+    // Verify chat exists and user belongs to it
+    // --------------------------------------------------------
+    const chatResult = await pool.query(
+      `
+      SELECT
+        id,
+        creator_id,
+        participants
+      FROM chats
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [chatId]
+    );
+
+    if (chatResult.rows.length === 0) {
+      return res.status(404).json({
+        error: "Chat not found"
+      });
+    }
+
+    const chat = chatResult.rows[0];
+
+    const participants = Array.isArray(chat.participants)
+      ? chat.participants.map(Number)
+      : [];
+
+    const isParticipant =
+      Number(chat.creator_id) === Number(userId) ||
+      participants.includes(Number(userId));
+
+    // Also check chat_participants because your schema
+    // contains a normalized participant table.
+    let normalizedParticipant = false;
+
+    const participantResult = await pool.query(
+      `
+      SELECT 1
+      FROM chat_participants
+      WHERE chat_id = $1
+        AND user_id = $2
+      LIMIT 1
+      `,
+      [chatId, userId]
+    );
+
+    normalizedParticipant = participantResult.rows.length > 0;
+
+    if (!isParticipant && !normalizedParticipant) {
+      return res.status(403).json({
+        error: "You are not a participant in this chat"
+      });
+    }
+
+    // --------------------------------------------------------
+    // Create expiration timestamp
+    // --------------------------------------------------------
+    const expiresAt = new Date(
+      Date.now() + expirationSeconds * 1000
+    );
+
+    // --------------------------------------------------------
+    // Insert snap into existing messages table
+    // --------------------------------------------------------
+    const result = await pool.query(
+      `
+      INSERT INTO messages (
+        chat_id,
+        sender_id,
+        content,
+        type,
+        media_url,
+        timestamp,
+        created_at,
+        snap_expires_at,
+        snap_caption,
+        snap_duration
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        NOW(),
+        NOW(),
+        $6,
+        $7,
+        $8
+      )
+      RETURNING
+        id,
+        chat_id,
+        sender_id,
+        content,
+        type,
+        media_url,
+        timestamp,
+        created_at,
+        snap_expires_at,
+        snap_opened_at,
+        snap_opened_by,
+        snap_caption,
+        snap_duration
+      `,
+      [
+        chatId,
+        userId,
+        content || null,
+        type || "snap",
+        mediaUrl,
+        expiresAt,
+        caption || null,
+        snapDuration
+      ]
+    );
+
+    const snap = result.rows[0];
+
+    // --------------------------------------------------------
+    // Update chat's last message
+    // --------------------------------------------------------
+    await pool.query(
+      `
+      UPDATE chats
+      SET
+        last_message = $1,
+        last_message_id = $2,
+        last_message_at = NOW()
+      WHERE id = $3
+      `,
+      [
+        "📸 Snap",
+        snap.id,
+        chatId
+      ]
+    );
+
+    // --------------------------------------------------------
+    // Optional Socket.IO notification
+    //
+    // This will only run if your app has Socket.IO attached.
+    // --------------------------------------------------------
+    try {
+      if (typeof io !== "undefined") {
+        io.to(`chat:${chatId}`).emit("chat:snap", snap);
+      }
+    } catch (socketError) {
       console.error(
-        "[SNAP] Rejected file type:",
-        file.mimetype
-      );
-
-      cb(
-        new Error(
-          `Invalid Snap file type: ${file.mimetype}`
-        ),
-        false
+        "Socket.IO snap notification error:",
+        socketError
       );
     }
-  },
+
+    return res.status(201).json({
+      success: true,
+      snap
+    });
+
+  } catch (error) {
+    console.error(
+      "POST /api/chats/:chatId/snaps error:",
+      error
+    );
+
+    return res.status(500).json({
+      error: "Failed to send snap"
+    });
+  }
 });
 
 
-app.post(
-  "/api/chats/:chatId/snaps",
-  authenticateToken,
-  snapUpload.single("media"),
+// ============================================================
+// GET SNAP MESSAGES
+// ============================================================
 
-  async (req, res) => {
-    const client = await pool.connect();
+app.get("/api/chats/:chatId/snaps", async (req, res) => {
+  try {
+    const { chatId } = req.params;
 
-    try {
-      // ========================================================
-      // AUTH
-      // ========================================================
+    const userId =
+      req.user?.id ||
+      req.user?.userId ||
+      req.auth?.userId ||
+      req.session?.userId;
 
-      const myId = Number(req.user?.id);
+    if (!userId) {
+      return res.status(401).json({
+        error: "Unauthorized"
+      });
+    }
 
-      if (!Number.isInteger(myId)) {
-        return res.status(401).json({
-          error: "Invalid authenticated user",
-        });
-      }
+    // --------------------------------------------------------
+    // Verify chat
+    // --------------------------------------------------------
+    const chatResult = await pool.query(
+      `
+      SELECT
+        id,
+        creator_id,
+        participants
+      FROM chats
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [chatId]
+    );
 
-      // ========================================================
-      // CHAT ID
-      // ========================================================
+    if (chatResult.rows.length === 0) {
+      return res.status(404).json({
+        error: "Chat not found"
+      });
+    }
 
-      const { chatId } = req.params;
+    const chat = chatResult.rows[0];
 
-      const UUID_RE =
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const participants = Array.isArray(chat.participants)
+      ? chat.participants.map(Number)
+      : [];
 
-      if (!UUID_RE.test(chatId)) {
-        return res.status(400).json({
-          error: "Invalid chat id",
-        });
-      }
+    let allowed =
+      Number(chat.creator_id) === Number(userId) ||
+      participants.includes(Number(userId));
 
-      // ========================================================
-      // FILE
-      // ========================================================
-
-      if (!req.file) {
-        return res.status(400).json({
-          error: "Snap media is required",
-        });
-      }
-
-      const file = req.file;
-
-      // ========================================================
-      // TYPE
-      // ========================================================
-
-      const requestedType =
-        typeof req.body?.type === "string"
-          ? req.body.type.toLowerCase().trim()
-          : "";
-
-      const isVideo =
-        requestedType === "video" ||
-        file.mimetype.startsWith("video/");
-
-      const snapType = isVideo
-        ? "video"
-        : "image";
-
-      // ========================================================
-      // CAPTION
-      // ========================================================
-
-      const caption =
-        typeof req.body?.caption === "string"
-          ? req.body.caption.trim().slice(0, 200)
-          : "";
-
-      console.log(
-        "[SNAP] Incoming:",
-        {
-          chatId,
-          userId: myId,
-          type: snapType,
-          filename: file.originalname,
-          mimetype: file.mimetype,
-          size: file.size,
-          hasCaption: !!caption,
-        }
-      );
-
-      // ========================================================
-      // START TRANSACTION
-      // ========================================================
-
-      await client.query("BEGIN");
-
-      // ========================================================
-      // VERIFY CHAT PARTICIPANT
-      //
-      // Supports:
-      //
-      // 1. chat_participants
-      // 2. chats.participants
-      // ========================================================
-
-      const accessResult =
-        await client.query(
-          `
-          SELECT
-            c.id,
-            c.participants
-          FROM chats c
-          WHERE c.id = $1
-            AND (
-              EXISTS (
-                SELECT 1
-                FROM chat_participants cp
-                WHERE cp.chat_id = c.id
-                  AND cp.user_id = $2
-              )
-              OR
-              $2 = ANY(
-                COALESCE(
-                  c.participants,
-                  ARRAY[]::integer[]
-                )
-              )
-            )
-          LIMIT 1
-          `,
-          [chatId, myId]
-        );
-
-      if (!accessResult.rowCount) {
-        await client.query("ROLLBACK");
-
-        return res.status(403).json({
-          error:
-            "You are not a participant in this chat",
-        });
-      }
-
-      // ========================================================
-      // ENSURE CHAT PARTICIPANT RECORD
-      // ========================================================
-
-      await client.query(
+    if (!allowed) {
+      const participantResult = await pool.query(
         `
-        INSERT INTO chat_participants (
-          chat_id,
-          user_id
-        )
-        VALUES ($1, $2)
-        ON CONFLICT (chat_id, user_id)
-        DO NOTHING
+        SELECT 1
+        FROM chat_participants
+        WHERE chat_id = $1
+          AND user_id = $2
+        LIMIT 1
         `,
-        [chatId, myId]
+        [chatId, userId]
       );
 
-      // ========================================================
-      // CHECK S3
-      // ========================================================
+      allowed = participantResult.rows.length > 0;
+    }
 
-      if (!s3) {
-        await client.query("ROLLBACK");
+    if (!allowed) {
+      return res.status(403).json({
+        error: "You are not a participant in this chat"
+      });
+    }
 
-        return res.status(500).json({
-          error: "S3 storage is not configured",
+    // --------------------------------------------------------
+    // Delete expired snaps first
+    // --------------------------------------------------------
+    await pool.query(
+      `
+      DELETE FROM messages
+      WHERE chat_id = $1
+        AND type = 'snap'
+        AND snap_expires_at IS NOT NULL
+        AND snap_expires_at <= NOW()
+      `,
+      [chatId]
+    );
+
+    // --------------------------------------------------------
+    // Return active snaps
+    // --------------------------------------------------------
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        chat_id,
+        sender_id,
+        content,
+        type,
+        media_url,
+        timestamp,
+        created_at,
+        snap_expires_at,
+        snap_opened_at,
+        snap_opened_by,
+        snap_caption,
+        snap_duration
+      FROM messages
+      WHERE chat_id = $1
+        AND type = 'snap'
+        AND (
+          snap_expires_at IS NULL
+          OR snap_expires_at > NOW()
+        )
+      ORDER BY created_at ASC
+      `,
+      [chatId]
+    );
+
+    return res.status(200).json({
+      success: true,
+      snaps: result.rows
+    });
+
+  } catch (error) {
+    console.error(
+      "GET /api/chats/:chatId/snaps error:",
+      error
+    );
+
+    return res.status(500).json({
+      error: "Failed to get snaps"
+    });
+  }
+});
+
+
+// ============================================================
+// OPEN SNAP
+// POST /api/chats/:chatId/snaps/:messageId/open
+// ============================================================
+
+app.post(
+  "/api/chats/:chatId/snaps/:messageId/open",
+  async (req, res) => {
+    try {
+      const {
+        chatId,
+        messageId
+      } = req.params;
+
+      const userId =
+        req.user?.id ||
+        req.user?.userId ||
+        req.auth?.userId ||
+        req.session?.userId;
+
+      if (!userId) {
+        return res.status(401).json({
+          error: "Unauthorized"
         });
       }
 
-      // ========================================================
-      // FILE EXTENSION
-      // ========================================================
-
-      let extension =
-        path
-          .extname(
-            file.originalname || ""
-          )
-          .replace(".", "")
-          .toLowerCase();
-
-      if (!extension) {
-        extension = isVideo
-          ? "mp4"
-          : "jpg";
-      }
-
-      extension =
-        extension.replace(
-          /[^a-z0-9]/gi,
-          ""
-        );
-
-      if (!extension) {
-        extension = isVideo
-          ? "mp4"
-          : "jpg";
-      }
-
-      // ========================================================
-      // S3 KEY
-      // ========================================================
-
-      const s3Key =
-        `snaps/${myId}/` +
-        `${Date.now()}-` +
-        `${crypto.randomUUID()}.` +
-        `${extension}`;
-
-      console.log(
-        "[SNAP] Uploading:",
-        s3Key
+      // ------------------------------------------------------
+      // Find snap
+      // ------------------------------------------------------
+      const snapResult = await pool.query(
+        `
+        SELECT
+          id,
+          chat_id,
+          sender_id,
+          type,
+          media_url,
+          content,
+          snap_expires_at,
+          snap_opened_at,
+          snap_opened_by,
+          snap_caption,
+          snap_duration
+        FROM messages
+        WHERE id = $1
+          AND chat_id = $2
+          AND type = 'snap'
+        LIMIT 1
+        `,
+        [messageId, chatId]
       );
 
-      // ========================================================
-      // UPLOAD S3
-      // ========================================================
-
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: S3_BUCKET_NAME,
-          Key: s3Key,
-          Body: file.buffer,
-          ContentType: file.mimetype,
-
-          // Snap media should not be publicly cached forever.
-          CacheControl:
-            "private, max-age=31536000",
-        })
-      );
-
-      // ========================================================
-      // MEDIA URL
-      // ========================================================
-
-      let mediaUrl;
-
-      if (AWS_CLOUDFRONT_DOMAIN) {
-        mediaUrl =
-          `https://${AWS_CLOUDFRONT_DOMAIN}/${s3Key}`;
-      } else {
-        mediaUrl =
-          `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`;
+      if (snapResult.rows.length === 0) {
+        return res.status(404).json({
+          error: "Snap not found"
+        });
       }
 
-      console.log(
-        "[SNAP] Media URL created"
+      const snap = snapResult.rows[0];
+
+      // ------------------------------------------------------
+      // Check expiration
+      // ------------------------------------------------------
+      if (
+        snap.snap_expires_at &&
+        new Date(snap.snap_expires_at).getTime() <= Date.now()
+      ) {
+        return res.status(410).json({
+          error: "Snap has expired"
+        });
+      }
+
+      // ------------------------------------------------------
+      // Check chat membership
+      // ------------------------------------------------------
+      const chatResult = await pool.query(
+        `
+        SELECT
+          creator_id,
+          participants
+        FROM chats
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [chatId]
       );
 
-      // ========================================================
-      // SNAP EXPIRATION
-      //
-      // Unopened Snap automatically becomes expired
-      // after 24 hours.
-      // ========================================================
+      if (chatResult.rows.length === 0) {
+        return res.status(404).json({
+          error: "Chat not found"
+        });
+      }
 
-      const expiresAt =
-        new Date(
-          Date.now() +
-            24 * 60 * 60 * 1000
-        );
+      const chat = chatResult.rows[0];
 
-      // ========================================================
-      // SNAP DURATION
-      //
-      // Photos = null
-      // Videos = 10 seconds
-      // ========================================================
+      const participants = Array.isArray(chat.participants)
+        ? chat.participants.map(Number)
+        : [];
 
-      const snapDuration =
-        isVideo ? 10 : null;
+      let allowed =
+        Number(chat.creator_id) === Number(userId) ||
+        participants.includes(Number(userId));
 
-      // ========================================================
-      // INSERT INTO EXISTING MESSAGES TABLE
-      // ========================================================
-
-      const messageResult =
-        await client.query(
+      if (!allowed) {
+        const participantResult = await pool.query(
           `
-          INSERT INTO messages (
-            chat_id,
-            sender_id,
-            content,
-            type,
-            media_url,
-            created_at,
-            snap_expires_at,
-            snap_caption,
-            snap_duration
-          )
-          VALUES (
-            $1,
-            $2,
-            $3,
-            'snap',
-            $4,
-            NOW(),
-            $5,
-            $6,
-            $7
-          )
-          RETURNING *
-          `,
-          [
-            chatId,
-            myId,
-            caption || null,
-            mediaUrl,
-            expiresAt,
-            caption || null,
-            snapDuration,
-          ]
-        );
-
-      const message =
-        messageResult.rows[0];
-
-      // ========================================================
-      // GET SENDER
-      // ========================================================
-
-      const senderResult =
-        await client.query(
-          `
-          SELECT
-            id,
-            username,
-            profile_url
-          FROM users
-          WHERE id = $1
+          SELECT 1
+          FROM chat_participants
+          WHERE chat_id = $1
+            AND user_id = $2
           LIMIT 1
           `,
-          [myId]
+          [chatId, userId]
         );
 
-      const sender =
-        senderResult.rows[0] || {
-          id: myId,
-          username:
-            req.user?.username ||
-            "User",
-          profile_url:
-            req.user?.profile_url ||
-            null,
-        };
+        allowed = participantResult.rows.length > 0;
+      }
 
-      // ========================================================
-      // UPDATE CHAT
-      // ========================================================
+      if (!allowed) {
+        return res.status(403).json({
+          error: "You are not a participant in this chat"
+        });
+      }
 
-      await client.query(
+      // ------------------------------------------------------
+      // Prevent sender from opening their own snap if desired
+      // ------------------------------------------------------
+      if (Number(snap.sender_id) === Number(userId)) {
+        return res.status(403).json({
+          error: "You cannot open your own snap"
+        });
+      }
+
+      // ------------------------------------------------------
+      // Mark as opened
+      // ------------------------------------------------------
+      const updateResult = await pool.query(
         `
-        UPDATE chats
+        UPDATE messages
         SET
-          last_message = $1,
-          last_message_at = NOW(),
-          updated_at = NOW()
+          snap_opened_at = NOW(),
+          snap_opened_by = $1
         WHERE id = $2
+          AND chat_id = $3
+          AND type = 'snap'
+        RETURNING
+          id,
+          chat_id,
+          sender_id,
+          type,
+          media_url,
+          content,
+          snap_expires_at,
+          snap_opened_at,
+          snap_opened_by,
+          snap_caption,
+          snap_duration
         `,
         [
-          isVideo
-            ? "📹 New Snap"
-            : "📸 New Snap",
-          chatId,
+          userId,
+          messageId,
+          chatId
         ]
       );
 
-      // ========================================================
-      // BUILD SOCKET MESSAGE
-      // ========================================================
+      if (updateResult.rows.length === 0) {
+        return res.status(404).json({
+          error: "Snap not found"
+        });
+      }
 
-      const snapMessage = {
-        ...message,
+      const openedSnap = updateResult.rows[0];
 
-        isSnap: true,
-
-        snap: {
-          id: message.id,
-
-          type: snapType,
-
-          mediaUrl: mediaUrl,
-
-          caption:
-            caption || null,
-
-          opened: false,
-
-          openedAt: null,
-
-          openedBy: null,
-
-          expiresAt: expiresAt,
-
-          duration: snapDuration,
-        },
-
-        sender,
-      };
-
-      // ========================================================
-      // COMMIT
-      // ========================================================
-
-      await client.query("COMMIT");
-
-      // ========================================================
-      // SOCKET.IO
-      // ========================================================
-
-      io
-        .to(`chat-${chatId}`)
-        .emit(
-          "new-message",
-          snapMessage
-        );
-
-      // ========================================================
-      // OTHER PARTICIPANTS
-      // ========================================================
-
-      const participantResult =
-        await pool.query(
-          `
-          SELECT user_id
-          FROM chat_participants
-          WHERE chat_id = $1
-            AND user_id != $2
-          `,
-          [chatId, myId]
-        );
-
-      for (
-        const participant
-        of participantResult.rows
-      ) {
-        io
-          .to(
-            `user-${participant.user_id}`
-          )
-          .emit(
-            "new-message",
-            snapMessage
+      // ------------------------------------------------------
+      // Socket notification
+      // ------------------------------------------------------
+      try {
+        if (typeof io !== "undefined") {
+          io.to(`chat:${chatId}`).emit(
+            "chat:snap-opened",
+            {
+              messageId: Number(messageId),
+              chatId,
+              openedBy: Number(userId),
+              openedAt: openedSnap.snap_opened_at
+            }
           );
-      }
-
-      // ========================================================
-      // LEGACY PARTICIPANTS
-      // ========================================================
-
-      const legacyResult =
-        await pool.query(
-          `
-          SELECT participants
-          FROM chats
-          WHERE id = $1
-          LIMIT 1
-          `,
-          [chatId]
+        }
+      } catch (socketError) {
+        console.error(
+          "Socket.IO snap-opened error:",
+          socketError
         );
-
-      const legacyParticipants =
-        legacyResult.rows[0]
-          ?.participants;
-
-      if (
-        Array.isArray(
-          legacyParticipants
-        )
-      ) {
-        for (
-          const userId
-          of legacyParticipants
-        ) {
-          if (
-            Number(userId) !== myId
-          ) {
-            io
-              .to(`user-${userId}`)
-              .emit(
-                "new-message",
-                snapMessage
-              );
-          }
-        }
       }
 
-      // ========================================================
-      // SUCCESS
-      // ========================================================
-
-      console.log(
-        "[SNAP] Created successfully:",
-        {
-          messageId: message.id,
-          chatId,
-          senderId: myId,
-          type: snapType,
-        }
-      );
-
-      return res.status(201).json({
+      return res.status(200).json({
         success: true,
-
-        snap: snapMessage,
-
-        message: snapMessage,
+        snap: openedSnap
       });
 
     } catch (error) {
-      // ========================================================
-      // ROLLBACK
-      // ========================================================
-
-      await client
-        .query("ROLLBACK")
-        .catch(() => {});
-
       console.error(
-        "[SNAP] Failed:",
+        "POST /api/chats/:chatId/snaps/:messageId/open error:",
         error
       );
 
       return res.status(500).json({
-        error:
-          error?.message ||
-          "Failed to send Snap",
+        error: "Failed to open snap"
       });
-
-    } finally {
-      client.release();
     }
   }
 );
+
+
+// ============================================================
+// DELETE SNAP
+// ============================================================
+
+app.delete(
+  "/api/chats/:chatId/snaps/:messageId",
+  async (req, res) => {
+    try {
+      const {
+        chatId,
+        messageId
+      } = req.params;
+
+      const userId =
+        req.user?.id ||
+        req.user?.userId ||
+        req.auth?.userId ||
+        req.session?.userId;
+
+      if (!userId) {
+        return res.status(401).json({
+          error: "Unauthorized"
+        });
+      }
+
+      const result = await pool.query(
+        `
+        DELETE FROM messages
+        WHERE id = $1
+          AND chat_id = $2
+          AND type = 'snap'
+          AND sender_id = $3
+        RETURNING id
+        `,
+        [
+          messageId,
+          chatId,
+          userId
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          error: "Snap not found"
+        });
+      }
+
+      try {
+        if (typeof io !== "undefined") {
+          io.to(`chat:${chatId}`).emit(
+            "chat:snap-deleted",
+            {
+              chatId,
+              messageId: Number(messageId)
+            }
+          );
+        }
+      } catch (socketError) {
+        console.error(
+          "Socket.IO snap-delete error:",
+          socketError
+        );
+      }
+
+      return res.status(200).json({
+        success: true,
+        messageId: Number(messageId)
+      });
+
+    } catch (error) {
+      console.error(
+        "DELETE /api/chats/:chatId/snaps/:messageId error:",
+        error
+      );
+
+      return res.status(500).json({
+        error: "Failed to delete snap"
+      });
+    }
+  }
+); 
 
 // ============================================================
 // GET MESSAGE REQUESTS
