@@ -7763,28 +7763,7 @@ app.post(
 // SNAP MEDIA UPLOAD
 // ============================================================
 
-const multer = require("multer");
 
-const snapUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 100 * 1024 * 1024, // 100 MB
-  },
-  fileFilter: (req, file, cb) => {
-    if (
-      file.mimetype.startsWith("image/") ||
-      file.mimetype.startsWith("video/")
-    ) {
-      cb(null, true);
-    } else {
-      cb(
-        new Error(
-          "Only image and video files are allowed."
-        )
-      );
-    }
-  },
-});
 
 
 // ============================================================
