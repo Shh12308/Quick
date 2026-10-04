@@ -7767,7 +7767,7 @@ app.post(
 // DELETE /api/chats/:chatId/snaps/:messageId
 // ============================================================
 
-app.post("/api/chats/:chatId/snaps", async (req, res) => {
+app.post("/api/chats/:chatId/snaps", authenticateToken, async (req, res) => {
   try {
     const { chatId } = req.params;
 
@@ -8018,7 +8018,7 @@ app.post("/api/chats/:chatId/snaps", async (req, res) => {
 // GET SNAP MESSAGES
 // ============================================================
 
-app.get("/api/chats/:chatId/snaps", async (req, res) => {
+app.get("/api/chats/:chatId/snaps", authenticateToken, async (req, res) => {
   try {
     const { chatId } = req.params;
 
@@ -8157,7 +8157,7 @@ app.get("/api/chats/:chatId/snaps", async (req, res) => {
 
 app.post(
   "/api/chats/:chatId/snaps/:messageId/open",
-  async (req, res) => {
+  authenticateToken, async (req, res) => {
     try {
       const {
         chatId,
@@ -8370,7 +8370,7 @@ app.post(
 
 app.delete(
   "/api/chats/:chatId/snaps/:messageId",
-  async (req, res) => {
+  authenticateToken, async (req, res) => {
     try {
       const {
         chatId,
