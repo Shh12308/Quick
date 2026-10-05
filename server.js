@@ -7941,7 +7941,7 @@ async function getChatParticipantStatus(chatId, userId) {
 
 app.post(
   "/api/chats/:chatId/snaps",
-  async (req, res) => {
+  authenticateToken, async (req, res) => {
     try {
       const { chatId } = req.params;
 
@@ -8244,7 +8244,7 @@ app.post(
 
 app.get(
   "/api/chats/:chatId/snaps",
-  async (req, res) => {
+  authenticateToken, async (req, res) => {
     try {
       const { chatId } = req.params;
 
@@ -8360,7 +8360,7 @@ app.get(
 
 app.post(
   "/api/chats/:chatId/snaps/:messageId/open",
-  async (req, res) => {
+  authenticateToken, async (req, res) => {
     try {
       const {
         chatId,
@@ -8583,7 +8583,7 @@ app.post(
 
 app.delete(
   "/api/chats/:chatId/snaps/:messageId",
-  async (req, res) => {
+  authenticateToken, async (req, res) => {
     try {
       const {
         chatId,
