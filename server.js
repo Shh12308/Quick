@@ -7777,7 +7777,20 @@ app.post(
 // It returns the URL that gets stored in messages.media_url.
 // ============================================================
 
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 
+const uploadsDirectory = path.join(
+  __dirname,
+  "uploads"
+);
+
+if (!fs.existsSync(uploadsDirectory)) {
+  fs.mkdirSync(uploadsDirectory, {
+    recursive: true,
+  });
+}
 
 
 async function uploadSnapMedia(file) {
