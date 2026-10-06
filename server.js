@@ -2420,7 +2420,7 @@ async function checkHiveAI(imagePath) {
     allowed: true,
     status: "approved",
     score: 0
-};};
+};
   } catch (err) { console.error("Hive Error:", err.message); return {
 
         allowed: false,
