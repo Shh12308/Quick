@@ -2416,8 +2416,25 @@ async function checkHiveAI(imagePath) {
     if (data.response && data.response.gore && data.response.gore.probability > 0.8) {
       return { allowed: false, reason: "Hive: Gore Detected" };
     }
-    return { allowed: true };
-  } catch (err) { console.error("Hive Error:", err.message); return { allowed: true }; }
+    return {
+    allowed: true,
+    status: "approved",
+    score: 0
+};};
+  } catch (err) { console.error("Hive Error:", err.message); return {
+
+        allowed: false,
+
+        status: "review",
+
+        score: 1,
+
+        category: "moderation_unavailable",
+
+        reason: "Image moderation provider unavailable"
+
+    };
+
 }
 
 async function checkSightengine(imagePath) {
@@ -2435,8 +2452,16 @@ async function checkSightengine(imagePath) {
     }
     if (data.gore && data.gore.prob > 0.7) return { allowed: false, reason: "Sightengine: Gore Detected" };
     if (data.weapon && data.weapon.weapon > 0.8) return { allowed: false, reason: "Sightengine: Weapon Detected" };
-    return { allowed: true };
-  } catch (err) { console.error("Sightengine Error:", err.message); return { allowed: true }; }
+    return {
+    allowed: true,
+    status: "approved",
+    score: 0
+};
+  } catch (err) { console.error("Sightengine Error:", err.message); return {
+    allowed: true,
+    status: "approved",
+    score: 0
+}; }
 }
 
 async function checkDeepAI(imagePath) {
@@ -2449,18 +2474,87 @@ async function checkDeepAI(imagePath) {
     });
     const score = response.data.output?.nsfw_score;
     if (score && score > 0.6) return { allowed: false, reason: "DeepAI: Inappropriate Content" };
-    return { allowed: true };
-  } catch (err) { console.error("DeepAI Error:", err.message); return { allowed: true }; }
+    return {
+    allowed: true,
+    status: "approved",
+    score: 0
+};
+  } catch (err) { console.error("DeepAI Error:", err.message); return {
+
+        allowed: false,
+
+        status: "review",
+
+        score: 1,
+
+        category: "moderation_unavailable",
+
+        reason: "Image moderation provider unavailable"
+
+    };
+
 }
 
 async function runAllModerationChecks(imagePath, userId) {
-  const hiveResult = await checkHiveAI(imagePath);
-  if (!hiveResult.allowed) return hiveResult;
-  const deepResult = await checkDeepAI(imagePath);
-  if (!deepResult.allowed) return deepResult;
-  const sightResult = await checkSightengine(imagePath);
-  if (!sightResult.allowed) return sightResult;
-  return { allowed: true };
+  const checks = [];
+
+  try {
+    checks.push(
+      await checkHiveAI(imagePath)
+    );
+  } catch (err) {
+    checks.push({
+      allowed: false,
+      status: "review",
+      score: 1,
+      category: "hive_error",
+      reason: "Hive moderation failed"
+    });
+  }
+
+  try {
+    checks.push(
+      await checkDeepAI(imagePath)
+    );
+  } catch (err) {
+    checks.push({
+      allowed: false,
+      status: "review",
+      score: 1,
+      category: "deepai_error",
+      reason: "DeepAI moderation failed"
+    });
+  }
+
+  try {
+    checks.push(
+      await checkSightengine(imagePath)
+    );
+  } catch (err) {
+    checks.push({
+      allowed: false,
+      status: "review",
+      score: 1,
+      category: "sightengine_error",
+      reason: "Sightengine moderation failed"
+    });
+  }
+
+  const failed = checks.find(
+    result => result.allowed === false
+  );
+
+  if (failed) {
+    return failed;
+  }
+
+  return {
+    allowed: true,
+    status: "approved",
+    score: 0,
+    category: null,
+    reason: null
+  };
 }
 
 async function handleContentViolation(userId, reason, client = pool) {
@@ -2512,20 +2606,680 @@ async function checkBan(req, res, next) {
   } catch (err) { console.error("checkBan error:", err); next(); }
 }
 
-async function checkTextModeration(text, userId) {
-  if (!openai || !text) return { allowed: true };
+// ============================================================
+// CENTRAL TEXT MODERATION
+// ============================================================
+
+async function checkTextModeration(text, userId = null) {
+  if (!text || !String(text).trim()) {
+    return {
+      allowed: true,
+      status: "approved",
+      score: 0,
+      category: null,
+      reason: null
+    };
+  }
+
+  if (!openai) {
+    console.error("❌ OpenAI moderation client unavailable");
+
+    return {
+      allowed: false,
+      status: "review",
+      score: 1,
+      category: "moderation_unavailable",
+      reason: "Moderation service unavailable"
+    };
+  }
+
   try {
-    const moderation = await openai.moderations.create({ input: text });
-    const result = moderation.results[0];
-    if (result.flagged) {
-      const categories = result.categories;
-      if (categories.sexual || categories.sexual_minors) return { allowed: false, reason: "Adult Content Detected" };
-      if (categories.harassment || categories.harassment_threatening) return { allowed: false, reason: "Harassment/Minor Safety Violation" };
-      if (categories.hate) return { allowed: false, reason: "Hate Speech Detected" };
-      return { allowed: false, reason: "Content Policy Violation" };
+    const moderation = await openai.moderations.create({
+      input: String(text).slice(0, 50000)
+    });
+
+    const result = moderation.results?.[0];
+
+    if (!result) {
+      return {
+        allowed: false,
+        status: "review",
+        score: 1,
+        category: "moderation_error",
+        reason: "No moderation result"
+      };
     }
-    return { allowed: true };
-  } catch (err) { console.error("Moderation API Error:", err); return { allowed: true }; }
+
+    const categories = result.categories || {};
+    const scores = result.category_scores || {};
+
+    const flaggedCategories = Object.keys(categories)
+      .filter(key => categories[key] === true);
+
+    if (!result.flagged) {
+      return {
+        allowed: true,
+        status: "approved",
+        score: 0,
+        category: null,
+        reason: null,
+        categories,
+        scores
+      };
+    }
+
+    let category = "policy_violation";
+    let reason = "Content policy violation";
+
+    if (
+      categories.sexual_minors ||
+      categories.illicit_sexual_minors
+    ) {
+      category = "child_safety";
+      reason = "Child safety violation";
+    } else if (categories.sexual) {
+      category = "sexual_content";
+      reason = "Sexual content";
+    } else if (
+      categories.harassment_threatening ||
+      categories.harassment
+    ) {
+      category = "harassment";
+      reason = "Harassment or threats";
+    } else if (categories.hate_threatening || categories.hate) {
+      category = "hate";
+      reason = "Hateful content";
+    } else if (categories.violence_graphic) {
+      category = "graphic_violence";
+      reason = "Graphic violence";
+    } else if (categories.violence) {
+      category = "violence";
+      reason = "Violent content";
+    } else if (categories.self_harm_intent) {
+      category = "self_harm";
+      reason = "Self-harm content";
+    } else if (categories.self_harm) {
+      category = "self_harm";
+      reason = "Self-harm content";
+    }
+
+    return {
+      allowed: false,
+      status: "rejected",
+      score: Math.max(
+        ...Object.values(scores).filter(v => typeof v === "number"),
+        0
+      ),
+      category,
+      reason,
+      flaggedCategories,
+      categories,
+      scores
+    };
+
+  } catch (err) {
+    console.error("❌ Text moderation failed:", err);
+
+    // FAIL CLOSED.
+    return {
+      allowed: false,
+      status: "review",
+      score: 1,
+      category: "moderation_unavailable",
+      reason: "Moderation service unavailable"
+    };
+  }
+}
+
+// ============================================================
+// CENTRAL MODERATION ENGINE
+// ============================================================
+
+const MODERATION_STATUSES = {
+  PENDING: "pending",
+  APPROVED: "approved",
+  LIMITED: "limited",
+  REVIEW: "review",
+  REJECTED: "rejected",
+  REMOVED: "removed"
+};
+
+
+function getSeverity(category, score = 0) {
+  if (
+    category === "child_safety" ||
+    category === "terrorism_extremism"
+  ) {
+    return "critical";
+  }
+
+  if (score >= 0.90) {
+    return "critical";
+  }
+
+  if (score >= 0.70) {
+    return "high";
+  }
+
+  if (score >= 0.40) {
+    return "medium";
+  }
+
+  return "low";
+}
+
+
+function calculateModerationDecision({
+  textResult = null,
+  imageResult = null,
+  userRisk = 0
+}) {
+  const results = [
+    textResult,
+    imageResult
+  ].filter(Boolean);
+
+  const rejected = results.find(
+    result => result.status === "rejected"
+  );
+
+  if (rejected) {
+    return {
+      status: "rejected",
+      reason: rejected.reason,
+      category: rejected.category,
+      score: rejected.score || 1
+    };
+  }
+
+  const review = results.find(
+    result => result.status === "review"
+  );
+
+  if (review) {
+    return {
+      status: "review",
+      reason: review.reason,
+      category: review.category,
+      score: review.score || 1
+    };
+  }
+
+  const scores = results
+    .map(r => Number(r.score || 0))
+    .filter(Number.isFinite);
+
+  const highestScore = Math.max(
+    ...scores,
+    Number(userRisk || 0)
+  );
+
+  if (highestScore >= 0.80) {
+    return {
+      status: "review",
+      reason: "High moderation risk",
+      category: "high_risk",
+      score: highestScore
+    };
+  }
+
+  if (highestScore >= 0.50) {
+    return {
+      status: "limited",
+      reason: "Limited distribution",
+      category: "limited_distribution",
+      score: highestScore
+    };
+  }
+
+  return {
+    status: "approved",
+    reason: null,
+    category: null,
+    score: highestScore
+  };
+}
+
+
+async function getUserModerationRisk(userId, db = pool) {
+  if (!userId) return 0;
+
+  try {
+    const { rows } = await db.query(
+      `
+      SELECT
+        COALESCE(trust_score, 50) AS trust_score,
+        COALESCE(moderation_risk, 0) AS moderation_risk,
+        COALESCE(warning_count, 0) AS warning_count,
+        status
+      FROM users
+      WHERE id = $1
+      `,
+      [userId]
+    );
+
+    if (!rows.length) return 0;
+
+    const user = rows[0];
+
+    if (user.status === "banned") {
+      return 1;
+    }
+
+    let risk = Number(user.moderation_risk || 0);
+
+    risk += Math.min(
+      Number(user.warning_count || 0) * 0.05,
+      0.30
+    );
+
+    if (Number(user.trust_score) < 30) {
+      risk += 0.15;
+    }
+
+    return Math.min(risk, 1);
+
+  } catch (err) {
+    console.error("User moderation risk error:", err);
+    return 0.5;
+  }
+}
+
+
+// ============================================================
+// WRITE MODERATION EVENT
+// ============================================================
+
+async function writeModerationEvent({
+  userId,
+  contentType,
+  contentId,
+  action,
+  category = null,
+  severity = null,
+  reason = null,
+  score = null,
+  source = "system",
+  metadata = {},
+  moderatorId = null,
+  db = pool
+}) {
+  try {
+    await db.query(
+      `
+      INSERT INTO moderation_events (
+        user_id,
+        content_type,
+        content_id,
+        action,
+        category,
+        severity,
+        reason,
+        score,
+        source,
+        metadata,
+        moderator_id
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
+      )
+      `,
+      [
+        userId,
+        contentType,
+        contentId,
+        action,
+        category,
+        severity,
+        reason,
+        score,
+        source,
+        JSON.stringify(metadata || {}),
+        moderatorId
+      ]
+    );
+  } catch (err) {
+    console.error(
+      "Failed to write moderation event:",
+      err
+    );
+  }
+}
+
+
+// ============================================================
+// CREATE MODERATION CASE
+// ============================================================
+
+async function createModerationCase({
+  userId,
+  contentType,
+  contentId,
+  category,
+  reason,
+  priority = 50,
+  db = pool
+}) {
+  const { rows } = await db.query(
+    `
+    INSERT INTO moderation_cases (
+      user_id,
+      content_type,
+      content_id,
+      category,
+      reason,
+      priority
+    )
+    VALUES ($1,$2,$3,$4,$5,$6)
+    RETURNING id
+    `,
+    [
+      userId,
+      contentType,
+      contentId,
+      category,
+      reason,
+      priority
+    ]
+  );
+
+  return rows[0]?.id || null;
+}
+
+
+// ============================================================
+// APPLY MODERATION STATUS TO CONTENT
+// ============================================================
+
+async function updateModerationStatus({
+  contentType,
+  contentId,
+  status,
+  reason = null,
+  score = null,
+  metadata = {},
+  db = pool
+}) {
+  const tableMap = {
+    video: "videos",
+    comment: "comments",
+    story: "story_posts",
+    music: "music"
+  };
+
+  const table = tableMap[contentType];
+
+  if (!table) {
+    throw new Error(
+      `Unsupported moderation content type: ${contentType}`
+    );
+  }
+
+  await db.query(
+    `
+    UPDATE ${table}
+    SET
+      moderation_status = $1,
+      moderation_reason = $2,
+      moderation_score = $3,
+      moderated_at = NOW()
+      ${contentType === "video" || contentType === "story"
+        ? `, moderation_metadata = $4`
+        : ""}
+    WHERE id = $${contentType === "video" || contentType === "story" ? 5 : 4}
+    `,
+    contentType === "video" || contentType === "story"
+      ? [
+          status,
+          reason,
+          score,
+          JSON.stringify(metadata || {}),
+          contentId
+        ]
+      : [
+          status,
+          reason,
+          score,
+          contentId
+        ]
+  );
+}
+
+
+// ============================================================
+// CENTRAL MODERATE CONTENT
+// ============================================================
+
+async function moderateContent({
+  userId,
+  contentType,
+  contentId = null,
+  text = null,
+  imagePath = null,
+  metadata = {},
+  db = pool
+}) {
+  const startedAt = Date.now();
+
+  try {
+    // --------------------------------------------------------
+    // USER CHECK
+    // --------------------------------------------------------
+
+    const userRisk = await getUserModerationRisk(
+      userId,
+      db
+    );
+
+    // --------------------------------------------------------
+    // TEXT
+    // --------------------------------------------------------
+
+    let textResult = null;
+
+    if (text && String(text).trim()) {
+      textResult = await checkTextModeration(
+        text,
+        userId
+      );
+    }
+
+    // --------------------------------------------------------
+    // IMAGE
+    // --------------------------------------------------------
+
+    let imageResult = null;
+
+    if (imagePath) {
+      try {
+        imageResult = await runAllModerationChecks(
+          imagePath,
+          userId
+        );
+      } catch (err) {
+        console.error(
+          "Image moderation failed:",
+          err
+        );
+
+        imageResult = {
+          allowed: false,
+          status: "review",
+          score: 1,
+          category: "moderation_unavailable",
+          reason: "Image moderation unavailable"
+        };
+      }
+
+      if (imageResult) {
+        if (imageResult.allowed) {
+          imageResult.status = "approved";
+          imageResult.score = Number(
+            imageResult.score || 0
+          );
+        } else {
+          imageResult.status =
+            imageResult.status || "rejected";
+
+          imageResult.score =
+            Number(imageResult.score || 1);
+
+          imageResult.category =
+            imageResult.category ||
+            "image_policy_violation";
+        }
+      }
+    }
+
+    // --------------------------------------------------------
+    // FINAL DECISION
+    // --------------------------------------------------------
+
+    const decision =
+      calculateModerationDecision({
+        textResult,
+        imageResult,
+        userRisk
+      });
+
+    const severity = getSeverity(
+      decision.category,
+      decision.score
+    );
+
+    // --------------------------------------------------------
+    // SAVE STATUS
+    // --------------------------------------------------------
+
+    if (contentId) {
+      await updateModerationStatus({
+        contentType,
+        contentId,
+        status: decision.status,
+        reason: decision.reason,
+        score: decision.score,
+        metadata: {
+          ...metadata,
+          textResult,
+          imageResult,
+          userRisk,
+          processingMs: Date.now() - startedAt
+        },
+        db
+      });
+    }
+
+    // --------------------------------------------------------
+    // EVENT
+    // --------------------------------------------------------
+
+    await writeModerationEvent({
+      userId,
+      contentType,
+      contentId,
+      action: decision.status,
+      category: decision.category,
+      severity,
+      reason: decision.reason,
+      score: decision.score,
+      source: "automatic",
+      metadata: {
+        textResult,
+        imageResult,
+        userRisk,
+        processingMs: Date.now() - startedAt
+      },
+      db
+    });
+
+    // --------------------------------------------------------
+    // HUMAN REVIEW
+    // --------------------------------------------------------
+
+    if (
+      contentId &&
+      decision.status === "review"
+    ) {
+      await createModerationCase({
+        userId,
+        contentType,
+        contentId,
+        category: decision.category,
+        reason: decision.reason,
+        priority:
+          severity === "critical"
+            ? 100
+            : severity === "high"
+              ? 80
+              : 50,
+        db
+      });
+    }
+
+    // --------------------------------------------------------
+    // ENFORCEMENT
+    // --------------------------------------------------------
+
+    if (
+      decision.status === "rejected" &&
+      userId
+    ) {
+      await handleContentViolation(
+        userId,
+        decision.reason || "Content policy violation",
+        db
+      );
+    }
+
+    return {
+      success: true,
+      status: decision.status,
+      allowed:
+        decision.status === "approved" ||
+        decision.status === "limited",
+      category: decision.category,
+      severity,
+      reason: decision.reason,
+      score: decision.score
+    };
+
+  } catch (err) {
+    console.error(
+      "❌ CENTRAL MODERATION ERROR:",
+      err
+    );
+
+    // NEVER fail open.
+    if (contentId) {
+      try {
+        await updateModerationStatus({
+          contentType,
+          contentId,
+          status: "review",
+          reason: "Moderation system error",
+          score: 1,
+          metadata: {
+            error: err.message
+          },
+          db
+        });
+      } catch (updateError) {
+        console.error(
+          "Could not mark content for review:",
+          updateError
+        );
+      }
+    }
+
+    return {
+      success: false,
+      allowed: false,
+      status: "review",
+      category: "moderation_error",
+      severity: "high",
+      reason: "Content sent for review"
+    };
+  }
 }
 
 async function handleChatViolation(userId, chatId, reason) {
@@ -4101,8 +4855,7 @@ const shortsUpload = multer({
   },
 });
 
-// --- Auth Middleware (reuse or import) ---
-app.post("/api/uploadv", authenticateToken, async (req, res) => {
+// --- Auth Middleware (reuse or app.post("/api/uploadv", authenticateToken, async (req, res) => {
   const userId = req.userId;
 
   const {
@@ -4118,78 +4871,618 @@ app.post("/api/uploadv", authenticateToken, async (req, res) => {
     ageRestriction = "none",
   } = req.body;
 
-  // --- Validation ---
+  // ============================================================
+  // VALIDATION
+  // ============================================================
+
   if (!title || !title.trim()) {
-    return res.status(400).json({ error: "Title is required." });
+    return res.status(400).json({
+      error: "Title is required.",
+    });
   }
+
   if (!s3Key || !fileUrl) {
-    return res.status(400).json({ error: "Missing video file data (s3Key, fileUrl)." });
+    return res.status(400).json({
+      error: "Missing video file data (s3Key, fileUrl).",
+    });
   }
+
   if (!Array.isArray(tags) || tags.length > 15) {
-    return res.status(400).json({ error: "Tags must be an array with max 15 items." });
+    return res.status(400).json({
+      error: "Tags must be an array with max 15 items.",
+    });
   }
-  if (tags.some((t) => typeof t !== "string" || t.trim().length === 0)) {
-    return res.status(400).json({ error: "Each tag must be a non-empty string." });
+
+  if (
+    tags.some(
+      (t) =>
+        typeof t !== "string" ||
+        t.trim().length === 0
+    )
+  ) {
+    return res.status(400).json({
+      error: "Each tag must be a non-empty string.",
+    });
   }
-  const validCategories = ["general", "gaming", "music", "education", "sports", "entertainment", "comedy"];
+
+  const validCategories = [
+    "general",
+    "gaming",
+    "music",
+    "education",
+    "sports",
+    "entertainment",
+    "comedy",
+  ];
+
   if (!validCategories.includes(category)) {
-    return res.status(400).json({ error: `Invalid category. Must be one of: ${validCategories.join(", ")}` });
+    return res.status(400).json({
+      error: `Invalid category. Must be one of: ${validCategories.join(", ")}`,
+    });
   }
-  const validRestrictions = ["none", "moderate", "strict"];
+
+  const validRestrictions = [
+    "none",
+    "moderate",
+    "strict",
+  ];
+
   if (!validRestrictions.includes(ageRestriction)) {
-    return res.status(400).json({ error: `Invalid ageRestriction. Must be one of: ${validRestrictions.join(", ")}` });
+    return res.status(400).json({
+      error: `Invalid ageRestriction. Must be one of: ${validRestrictions.join(", ")}`,
+    });
   }
+
+  const publicValue =
+    isPublic === true ||
+    isPublic === "true";
+
+  // ============================================================
+  // NORMALIZE CONTENT
+  // ============================================================
+
+  const cleanTitle = title.trim();
+
+  const cleanDescription =
+    typeof description === "string"
+      ? description.trim()
+      : "";
+
+  const cleanTags = tags.map((t) =>
+    t.trim().toLowerCase()
+  );
 
   try {
-    // Verify user exists
+    // ============================================================
+    // VERIFY USER
+    // ============================================================
+
     const { rows: userRows } = await pool.query(
-      "SELECT id, username FROM users WHERE id = $1",
+      `
+      SELECT
+        id,
+        username,
+        status,
+        suspend_until
+      FROM users
+      WHERE id = $1
+      `,
       [userId]
     );
+
     if (!userRows.length) {
-      return res.status(404).json({ error: "User not found." });
+      return res.status(404).json({
+        error: "User not found.",
+      });
     }
 
-    // Insert video record
+    const user = userRows[0];
+
+    // ============================================================
+    // BLOCK SUSPENDED / BANNED USERS FROM UPLOADING
+    // ============================================================
+
+    if (user.status === "banned") {
+      return res.status(403).json({
+        error: "Your account is banned and cannot upload videos.",
+      });
+    }
+
+    if (
+      user.status === "suspended" &&
+      user.suspend_until &&
+      new Date(user.suspend_until) > new Date()
+    ) {
+      return res.status(403).json({
+        error: "Your account is currently suspended.",
+        suspend_until: user.suspend_until,
+      });
+    }
+
+    // ============================================================
+    // CREATE VIDEO AS PENDING MODERATION
+    // ============================================================
+    //
+    // IMPORTANT:
+    //
+    // moderation_status controls whether users can actually see
+    // the video.
+    //
+    // processing_status/status can continue to control the video
+    // processing pipeline.
+    //
+    // A video is NOT publicly visible just because status =
+    // "processing" or because is_public = true.
+    //
+    // ============================================================
+
     const { rows } = await pool.query(
-      `INSERT INTO videos (
-        user_id, title, description, tags, category,
-        s3_key, file_url, thumbnail_url, thumbnail_key, thumbnail_s3_key,
-        is_short, is_public, age_restriction, status, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
-      RETURNING id, title, created_at`,
+      `
+      INSERT INTO videos (
+        user_id,
+        title,
+        description,
+        tags,
+        category,
+
+        s3_key,
+        file_url,
+
+        thumbnail_url,
+        thumbnail_key,
+        thumbnail_s3_key,
+
+        is_short,
+        is_public,
+        age_restriction,
+
+        status,
+        moderation_status,
+        moderation_reason,
+        moderated_at,
+
+        created_at
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+
+        $6,
+        $7,
+
+        $8,
+        $9,
+        $10,
+
+        $11,
+        $12,
+        $13,
+
+        $14,
+        $15,
+        $16,
+        $17,
+
+        NOW()
+      )
+      RETURNING
+        id,
+        title,
+        status,
+        moderation_status,
+        is_public,
+        created_at
+      `,
       [
         userId,
-        title.trim(),
-        description.trim(),
-        JSON.stringify(tags.map((t) => t.trim().toLowerCase())),
+        cleanTitle,
+        cleanDescription,
+        JSON.stringify(cleanTags),
         category,
+
         s3Key,
         fileUrl,
+
         thumbnailUrl,
         thumbnailKey,
-        thumbnailKey, // ✅ Added thumbnail_s3_key here
-        false, 
-        isPublic === true || isPublic === "true",
+        thumbnailKey,
+
+        false,
+        publicValue,
         ageRestriction,
-        "processing", 
+
+        "processing",
+
+        // IMPORTANT:
+        // Everything starts pending.
+        "pending",
+
+        null,
+        null,
       ]
     );
 
-    cache.del(`user-videos:${userId}`);
+    const video = rows[0];
 
-    res.status(201).json({
-      success: true,
-      video: {
-        id: rows[0].id,
-        title: rows[0].title,
-        status: "processing",
-        created_at: rows[0].created_at,
+    // ============================================================
+    // MODERATE TITLE + DESCRIPTION + TAGS
+    // ============================================================
+    //
+    // We moderate the metadata immediately.
+    //
+    // The actual uploaded video file may require asynchronous
+    // video scanning later in the processing pipeline.
+    //
+    // ============================================================
+
+    let moderationResult = null;
+
+    try {
+      moderationResult = await moderateContent({
+        type: "video",
+        contentId: video.id,
+        userId,
+
+        title: cleanTitle,
+        description: cleanDescription,
+        tags: cleanTags,
+
+        fileUrl,
+        thumbnailUrl,
+
+        category,
+        ageRestriction,
+      });
+    } catch (moderationError) {
+      console.error(
+        "[/api/uploadv] Moderation error:",
+        moderationError
+      );
+
+      // ========================================================
+      // FAIL CLOSED
+      // ========================================================
+      //
+      // If the moderation service fails, do NOT publish the
+      // video automatically.
+      //
+      // Leave it pending so it can be retried/reviewed.
+      // ========================================================
+
+      await pool.query(
+        `
+        UPDATE videos
+        SET
+          moderation_status = 'review',
+          moderation_reason = $1,
+          moderated_at = NOW()
+        WHERE id = $2
+        `,
+        [
+          "Automatic moderation could not be completed.",
+          video.id,
+        ]
+      );
+
+      await createModerationCase({
+        contentType: "video",
+        contentId: video.id,
+        userId,
+        reason: "moderation_error",
+        priority: "high",
+        metadata: {
+          source: "video_upload",
+          error: moderationError.message,
+        },
+      });
+
+      await writeModerationEvent({
+        db: pool,
+        contentType: "video",
+        contentId: video.id,
+        userId,
+        action: "automatic_review",
+        reason:
+          "Automatic moderation service failed.",
+        metadata: {
+          source: "video_upload",
+        },
+      });
+
+      cache.del(`user-videos:${userId}`);
+
+      return res.status(202).json({
+        success: true,
+
+        video: {
+          id: video.id,
+          title: video.title,
+
+          status: "processing",
+
+          // The video is not visible until moderation
+          // has been completed.
+          moderation_status: "review",
+
+          created_at: video.created_at,
+        },
+
+        message:
+          "Video uploaded successfully and is awaiting moderation.",
+      });
+    }
+
+    // ============================================================
+    // NORMALIZE MODERATION RESULT
+    // ============================================================
+
+    const moderationStatus =
+      moderationResult?.status || "review";
+
+    const moderationReason =
+      moderationResult?.reason || null;
+
+    // ============================================================
+    // REJECTED
+    // ============================================================
+
+    if (moderationStatus === "rejected") {
+      await pool.query(
+        `
+        UPDATE videos
+        SET
+          moderation_status = 'rejected',
+          moderation_reason = $1,
+          moderated_at = NOW()
+        WHERE id = $2
+        `,
+        [
+          moderationReason ||
+            "Video violates our content rules.",
+          video.id,
+        ]
+      );
+
+      await createModerationCase({
+        contentType: "video",
+        contentId: video.id,
+        userId,
+        reason:
+          moderationReason ||
+          "Video rejected by automatic moderation.",
+        priority: "high",
+        metadata: {
+          source: "video_upload",
+          moderation: moderationResult,
+        },
+      });
+
+      await writeModerationEvent({
+        db: pool,
+        contentType: "video",
+        contentId: video.id,
+        userId,
+        action: "rejected",
+        reason:
+          moderationReason ||
+          "Video rejected by automatic moderation.",
+        metadata: moderationResult,
+      });
+
+      cache.del(`user-videos:${userId}`);
+
+      return res.status(201).json({
+        success: true,
+
+        video: {
+          id: video.id,
+          title: video.title,
+
+          status: "processing",
+          moderation_status: "rejected",
+
+          created_at: video.created_at,
+        },
+
+        message:
+          "Video was uploaded but cannot be published because it violates our content rules.",
+      });
+    }
+
+    // ============================================================
+    // NEEDS HUMAN REVIEW
+    // ============================================================
+
+    if (
+      moderationStatus === "review" ||
+      moderationStatus === "pending"
+    ) {
+      await pool.query(
+        `
+        UPDATE videos
+        SET
+          moderation_status = 'review',
+          moderation_reason = $1,
+          moderated_at = NOW()
+        WHERE id = $2
+        `,
+        [
+          moderationReason,
+          video.id,
+        ]
+      );
+
+      await createModerationCase({
+        contentType: "video",
+        contentId: video.id,
+        userId,
+        reason:
+          moderationReason ||
+          "Video requires manual review.",
+        priority: "normal",
+        metadata: {
+          source: "video_upload",
+          moderation: moderationResult,
+        },
+      });
+
+      await writeModerationEvent({
+        db: pool,
+        contentType: "video",
+        contentId: video.id,
+        userId,
+        action: "manual_review",
+        reason:
+          moderationReason ||
+          "Video requires manual review.",
+        metadata: moderationResult,
+      });
+
+      cache.del(`user-videos:${userId}`);
+
+      return res.status(202).json({
+        success: true,
+
+        video: {
+          id: video.id,
+          title: video.title,
+
+          status: "processing",
+          moderation_status: "review",
+
+          created_at: video.created_at,
+        },
+
+        message:
+          "Video uploaded successfully and is awaiting moderation.",
+      });
+    }
+
+    // ============================================================
+    // LIMITED
+    // ============================================================
+    //
+    // Limited content can exist, but should not necessarily be
+    // shown in every recommendation/feed surface.
+    //
+    // ============================================================
+
+    if (moderationStatus === "limited") {
+      await pool.query(
+        `
+        UPDATE videos
+        SET
+          moderation_status = 'limited',
+          moderation_reason = $1,
+          moderated_at = NOW()
+        WHERE id = $2
+        `,
+        [
+          moderationReason,
+          video.id,
+        ]
+      );
+
+      await writeModerationEvent({
+        db: pool,
+        contentType: "video",
+        contentId: video.id,
+        userId,
+        action: "limited",
+        reason:
+          moderationReason ||
+          "Video has limited distribution.",
+        metadata: moderationResult,
+      });
+
+      cache.del(`user-videos:${userId}`);
+
+      return res.status(201).json({
+        success: true,
+
+        video: {
+          id: video.id,
+          title: video.title,
+
+          status: "processing",
+          moderation_status: "limited",
+
+          created_at: video.created_at,
+        },
+
+        message:
+          "Video uploaded successfully with limited distribution.",
+      });
+    }
+
+    // ============================================================
+    // APPROVED
+    // ============================================================
+
+    await pool.query(
+      `
+      UPDATE videos
+      SET
+        moderation_status = 'approved',
+        moderation_reason = NULL,
+        moderated_at = NOW()
+      WHERE id = $1
+      `,
+      [video.id]
+    );
+
+    await writeModerationEvent({
+      db: pool,
+      contentType: "video",
+      contentId: video.id,
+      userId,
+      action: "approved",
+      reason: null,
+      metadata: {
+        source: "video_upload",
+        moderation: moderationResult,
       },
     });
+
+    // ============================================================
+    // CACHE INVALIDATION
+    // ============================================================
+
+    cache.del(`user-videos:${userId}`);
+
+    // ============================================================
+    // RESPONSE
+    // ============================================================
+
+    return res.status(201).json({
+      success: true,
+
+      video: {
+        id: video.id,
+        title: video.title,
+
+        status: "processing",
+        moderation_status: "approved",
+
+        created_at: video.created_at,
+      },
+
+      message:
+        "Video uploaded successfully.",
+    });
   } catch (err) {
-    console.error("[/api/uploadv] Error:", err);
-    res.status(500).json({ error: "Failed to save video. Please try again." });
+    console.error(
+      "[/api/uploadv] Error:",
+      err
+    );
+
+    return res.status(500).json({
+      error:
+        "Failed to save video. Please try again.",
+    });
   }
 });
 
@@ -5697,91 +6990,227 @@ app.options('/api/video-proxy', (req, res) => {
 });
 
 // 3. GET /api/videos/:id - Get single video details (Increment View)
-app.get('/api/videos/:id', async (req, res) => {
-  // ✅ GUARD: Convert to number and validate to prevent Postgres crashes
-  const id = Number(req.params.id);
-  
-  if (!Number.isInteger(id) || id <= 0) {
-    return res.status(400).json({ error: true, msg: "Invalid video ID" });
-  }
+// ============================================================
+// GET /api/videos/:id
+// ONLY SERVE MODERATION-APPROVED VIDEOS
+// ============================================================
 
-  try {
-    // Increment view count
-    await pool.query("UPDATE videos SET views = views + 1 WHERE id = $1", [id]);
+app.get(
+  "/api/videos/:id",
+  async (req, res) => {
 
-    const query = `
-      SELECT 
-        v.id, v.title, v.description, 
-        COALESCE(v.video_url, v.file_url) as video_url,
-        v.file_url,
-        v.thumbnail_url, 
-        v.duration, v.views, v.likes, v.dislikes, v.created_at,
-        v.processing_status, v.status,
-        v.auto_captions, v.custom_captions,
-        u.id as user_id, u.username, u.profile_url,
-        (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as subscriber_count
-      FROM videos v
-      JOIN users u ON v.user_id = u.id
-      WHERE v.id = $1;
-    `;
+    const id = Number(req.params.id);
 
-    const { rows } = await pool.query(query, [id]);
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: true, msg: "Video not found" });
+    if (
+      !Number.isInteger(id) ||
+      id <= 0
+    ) {
+      return res.status(400).json({
+        error: true,
+        msg: "Invalid video ID"
+      });
     }
 
-    const video = {
-      ...rows[0],
-      // ✅ src falls back to file_url if video_url is null
-      src: rows[0].video_url || rows[0].file_url,
-      thumbnail: rows[0].thumbnail_url,
-      channelName: rows[0].username,
-      channelAvatar: rows[0].profile_url,
-      channelSubscribers: parseInt(rows[0].subscriber_count),
-      subtitles: rows[0].auto_captions || rows[0].custom_captions || [],
-    };
+    try {
 
-    res.json({ video });
-  } catch (err) {
-    console.error("Get video error:", err);
-    res.status(500).json({ error: true, msg: "Server error" });
+      const query = `
+        SELECT
+          v.id,
+          v.title,
+          v.description,
+
+          COALESCE(
+            v.video_url,
+            v.file_url
+          ) AS video_url,
+
+          v.file_url,
+          v.thumbnail_url,
+          v.duration,
+          v.views,
+          v.likes,
+          v.dislikes,
+          v.created_at,
+
+          v.processing_status,
+          v.status,
+          v.moderation_status,
+
+          v.auto_captions,
+          v.custom_captions,
+
+          u.id AS user_id,
+          u.username,
+          u.profile_url,
+
+          (
+            SELECT COUNT(*)
+            FROM follows
+            WHERE following_id = u.id
+          ) AS subscriber_count
+
+        FROM videos v
+
+        JOIN users u
+          ON v.user_id = u.id
+
+        WHERE v.id = $1
+          AND v.processing_status = 'ready'
+          AND v.status NOT IN (
+            'removed',
+            'deleted'
+          )
+          AND v.moderation_status IN (
+            'approved',
+            'limited'
+          )
+          AND u.status NOT IN (
+            'banned',
+            'suspended'
+          );
+      `;
+
+      const { rows } =
+        await pool.query(
+          query,
+          [id]
+        );
+
+      if (!rows.length) {
+        return res.status(404).json({
+          error: true,
+          msg: "Video not found or unavailable"
+        });
+      }
+
+      // Increment view ONLY for available content.
+      await pool.query(
+        `
+        UPDATE videos
+        SET views = COALESCE(views, 0) + 1
+        WHERE id = $1
+        `,
+        [id]
+      );
+
+      const row = rows[0];
+
+      const video = {
+        ...row,
+
+        src:
+          row.video_url ||
+          row.file_url,
+
+        thumbnail:
+          row.thumbnail_url,
+
+        channelName:
+          row.username,
+
+        channelAvatar:
+          row.profile_url,
+
+        channelSubscribers:
+          Number(row.subscriber_count || 0),
+
+        subtitles:
+          row.auto_captions ||
+          row.custom_captions ||
+          []
+      };
+
+      return res.json({
+        success: true,
+        video
+      });
+
+    } catch (err) {
+
+      console.error(
+        "Get moderated video error:",
+        err
+      );
+
+      res.status(500).json({
+        error: true,
+        msg: "Server error"
+      });
+    }
   }
-});
+);
 
 // ==========================================
 // COMMENTS ROUTES
 // ==========================================
 
-// 4. GET /api/videos/:id/comments - Fetch comments
-app.get('/api/videos/:id/comments', async (req, res) => {
-  const { id } = req.params;
-  try {
-    const query = `
-      SELECT 
-        c.id, c.content, c.likes, c.created_at,
-        u.username, u.profile_url
-      FROM comments c
-      JOIN users u ON c.user_id = u.id
-      WHERE c.video_id = $1
-      ORDER BY c.created_at DESC;
-    `;
+// ============================================================
+// GET /api/videos/:id/comments
+// ONLY RETURN APPROVED COMMENTS
+// ============================================================
 
-    const { rows } = await pool.query(query, [id]);
+app.get(
+  "/api/videos/:id/comments",
+  async (req, res) => {
+    const videoId = Number(req.params.id);
 
-    const comments = rows.map(c => ({
-      ...c,
-      authorName: c.username,
-      authorAvatar: c.profile_url,
-      text: c.content,
-    }));
+    if (!Number.isInteger(videoId) || videoId <= 0) {
+      return res.status(400).json({
+        error: true,
+        msg: "Invalid video ID"
+      });
+    }
 
-    res.json({ comments });
-  } catch (err) {
-    console.error("Get comments error:", err);
-    res.status(500).json({ error: true, msg: "Server error" });
+    try {
+      const query = `
+        SELECT
+          c.id,
+          c.content,
+          c.likes,
+          c.created_at,
+          c.user_id,
+          u.username,
+          u.profile_url
+        FROM comments c
+        JOIN users u
+          ON c.user_id = u.id
+        WHERE c.video_id = $1
+          AND c.moderation_status = 'approved'
+          AND u.status NOT IN ('banned', 'suspended')
+        ORDER BY c.created_at DESC
+        LIMIT 200;
+      `;
+
+      const { rows } = await pool.query(
+        query,
+        [videoId]
+      );
+
+      const comments = rows.map(c => ({
+        ...c,
+        authorName: c.username,
+        authorAvatar: c.profile_url,
+        text: c.content
+      }));
+
+      res.json({
+        success: true,
+        comments
+      });
+
+    } catch (err) {
+      console.error(
+        "Get moderated comments error:",
+        err
+      );
+
+      res.status(500).json({
+        error: true,
+        msg: "Server error"
+      });
+    }
   }
-});
+);
 
 app.get("/api/users/:username", async (req, res) => {
   try {
@@ -6923,40 +8352,252 @@ app.get("/api/wallet/purchases", async (req, res) => {
 });
 
 // 5. POST /api/videos/:id/comments - Post a comment
-app.post('/api/videos/:id/comments', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const { content } = req.body;
-  const userId = req.userId;
+// ============================================================
+// POST /api/videos/:id/comments
+// CREATE + MODERATE COMMENT
+// ============================================================
 
-  if (!content || !content.trim()) {
-    return res.status(400).json({ error: true, msg: "Comment cannot be empty" });
+app.post(
+  "/api/videos/:id/comments",
+  authenticateToken,
+  async (req, res) => {
+
+    const videoId = Number(req.params.id);
+    const userId = Number(req.userId);
+
+    const content =
+      typeof req.body.content === "string"
+        ? req.body.content.trim()
+        : "";
+
+    if (
+      !Number.isInteger(videoId) ||
+      videoId <= 0
+    ) {
+      return res.status(400).json({
+        error: true,
+        msg: "Invalid video ID"
+      });
+    }
+
+    if (!content) {
+      return res.status(400).json({
+        error: true,
+        msg: "Comment cannot be empty"
+      });
+    }
+
+    if (content.length > 5000) {
+      return res.status(400).json({
+        error: true,
+        msg: "Comment is too long"
+      });
+    }
+
+    try {
+
+      // --------------------------------------------------------
+      // USER CHECK
+      // --------------------------------------------------------
+
+      const userResult = await pool.query(
+        `
+        SELECT
+          id,
+          username,
+          profile_url,
+          status
+        FROM users
+        WHERE id = $1
+        `,
+        [userId]
+      );
+
+      if (!userResult.rows.length) {
+        return res.status(401).json({
+          error: true,
+          msg: "User not found"
+        });
+      }
+
+      const user = userResult.rows[0];
+
+      if (
+        user.status === "banned" ||
+        user.status === "suspended"
+      ) {
+        return res.status(403).json({
+          error: true,
+          msg: "Your account cannot post comments"
+        });
+      }
+
+      // --------------------------------------------------------
+      // VIDEO CHECK
+      // --------------------------------------------------------
+
+      const videoResult = await pool.query(
+        `
+        SELECT
+          id,
+          user_id,
+          status,
+          processing_status,
+          moderation_status
+        FROM videos
+        WHERE id = $1
+        `,
+        [videoId]
+      );
+
+      if (!videoResult.rows.length) {
+        return res.status(404).json({
+          error: true,
+          msg: "Video not found"
+        });
+      }
+
+      const video = videoResult.rows[0];
+
+      if (
+        video.status === "removed" ||
+        video.moderation_status === "rejected" ||
+        video.moderation_status === "removed"
+      ) {
+        return res.status(404).json({
+          error: true,
+          msg: "Video is unavailable"
+        });
+      }
+
+      // --------------------------------------------------------
+      // INSERT AS PENDING
+      // --------------------------------------------------------
+
+      const insertResult = await pool.query(
+        `
+        INSERT INTO comments (
+          video_id,
+          user_id,
+          content,
+          moderation_status,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          'pending',
+          NOW()
+        )
+        RETURNING *;
+        `,
+        [
+          videoId,
+          userId,
+          content
+        ]
+      );
+
+      const comment =
+        insertResult.rows[0];
+
+      // --------------------------------------------------------
+      // MODERATION
+      // --------------------------------------------------------
+
+      const moderation =
+        await moderateContent({
+          userId,
+          contentType: "comment",
+          contentId: comment.id,
+          text: content
+        });
+
+      // --------------------------------------------------------
+      // REJECTED
+      // --------------------------------------------------------
+
+      if (
+        moderation.status === "rejected"
+      ) {
+
+        return res.status(400).json({
+          success: false,
+          moderationStatus: "rejected",
+          error:
+            "Your comment violates our Community Guidelines."
+        });
+      }
+
+      // --------------------------------------------------------
+      // HUMAN REVIEW
+      // --------------------------------------------------------
+
+      if (
+        moderation.status === "review"
+      ) {
+
+        return res.status(202).json({
+          success: true,
+          moderationStatus: "review",
+          message:
+            "Your comment was submitted for review."
+        });
+      }
+
+      // --------------------------------------------------------
+      // LIMITED
+      // --------------------------------------------------------
+
+      if (
+        moderation.status === "limited"
+      ) {
+
+        return res.status(201).json({
+          success: true,
+          moderationStatus: "limited",
+          comment: {
+            ...comment,
+            username: user.username,
+            profile_url: user.profile_url
+          }
+        });
+      }
+
+      // --------------------------------------------------------
+      // APPROVED
+      // --------------------------------------------------------
+
+      const newComment = {
+        ...comment,
+        username: user.username,
+        profile_url: user.profile_url,
+        authorName: user.username,
+        authorAvatar: user.profile_url,
+        text: comment.content
+      };
+
+      return res.status(201).json({
+        success: true,
+        moderationStatus: "approved",
+        comment: newComment
+      });
+
+    } catch (err) {
+
+      console.error(
+        "Post moderated comment error:",
+        err
+      );
+
+      res.status(500).json({
+        error: true,
+        msg: "Failed to post comment"
+      });
+    }
   }
-
-  try {
-    const query = `
-      INSERT INTO comments (video_id, user_id, content, created_at)
-      VALUES ($1, $2, $3, NOW())
-      RETURNING *;
-    `;
-
-    const { rows } = await pool.query(query, [id, userId, content.trim()]);
-    
-    // Fetch user details again to return full comment object
-    const userQuery = "SELECT username, profile_url FROM users WHERE id = $1";
-    const { rows: userRows } = await pool.query(userQuery, [userId]);
-
-    const newComment = {
-      ...rows[0],
-      username: userRows[0].username,
-      profile_url: userRows[0].profile_url,
-    };
-
-    res.json({ comment: newComment });
-  } catch (err) {
-    console.error("Post comment error:", err);
-    res.status(500).json({ error: true, msg: "Failed to post comment" });
-  }
-});
+);
 
 // ==========================================
 // REACTIONS (LIKE / DISLIKE) ROUTES
@@ -14114,84 +15755,1491 @@ app.delete(
 );
 
 
-// ------------------------------------------------------------
+// ============================================================
 // POST /api/videos/:id/report
-// Report a video
-// ------------------------------------------------------------
+// REPORT VIDEO
+// ============================================================
+
 app.post(
-  '/api/videos/:id/report',
-  authMiddleware,
+  "/api/videos/:id/report",
+  authenticateToken,
   async (req, res) => {
-    try {
-      const videoId = req.params.id;
-      const userId = req.user.id;
 
-      const {
-        reason,
-        details = ''
-      } = req.body;
+    const videoId =
+      Number(req.params.id);
 
-      const validReasons = [
-        'Spam',
-        'Harassment',
-        'Hateful content',
-        'Violence',
-        'Sexual content',
-        'Dangerous content',
-        'Misinformation',
-        'Scam or fraud',
-        'Copyright',
-        'Other'
-      ];
+    const reporterId =
+      Number(req.userId);
 
-      if (!reason) {
-        return res.status(400).json({
-          success: false,
-          message: 'Report reason is required'
-        });
-      }
+    const {
+      reason,
+      details = ""
+    } = req.body;
 
-      if (!validReasons.includes(reason)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid report reason'
-        });
-      }
+    const validReasons = [
+      "Spam",
+      "Harassment",
+      "Hateful content",
+      "Violence",
+      "Sexual content",
+      "Dangerous content",
+      "Misinformation",
+      "Scam or fraud",
+      "Copyright",
+      "Child safety",
+      "Self-harm",
+      "Other"
+    ];
 
-      // Prevent duplicate reports
-      const existing = await VideoReport.findOne({
-        video_id: videoId,
-        reporter_id: userId
+    if (
+      !Number.isInteger(videoId) ||
+      videoId <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid video ID"
       });
+    }
 
-      if (existing) {
+    if (
+      !validReasons.includes(reason)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid report reason"
+      });
+    }
+
+    if (
+      String(details).length > 5000
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Report details are too long"
+      });
+    }
+
+    try {
+
+      // --------------------------------------------------------
+      // CHECK VIDEO
+      // --------------------------------------------------------
+
+      const videoResult =
+        await pool.query(
+          `
+          SELECT
+            id,
+            user_id,
+            moderation_status
+          FROM videos
+          WHERE id = $1
+          `,
+          [videoId]
+        );
+
+      if (!videoResult.rows.length) {
+        return res.status(404).json({
+          success: false,
+          message: "Video not found"
+        });
+      }
+
+      const video =
+        videoResult.rows[0];
+
+      // --------------------------------------------------------
+      // DON'T REPORT YOUR OWN VIDEO
+      // --------------------------------------------------------
+
+      if (
+        Number(video.user_id) ===
+        reporterId
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "You cannot report your own video"
+        });
+      }
+
+      // --------------------------------------------------------
+      // FIND / CREATE MODERATION CASE
+      // --------------------------------------------------------
+
+      let caseId;
+
+      const existingCase =
+        await pool.query(
+          `
+          SELECT id
+          FROM moderation_cases
+          WHERE content_type = 'video'
+            AND content_id = $1
+            AND status IN (
+              'open',
+              'reviewing'
+            )
+          LIMIT 1
+          `,
+          [videoId]
+        );
+
+      if (
+        existingCase.rows.length
+      ) {
+        caseId =
+          existingCase.rows[0].id;
+
+      } else {
+
+        caseId =
+          await createModerationCase({
+            userId: video.user_id,
+            contentType: "video",
+            contentId: videoId,
+            category: reason,
+            reason:
+              details || reason,
+            priority: 60
+          });
+      }
+
+      // --------------------------------------------------------
+      // INSERT REPORT
+      // --------------------------------------------------------
+
+      const reportResult =
+        await pool.query(
+          `
+          INSERT INTO content_reports (
+            reporter_id,
+            content_type,
+            content_id,
+            reason,
+            details,
+            status,
+            case_id
+          )
+          VALUES (
+            $1,
+            'video',
+            $2,
+            $3,
+            $4,
+            'pending',
+            $5
+          )
+          ON CONFLICT DO NOTHING
+          RETURNING id
+          `,
+          [
+            reporterId,
+            videoId,
+            reason,
+            details || null,
+            caseId
+          ]
+        );
+
+      if (!reportResult.rows.length) {
         return res.status(409).json({
           success: false,
-          message: 'You have already reported this video'
+          message:
+            "You have already submitted this report"
         });
       }
 
-      await VideoReport.create({
-        video_id: videoId,
-        reporter_id: userId,
-        reason,
-        details,
-        status: 'pending',
-        created_at: new Date()
+      // --------------------------------------------------------
+      // COUNT REPORTS
+      // --------------------------------------------------------
+
+      const countResult =
+        await pool.query(
+          `
+          SELECT COUNT(*)::integer AS count
+          FROM content_reports
+          WHERE content_type = 'video'
+            AND content_id = $1
+            AND status IN (
+              'pending',
+              'reviewing'
+            )
+          `,
+          [videoId]
+        );
+
+      const reportCount =
+        Number(
+          countResult.rows[0]?.count || 0
+        );
+
+      let priority = 60;
+
+      if (reportCount >= 10) {
+        priority = 100;
+      } else if (reportCount >= 5) {
+        priority = 85;
+      } else if (reportCount >= 3) {
+        priority = 75;
+      }
+
+      await pool.query(
+        `
+        UPDATE moderation_cases
+        SET
+          priority = $1,
+          updated_at = NOW()
+        WHERE id = $2
+        `,
+        [
+          priority,
+          caseId
+        ]
+      );
+
+      // --------------------------------------------------------
+      // AUDIT
+      // --------------------------------------------------------
+
+      await writeModerationEvent({
+        userId: video.user_id,
+        contentType: "video",
+        contentId: videoId,
+        action: "reported",
+        category: reason,
+        severity:
+          reason === "Child safety"
+            ? "critical"
+            : "medium",
+        reason:
+          details || reason,
+        source: "user_report",
+        metadata: {
+          reporterId,
+          reportCount
+        }
       });
 
-      res.json({
+      return res.status(201).json({
         success: true,
-        message: 'Report submitted'
+        message: "Report submitted",
+        caseId
       });
 
-    } catch (error) {
-      console.error('Report video error:', error);
+    } catch (err) {
+
+      console.error(
+        "Report video error:",
+        err
+      );
 
       res.status(500).json({
         success: false,
-        message: 'Failed to report video'
+        message:
+          "Failed to report video"
       });
+    }
+  }
+);
+
+// ============================================================
+// POST /api/moderation/report
+// UNIVERSAL CONTENT REPORT
+// ============================================================
+
+app.post(
+  "/api/moderation/report",
+  authenticateToken,
+  async (req, res) => {
+
+    const reporterId =
+      Number(req.userId);
+
+    const {
+      contentType,
+      contentId,
+      reason,
+      details = ""
+    } = req.body;
+
+    const allowedTypes = [
+      "video",
+      "comment",
+      "story",
+      "music",
+      "profile",
+      "live",
+      "message"
+    ];
+
+    if (
+      !allowedTypes.includes(contentType)
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid content type"
+      });
+    }
+
+    if (
+      !contentId ||
+      !Number.isInteger(
+        Number(contentId)
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid content ID"
+      });
+    }
+
+    if (
+      !reason ||
+      !String(reason).trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Report reason is required"
+      });
+    }
+
+    try {
+
+      const numericContentId =
+        Number(contentId);
+
+      // --------------------------------------------------------
+      // FIND EXISTING CASE
+      // --------------------------------------------------------
+
+      let caseId = null;
+
+      const existingCase =
+        await pool.query(
+          `
+          SELECT id
+          FROM moderation_cases
+          WHERE content_type = $1
+            AND content_id = $2
+            AND status IN (
+              'open',
+              'reviewing'
+            )
+          LIMIT 1
+          `,
+          [
+            contentType,
+            numericContentId
+          ]
+        );
+
+      if (
+        existingCase.rows.length
+      ) {
+        caseId =
+          existingCase.rows[0].id;
+      } else {
+
+        caseId =
+          await createModerationCase({
+            userId: null,
+            contentType,
+            contentId:
+              numericContentId,
+            category: reason,
+            reason:
+              details || reason,
+            priority: 60
+          });
+      }
+
+      // --------------------------------------------------------
+      // INSERT REPORT
+      // --------------------------------------------------------
+
+      const report =
+        await pool.query(
+          `
+          INSERT INTO content_reports (
+            reporter_id,
+            content_type,
+            content_id,
+            reason,
+            details,
+            status,
+            case_id
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            'pending',
+            $6
+          )
+          ON CONFLICT DO NOTHING
+          RETURNING id
+          `,
+          [
+            reporterId,
+            contentType,
+            numericContentId,
+            String(reason).trim(),
+            String(details).trim() || null,
+            caseId
+          ]
+        );
+
+      if (!report.rows.length) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "You have already submitted this report"
+        });
+      }
+
+      // --------------------------------------------------------
+      // COUNT REPORTS
+      // --------------------------------------------------------
+
+      const count =
+        await pool.query(
+          `
+          SELECT COUNT(*)::integer AS count
+          FROM content_reports
+          WHERE content_type = $1
+            AND content_id = $2
+            AND status IN (
+              'pending',
+              'reviewing'
+            )
+          `,
+          [
+            contentType,
+            numericContentId
+          ]
+        );
+
+      const reportCount =
+        Number(
+          count.rows[0]?.count || 0
+        );
+
+      const priority =
+        reportCount >= 10
+          ? 100
+          : reportCount >= 5
+            ? 85
+            : reportCount >= 3
+              ? 75
+              : 60;
+
+      await pool.query(
+        `
+        UPDATE moderation_cases
+        SET
+          priority = $1,
+          updated_at = NOW()
+        WHERE id = $2
+        `,
+        [
+          priority,
+          caseId
+        ]
+      );
+
+      await writeModerationEvent({
+        userId: null,
+        contentType,
+        contentId:
+          numericContentId,
+        action: "reported",
+        category: reason,
+        severity:
+          String(reason)
+            .toLowerCase()
+            .includes("child")
+            ? "critical"
+            : "medium",
+        reason:
+          details || reason,
+        source: "user_report",
+        metadata: {
+          reporterId,
+          reportCount
+        }
+      });
+
+      return res.status(201).json({
+        success: true,
+        message: "Report submitted",
+        caseId
+      });
+
+    } catch (err) {
+
+      console.error(
+        "Universal moderation report error:",
+        err
+      );
+
+      res.status(500).json({
+        success: false,
+        error:
+          "Failed to submit report"
+      });
+    }
+  }
+);
+
+// ============================================================
+// GET /api/admin/moderation/queue
+// ============================================================
+
+app.get(
+  "/api/admin/moderation/queue",
+  authenticateToken,
+  async (req, res) => {
+
+    try {
+
+      const moderatorId =
+        Number(req.userId);
+
+      const userResult =
+        await pool.query(
+          `
+          SELECT role, status
+          FROM users
+          WHERE id = $1
+          `,
+          [moderatorId]
+        );
+
+      if (!userResult.rows.length) {
+        return res.status(401).json({
+          error: "User not found"
+        });
+      }
+
+      const user =
+        userResult.rows[0];
+
+      if (
+        !["admin", "moderator"].includes(
+          user.role
+        )
+      ) {
+        return res.status(403).json({
+          error:
+            "Moderator access required"
+        });
+      }
+
+      const limit =
+        Math.min(
+          Math.max(
+            Number(req.query.limit) || 50,
+            1
+          ),
+          100
+        );
+
+      const { rows } =
+        await pool.query(
+          `
+          SELECT
+
+            mc.id,
+            mc.content_type,
+            mc.content_id,
+            mc.user_id,
+
+            mc.status,
+            mc.priority,
+            mc.category,
+            mc.reason,
+
+            mc.assigned_to,
+            mc.created_at,
+            mc.updated_at,
+
+            u.username,
+            u.profile_url,
+
+            (
+              SELECT COUNT(*)
+              FROM content_reports cr
+              WHERE cr.case_id = mc.id
+            ) AS report_count
+
+          FROM moderation_cases mc
+
+          LEFT JOIN users u
+            ON u.id = mc.user_id
+
+          WHERE mc.status IN (
+            'open',
+            'reviewing'
+          )
+
+          ORDER BY
+            mc.priority DESC,
+            mc.created_at ASC
+
+          LIMIT $1
+          `,
+          [limit]
+        );
+
+      return res.json({
+        success: true,
+        cases: rows
+      });
+
+    } catch (err) {
+
+      console.error(
+        "Moderation queue error:",
+        err
+      );
+
+      res.status(500).json({
+        error:
+          "Failed to load moderation queue"
+      });
+    }
+  }
+);
+
+// ============================================================
+// GET /api/admin/moderation/cases/:caseId
+// ============================================================
+
+app.get(
+  "/api/admin/moderation/cases/:caseId",
+  authenticateToken,
+  async (req, res) => {
+
+    try {
+
+      const moderatorId =
+        Number(req.userId);
+
+      const caseId =
+        Number(req.params.caseId);
+
+      const roleResult =
+        await pool.query(
+          `
+          SELECT role
+          FROM users
+          WHERE id = $1
+          `,
+          [moderatorId]
+        );
+
+      if (
+        !["admin", "moderator"].includes(
+          roleResult.rows[0]?.role
+        )
+      ) {
+        return res.status(403).json({
+          error:
+            "Moderator access required"
+        });
+      }
+
+      const caseResult =
+        await pool.query(
+          `
+          SELECT
+            mc.*,
+            u.username,
+            u.profile_url
+          FROM moderation_cases mc
+          LEFT JOIN users u
+            ON u.id = mc.user_id
+          WHERE mc.id = $1
+          `,
+          [caseId]
+        );
+
+      if (!caseResult.rows.length) {
+        return res.status(404).json({
+          error:
+            "Moderation case not found"
+        });
+      }
+
+      const reportsResult =
+        await pool.query(
+          `
+          SELECT
+            cr.id,
+            cr.reporter_id,
+            cr.reason,
+            cr.details,
+            cr.status,
+            cr.created_at,
+
+            u.username AS reporter_username
+
+          FROM content_reports cr
+
+          LEFT JOIN users u
+            ON u.id = cr.reporter_id
+
+          WHERE cr.case_id = $1
+
+          ORDER BY cr.created_at ASC
+          `,
+          [caseId]
+        );
+
+      const eventsResult =
+        await pool.query(
+          `
+          SELECT
+            me.*,
+            u.username AS moderator_username
+          FROM moderation_events me
+
+          LEFT JOIN users u
+            ON u.id = me.moderator_id
+
+          WHERE me.content_type =
+            (
+              SELECT content_type
+              FROM moderation_cases
+              WHERE id = $1
+            )
+
+          AND me.content_id =
+            (
+              SELECT content_id
+              FROM moderation_cases
+              WHERE id = $1
+            )
+
+          ORDER BY me.created_at DESC
+          `,
+          [caseId]
+        );
+
+      return res.json({
+        success: true,
+        case: caseResult.rows[0],
+        reports: reportsResult.rows,
+        events: eventsResult.rows
+      });
+
+    } catch (err) {
+
+      console.error(
+        "Get moderation case error:",
+        err
+      );
+
+      res.status(500).json({
+        error:
+          "Failed to load moderation case"
+      });
+    }
+  }
+);
+
+// ============================================================
+// POST /api/admin/moderation/cases/:caseId/action
+// ============================================================
+
+app.post(
+  "/api/admin/moderation/cases/:caseId/action",
+  authenticateToken,
+  async (req, res) => {
+
+    const client =
+      await pool.connect();
+
+    try {
+
+      const moderatorId =
+        Number(req.userId);
+
+      const caseId =
+        Number(req.params.caseId);
+
+      const {
+        action,
+        reason = ""
+      } = req.body;
+
+      const allowedActions = [
+        "approve",
+        "remove",
+        "reject",
+        "restore",
+        "dismiss"
+      ];
+
+      if (
+        !allowedActions.includes(action)
+      ) {
+        return res.status(400).json({
+          error:
+            "Invalid moderation action"
+        });
+      }
+
+      // --------------------------------------------------------
+      // CHECK MODERATOR
+      // --------------------------------------------------------
+
+      const roleResult =
+        await client.query(
+          `
+          SELECT role
+          FROM users
+          WHERE id = $1
+          `,
+          [moderatorId]
+        );
+
+      if (
+        !["admin", "moderator"].includes(
+          roleResult.rows[0]?.role
+        )
+      ) {
+        return res.status(403).json({
+          error:
+            "Moderator access required"
+        });
+      }
+
+      // --------------------------------------------------------
+      // GET CASE
+      // --------------------------------------------------------
+
+      const caseResult =
+        await client.query(
+          `
+          SELECT *
+          FROM moderation_cases
+          WHERE id = $1
+          FOR UPDATE
+          `,
+          [caseId]
+        );
+
+      if (!caseResult.rows.length) {
+        return res.status(404).json({
+          error:
+            "Moderation case not found"
+        });
+      }
+
+      const moderationCase =
+        caseResult.rows[0];
+
+      await client.query("BEGIN");
+
+      // --------------------------------------------------------
+      // DETERMINE CONTENT TABLE
+      // --------------------------------------------------------
+
+      const tableMap = {
+        video: "videos",
+        comment: "comments",
+        music: "music"
+      };
+
+      const table =
+        tableMap[
+          moderationCase.content_type
+        ];
+
+      // --------------------------------------------------------
+      // CONTENT ACTION
+      // --------------------------------------------------------
+
+      if (table) {
+
+        let status = null;
+
+        if (
+          action === "approve" ||
+          action === "restore"
+        ) {
+          status = "approved";
+        }
+
+        if (
+          action === "remove" ||
+          action === "reject"
+        ) {
+          status = "removed";
+        }
+
+        if (status) {
+
+          await client.query(
+            `
+            UPDATE ${table}
+            SET
+              moderation_status = $1,
+              moderation_reason = $2,
+              moderated_at = NOW()
+            WHERE id = $3
+            `,
+            [
+              status,
+              reason ||
+                `Moderator action: ${action}`,
+              moderationCase.content_id
+            ]
+          );
+        }
+      }
+
+      // --------------------------------------------------------
+      // CASE
+      // --------------------------------------------------------
+
+      await client.query(
+        `
+        UPDATE moderation_cases
+        SET
+          status = $1,
+          resolved_by = $2,
+          resolution = $3,
+          resolved_at = NOW(),
+          updated_at = NOW()
+        WHERE id = $4
+        `,
+        [
+          action === "dismiss"
+            ? "dismissed"
+            : "resolved",
+
+          moderatorId,
+
+          reason ||
+            `Moderator action: ${action}`,
+
+          caseId
+        ]
+      );
+
+      // --------------------------------------------------------
+      // UPDATE REPORTS
+      // --------------------------------------------------------
+
+      await client.query(
+        `
+        UPDATE content_reports
+        SET
+          status = $1,
+          reviewed_by = $2,
+          resolution = $3,
+          reviewed_at = NOW()
+        WHERE case_id = $4
+          AND status IN (
+            'pending',
+            'reviewing'
+          )
+        `,
+        [
+          action === "dismiss"
+            ? "dismissed"
+            : "resolved",
+
+          moderatorId,
+
+          reason ||
+            `Moderator action: ${action}`,
+
+          caseId
+        ]
+      );
+
+      // --------------------------------------------------------
+      // AUDIT
+      // --------------------------------------------------------
+
+      await writeModerationEvent({
+        userId:
+          moderationCase.user_id,
+
+        contentType:
+          moderationCase.content_type,
+
+        contentId:
+          moderationCase.content_id,
+
+        action,
+
+        category:
+          moderationCase.category,
+
+        severity:
+          action === "remove"
+            ? "high"
+            : "low",
+
+        reason:
+          reason ||
+          `Moderator action: ${action}`,
+
+        source: "moderator",
+
+        moderatorId,
+
+        db: client
+      });
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        action,
+        caseStatus:
+          action === "dismiss"
+            ? "dismissed"
+            : "resolved"
+      });
+
+    } catch (err) {
+
+      await client
+        .query("ROLLBACK")
+        .catch(() => {});
+
+      console.error(
+        "Moderator action error:",
+        err
+      );
+
+      res.status(500).json({
+        error:
+          "Failed to apply moderation action"
+      });
+
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// ============================================================
+// POST /api/moderation/appeal
+// ============================================================
+
+app.post(
+  "/api/moderation/appeal",
+  authenticateToken,
+  async (req, res) => {
+
+    try {
+
+      const userId =
+        Number(req.userId);
+
+      const {
+        contentType,
+        contentId,
+        moderationEventId,
+        reason
+      } = req.body;
+
+      if (
+        !contentType ||
+        !contentId ||
+        !reason ||
+        !String(reason).trim()
+      ) {
+        return res.status(400).json({
+          error:
+            "Content and appeal reason are required"
+        });
+      }
+
+      if (
+        String(reason).length > 5000
+      ) {
+        return res.status(400).json({
+          error:
+            "Appeal reason is too long"
+        });
+      }
+
+      // --------------------------------------------------------
+      // EXISTING APPEAL
+      // --------------------------------------------------------
+
+      const existing =
+        await pool.query(
+          `
+          SELECT id
+          FROM moderation_appeals
+          WHERE user_id = $1
+            AND content_type = $2
+            AND content_id = $3
+            AND status IN (
+              'pending',
+              'reviewing'
+            )
+          LIMIT 1
+          `,
+          [
+            userId,
+            contentType,
+            Number(contentId)
+          ]
+        );
+
+      if (existing.rows.length) {
+        return res.status(409).json({
+          error:
+            "An appeal is already pending"
+        });
+      }
+
+      // --------------------------------------------------------
+      // CREATE APPEAL
+      // --------------------------------------------------------
+
+      const { rows } =
+        await pool.query(
+          `
+          INSERT INTO moderation_appeals (
+            user_id,
+            content_type,
+            content_id,
+            moderation_event_id,
+            reason,
+            status
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            'pending'
+          )
+          RETURNING
+            id,
+            status,
+            created_at
+          `,
+          [
+            userId,
+            contentType,
+            Number(contentId),
+            moderationEventId || null,
+            String(reason).trim()
+          ]
+        );
+
+      return res.status(201).json({
+        success: true,
+        appeal: rows[0]
+      });
+
+    } catch (err) {
+
+      console.error(
+        "Moderation appeal error:",
+        err
+      );
+
+      res.status(500).json({
+        error:
+          "Failed to submit appeal"
+      });
+    }
+  }
+);
+
+// ============================================================
+// GET /api/admin/moderation/appeals
+// ============================================================
+
+app.get(
+  "/api/admin/moderation/appeals",
+  authenticateToken,
+  async (req, res) => {
+
+    try {
+
+      const roleResult =
+        await pool.query(
+          `
+          SELECT role
+          FROM users
+          WHERE id = $1
+          `,
+          [req.userId]
+        );
+
+      if (
+        !["admin", "moderator"].includes(
+          roleResult.rows[0]?.role
+        )
+      ) {
+        return res.status(403).json({
+          error:
+            "Moderator access required"
+        });
+      }
+
+      const { rows } =
+        await pool.query(
+          `
+          SELECT
+            ma.*,
+
+            u.username,
+            u.profile_url
+
+          FROM moderation_appeals ma
+
+          JOIN users u
+            ON u.id = ma.user_id
+
+          WHERE ma.status IN (
+            'pending',
+            'reviewing'
+          )
+
+          ORDER BY ma.created_at ASC
+
+          LIMIT 100
+          `
+        );
+
+      return res.json({
+        success: true,
+        appeals: rows
+      });
+
+    } catch (err) {
+
+      console.error(
+        "Appeals queue error:",
+        err
+      );
+
+      res.status(500).json({
+        error:
+          "Failed to load appeals"
+      });
+    }
+  }
+);
+
+// ============================================================
+// POST /api/admin/moderation/appeals/:appealId/decision
+// ============================================================
+
+app.post(
+  "/api/admin/moderation/appeals/:appealId/decision",
+  authenticateToken,
+  async (req, res) => {
+
+    const client =
+      await pool.connect();
+
+    try {
+
+      const moderatorId =
+        Number(req.userId);
+
+      const appealId =
+        Number(req.params.appealId);
+
+      const {
+        decision,
+        reason = ""
+      } = req.body;
+
+      if (
+        !["approved", "rejected"]
+          .includes(decision)
+      ) {
+        return res.status(400).json({
+          error:
+            "Decision must be approved or rejected"
+        });
+      }
+
+      const roleResult =
+        await client.query(
+          `
+          SELECT role
+          FROM users
+          WHERE id = $1
+          `,
+          [moderatorId]
+        );
+
+      if (
+        !["admin", "moderator"].includes(
+          roleResult.rows[0]?.role
+        )
+      ) {
+        return res.status(403).json({
+          error:
+            "Moderator access required"
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const appealResult =
+        await client.query(
+          `
+          SELECT *
+          FROM moderation_appeals
+          WHERE id = $1
+          FOR UPDATE
+          `,
+          [appealId]
+        );
+
+      if (!appealResult.rows.length) {
+
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+          error:
+            "Appeal not found"
+        });
+      }
+
+      const appeal =
+        appealResult.rows[0];
+
+      if (
+        !["pending", "reviewing"]
+          .includes(appeal.status)
+      ) {
+
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          error:
+            "Appeal has already been decided"
+        });
+      }
+
+      // --------------------------------------------------------
+      // APPROVED APPEAL = RESTORE CONTENT
+      // --------------------------------------------------------
+
+      if (decision === "approved") {
+
+        const tableMap = {
+          video: "videos",
+          comment: "comments",
+          music: "music"
+        };
+
+        const table =
+          tableMap[
+            appeal.content_type
+          ];
+
+        if (table) {
+
+          await client.query(
+            `
+            UPDATE ${table}
+            SET
+              moderation_status = 'approved',
+              moderation_reason = $1,
+              moderated_at = NOW()
+            WHERE id = $2
+            `,
+            [
+              reason ||
+                "Content restored after successful appeal",
+              appeal.content_id
+            ]
+          );
+        }
+      }
+
+      // --------------------------------------------------------
+      // UPDATE APPEAL
+      // --------------------------------------------------------
+
+      await client.query(
+        `
+        UPDATE moderation_appeals
+        SET
+          status = $1,
+          reviewed_by = $2,
+          decision = $3,
+          reviewed_at = NOW()
+        WHERE id = $4
+        `,
+        [
+          decision,
+          moderatorId,
+          reason ||
+            `Appeal ${decision}`,
+          appealId
+        ]
+      );
+
+      // --------------------------------------------------------
+      // AUDIT
+      // --------------------------------------------------------
+
+      await writeModerationEvent({
+        userId: appeal.user_id,
+        contentType:
+          appeal.content_type,
+        contentId:
+          appeal.content_id,
+        action:
+          `appeal_${decision}`,
+        reason:
+          reason ||
+          `Appeal ${decision}`,
+        source: "appeal",
+        moderatorId,
+        db: client
+      });
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        decision
+      });
+
+    } catch (err) {
+
+      await client
+        .query("ROLLBACK")
+        .catch(() => {});
+
+      console.error(
+        "Appeal decision error:",
+        err
+      );
+
+      res.status(500).json({
+        error:
+          "Failed to process appeal"
+      });
+
+    } finally {
+      client.release();
     }
   }
 );
