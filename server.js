@@ -3363,19 +3363,6 @@ const storage = multer.diskStorage({
   },
 });
 
-export const upload = multer({ 
-  storage, 
-  limits: { fileSize: 500 * 1024 * 1024 }, 
-  fileFilter: (req, file, cb) => { 
-    const allowed = [
-      'image/jpeg', 'image/png', 'image/gif', 'image/webp', 
-      'video/mp4', 'video/webm', 'video/ogg', 'video/quicktime',
-      'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/webm', 'audio/mp4'
-    ]; 
-    cb(null, allowed.includes(file.mimetype)); 
-  } 
-});
-
 async function ensureCreatorStats(userId) { 
   try { 
     await pool.query(`INSERT INTO creator_stats (user_id, total_likes, total_follows, total_views, total_tips, total_merch_sales, earnings, updated_at) VALUES ($1,0,0,0,0,0,0,NOW()) ON CONFLICT (user_id) DO NOTHING`, [userId]); 
