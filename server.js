@@ -3470,109 +3470,6 @@ if (GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET) {
   }));
 }
 
-const authenticateToken = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({
-        error: "No token provided"
-      });
-    }
-
-    const token = authHeader.split(" ")[1];
-
-    if (!token) {
-      return res.status(401).json({
-        error: "No token provided"
-      });
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-
-    const userId =
-      decoded.id ||
-      decoded.userId ||
-      decoded.sub;
-
-    if (!userId) {
-      return res.status(401).json({
-        error: "Invalid token payload"
-      });
-    }
-
-    const { rows } = await pool.query(
-      `SELECT * FROM users WHERE id = $1`,
-      [userId]
-    );
-
-    if (!rows.length) {
-      return res.status(404).json({
-        error: "User not found"
-      });
-    }
-
-    const user = rows[0];
-
-    if (user.status === "suspended") {
-      if (
-        user.suspend_until &&
-        new Date(user.suspend_until) > new Date()
-      ) {
-        return res.status(403).json({
-          error: "Account suspended",
-          reason: "Your account is temporarily suspended",
-          until: user.suspend_until
-        });
-      }
-
-      if (!user.suspend_until) {
-        return res.status(403).json({
-          error: "Account permanently suspended",
-          reason: "Your account has been permanently suspended"
-        });
-      }
-
-      await pool.query(
-        `
-        UPDATE users
-        SET status = 'active',
-            suspend_until = NULL
-        WHERE id = $1
-        `,
-        [userId]
-      );
-
-      user.status = "active";
-      user.suspend_until = null;
-    }
-
-    req.user = user;
-    req.userId = user.id;
-
-    next();
-
-  } catch (err) {
-    if (err.name === "JsonWebTokenError") {
-      return res.status(401).json({
-        error: "Invalid token"
-      });
-    }
-
-    if (err.name === "TokenExpiredError") {
-      return res.status(401).json({
-        error: "Token expired"
-      });
-    }
-
-    console.error("[AUTH] Unexpected error:", err);
-
-    return res.status(500).json({
-      error: "Authentication failed"
-    });
-  }
-};
-
 // ==========================================
 // API ROUTES (All existing routes remain the same)
 // ==========================================
@@ -5867,6 +5764,109 @@ app.post("/api/uploads", authenticateToken,async (req, res) => {
     }
   }
 );
+
+const authenticateToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        error: "No token provided"
+      });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    if (!token) {
+      return res.status(401).json({
+        error: "No token provided"
+      });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    const userId =
+      decoded.id ||
+      decoded.userId ||
+      decoded.sub;
+
+    if (!userId) {
+      return res.status(401).json({
+        error: "Invalid token payload"
+      });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT * FROM users WHERE id = $1`,
+      [userId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        error: "User not found"
+      });
+    }
+
+    const user = rows[0];
+
+    if (user.status === "suspended") {
+      if (
+        user.suspend_until &&
+        new Date(user.suspend_until) > new Date()
+      ) {
+        return res.status(403).json({
+          error: "Account suspended",
+          reason: "Your account is temporarily suspended",
+          until: user.suspend_until
+        });
+      }
+
+      if (!user.suspend_until) {
+        return res.status(403).json({
+          error: "Account permanently suspended",
+          reason: "Your account has been permanently suspended"
+        });
+      }
+
+      await pool.query(
+        `
+        UPDATE users
+        SET status = 'active',
+            suspend_until = NULL
+        WHERE id = $1
+        `,
+        [userId]
+      );
+
+      user.status = "active";
+      user.suspend_until = null;
+    }
+
+    req.user = user;
+    req.userId = user.id;
+
+    next();
+
+  } catch (err) {
+    if (err.name === "JsonWebTokenError") {
+      return res.status(401).json({
+        error: "Invalid token"
+      });
+    }
+
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({
+        error: "Token expired"
+      });
+    }
+
+    console.error("[AUTH] Unexpected error:", err);
+
+    return res.status(500).json({
+      error: "Authentication failed"
+    });
+  }
+};
 
 app.post("/api/chats/dm", authenticateToken, async (req, res) => {
   try {
