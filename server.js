@@ -3506,8 +3506,6 @@ const authenticateToken = async (req, res, next) => {
 
     const decoded = jwt.verify(token, JWT_SECRET);
 
-    // The JWT keeps the INTERNAL numeric ID.
-    // This means all existing database relationships continue working.
     const userId =
       decoded.id ||
       decoded.userId ||
@@ -3527,10 +3525,6 @@ const authenticateToken = async (req, res, next) => {
     );
 
     if (!rows.length) {
-      console.error(
-        `[AUTH] User ${userId} not found in database`
-      );
-
       return res.status(404).json({
         error: "User not found"
       });
@@ -3538,7 +3532,6 @@ const authenticateToken = async (req, res, next) => {
 
     const user = rows[0];
 
-    // Check suspension
     if (user.status === "suspended") {
       if (
         user.suspend_until &&
@@ -3558,7 +3551,6 @@ const authenticateToken = async (req, res, next) => {
         });
       }
 
-      // Suspension expired
       await pool.query(
         `UPDATE users
          SET status = 'active',
@@ -3571,9 +3563,6 @@ const authenticateToken = async (req, res, next) => {
       user.suspend_until = null;
     }
 
-    // IMPORTANT:
-    // req.userId remains the INTERNAL numeric database ID.
-    // Do NOT change this to public_id.
     req.user = user;
     req.userId = user.id;
 
@@ -7529,7 +7518,7 @@ app.post("/api/test-notification", authMiddleware, async (req, res) => {
 // ==========================================
 
 // GET /api/wallet/balance — Return user's coin balance
-app.get("/api/wallet/balance", async (req, res) => {
+app.get("/api/wallet/balance", authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.split(" ")[1];
     if (!token) return res.status(401).json({ error: "Not authenticated" });
@@ -7558,7 +7547,7 @@ app.get("/api/wallet/balance", async (req, res) => {
 });
 
 // POST /api/wallet/purchase-coins — Create Stripe Checkout Session
-app.post("/api/wallet/purchase-coins", async (req, res) => {
+app.post("/api/wallet/purchase-coins", authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.split(" ")[1];
     if (!token) return res.status(401).json({ error: "Not authenticated" });
