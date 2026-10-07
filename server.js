@@ -3518,9 +3518,7 @@ const authenticateToken = async (req, res, next) => {
     }
 
     const { rows } = await pool.query(
-      `SELECT *
-       FROM users
-       WHERE id = $1`,
+      `SELECT * FROM users WHERE id = $1`,
       [userId]
     );
 
@@ -3552,10 +3550,12 @@ const authenticateToken = async (req, res, next) => {
       }
 
       await pool.query(
-        `UPDATE users
-         SET status = 'active',
-             suspend_until = NULL
-         WHERE id = $1`,
+        `
+        UPDATE users
+        SET status = 'active',
+            suspend_until = NULL
+        WHERE id = $1
+        `,
         [userId]
       );
 
@@ -8656,22 +8656,6 @@ app.post('/api/videos/:id/react', authenticateToken, async (req, res) => {
     client.release();
   }
 });
-
-// ==========================================
-// REST AUTH MIDDLEWARE
-// ==========================================
-const authenticateREST = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : authHeader;
-    if (!token) return res.status(401).json({ error: "Not authenticated" });
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch (err) {
-    res.status(401).json({ error: "Invalid or expired token" });
-  }
-};
 
 // ==========================================
 // DM & MESSAGES ENDPOINTS
