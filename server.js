@@ -2421,20 +2421,17 @@ async function checkHiveAI(imagePath) {
     status: "approved",
     score: 0
 };
-  } catch (err) { console.error("Hive Error:", err.message); return {
+    } catch (err) {
+    console.error("Hive Error:", err.message);
 
-        allowed: false,
-
-        status: "review",
-
-        score: 1,
-
-        category: "moderation_unavailable",
-
-        reason: "Image moderation provider unavailable"
-
+    return {
+      allowed: false,
+      status: "review",
+      score: 1,
+      category: "moderation_unavailable",
+      reason: "Image moderation provider unavailable"
     };
-
+  }
 }
 
 async function checkSightengine(imagePath) {
