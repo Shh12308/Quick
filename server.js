@@ -18128,21 +18128,6 @@ app.post('/api/admin/notifications/send', authenticateToken, async (req, res) =>
   }
 });
 
-// Make helpers available to other routes
-export {
-  createNotification,
-  notifyLike,
-  notifyComment,
-  notifyFollow,
-  notifyMention,
-  notifyLogin,
-  notifyWarning,
-  notifyAppUpdate,
-  notifyTipReceived,
-  notifySubscription,
-  getNotificationLink
-};
-
 // ==========================================================
 // ENDPOINT 1: SEARCH USERS
 // ==========================================================
