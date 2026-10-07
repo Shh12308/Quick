@@ -5461,9 +5461,7 @@ const shortsUpload = multer({
 
 
 
-app.post("/api/uploads", authenticateToken,
-  shortsUpload.single("video"),
-  async (req, res) => {
+app.post("/api/uploads", authenticateToken,async (req, res) => {
     const userId = req.userId;
 
     const {
