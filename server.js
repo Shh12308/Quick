@@ -3470,22 +3470,6 @@ if (GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET) {
   }));
 }
 
-// ==========================================
-// API ROUTES (All existing routes remain the same)
-// ==========================================
-
-app.get("/api/health", async (req, res) => {
-  try {
-    if (!DATABASE_URL) return res.status(503).json({ status: "degraded", database: "disconnected", s3: !!s3, cdn: !!AWS_CLOUDFRONT_DOMAIN });
-    await pool.query("SELECT 1");
-    res.json({ status: "ok", timestamp: new Date().toISOString(), s3: !!s3, cdn: !!AWS_CLOUDFRONT_DOMAIN });
-  } catch (err) { console.error("Health check failed:", err); res.status(503).json({ status: "error", database: "error", message: err.message }); }
-});
-
-// ============================================================
-// AUTHENTICATION MIDDLEWARE
-// ============================================================
-
 const authenticateToken = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -3588,6 +3572,24 @@ const authenticateToken = async (req, res, next) => {
     });
   }
 };
+
+// ==========================================
+// API ROUTES (All existing routes remain the same)
+// ==========================================
+
+app.get("/api/health", async (req, res) => {
+  try {
+    if (!DATABASE_URL) return res.status(503).json({ status: "degraded", database: "disconnected", s3: !!s3, cdn: !!AWS_CLOUDFRONT_DOMAIN });
+    await pool.query("SELECT 1");
+    res.json({ status: "ok", timestamp: new Date().toISOString(), s3: !!s3, cdn: !!AWS_CLOUDFRONT_DOMAIN });
+  } catch (err) { console.error("Health check failed:", err); res.status(503).json({ status: "error", database: "error", message: err.message }); }
+});
+
+// ============================================================
+// AUTHENTICATION MIDDLEWARE
+// ============================================================
+
+
 
 
 // ============================================================
