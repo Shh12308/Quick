@@ -3302,6 +3302,18 @@ function generateAgoraToken(channelName, userId) {
   return RtcTokenBuilder.buildTokenWithUid(AGORA_APP_ID, AGORA_APP_CERTIFICATE, channelName, userId, role, privilegeExpiredTs);
 }
 
+const musicUpload = multer({
+
+  storage: multer.memoryStorage(),
+
+  limits: {
+
+    fileSize: 50 * 1024 * 1024,
+
+  },
+
+});
+
 async function sendPushNotification(userId, title, message, data = {}) {
   if (!oneSignalClient) return;
   try {
