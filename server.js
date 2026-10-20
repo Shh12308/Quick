@@ -336,6 +336,12 @@ async function redisGet(key) {
   }
 }
 
+// General upload configuration
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+});
+
 async function redisSet(key, value, expirySeconds = null) {
   if (!redisClient) return false;
   try {
