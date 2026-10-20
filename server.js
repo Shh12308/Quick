@@ -185,6 +185,111 @@ pool.on("error", (err) => {
   console.error("PostgreSQL Pool Error:", err);
 });
 
+// JWT authentication middleware; declared before protected route registration.
+const authenticateToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        error: "No token provided"
+      });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    if (!token) {
+      return res.status(401).json({
+        error: "No token provided"
+      });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    const userId =
+      decoded.id ||
+      decoded.userId ||
+      decoded.sub;
+
+    if (!userId) {
+      return res.status(401).json({
+        error: "Invalid token payload"
+      });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT * FROM users WHERE id = $1`,
+      [userId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        error: "User not found"
+      });
+    }
+
+    const user = rows[0];
+
+    if (user.status === "suspended") {
+      if (
+        user.suspend_until &&
+        new Date(user.suspend_until) > new Date()
+      ) {
+        return res.status(403).json({
+          error: "Account suspended",
+          reason: "Your account is temporarily suspended",
+          until: user.suspend_until
+        });
+      }
+
+      if (!user.suspend_until) {
+        return res.status(403).json({
+          error: "Account permanently suspended",
+          reason: "Your account has been permanently suspended"
+        });
+      }
+
+      await pool.query(
+        `
+        UPDATE users
+        SET status = 'active',
+            suspend_until = NULL
+        WHERE id = $1
+        `,
+        [userId]
+      );
+
+      user.status = "active";
+      user.suspend_until = null;
+    }
+
+    req.user = user;
+    req.userId = user.id;
+
+    next();
+
+  } catch (err) {
+    if (err.name === "JsonWebTokenError") {
+      return res.status(401).json({
+        error: "Invalid token"
+      });
+    }
+
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({
+        error: "Token expired"
+      });
+    }
+
+    console.error("[AUTH] Unexpected error:", err);
+
+    return res.status(500).json({
+      error: "Authentication failed"
+    });
+  }
+};
+
+
 // ==========================================
 // REDIS & SESSION (SAFE INITIALIZATION)
 // ==========================================
@@ -315,12 +420,6 @@ async function redisHIncrBy(key, field, increment) {
 }
 
 const cache = new NodeCache({ stdTTL: 600 });
-
-// General upload configuration
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
-});
 
 // ==========================================
 // AWS S3 + CLOUDFRONT SETUP
@@ -5362,108 +5461,7 @@ const shortsUpload = multer({
 
 
 
-const authenticateToken = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
 
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({
-        error: "No token provided"
-      });
-    }
-
-    const token = authHeader.split(" ")[1];
-
-    if (!token) {
-      return res.status(401).json({
-        error: "No token provided"
-      });
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-
-    const userId =
-      decoded.id ||
-      decoded.userId ||
-      decoded.sub;
-
-    if (!userId) {
-      return res.status(401).json({
-        error: "Invalid token payload"
-      });
-    }
-
-    const { rows } = await pool.query(
-      `SELECT * FROM users WHERE id = $1`,
-      [userId]
-    );
-
-    if (!rows.length) {
-      return res.status(404).json({
-        error: "User not found"
-      });
-    }
-
-    const user = rows[0];
-
-    if (user.status === "suspended") {
-      if (
-        user.suspend_until &&
-        new Date(user.suspend_until) > new Date()
-      ) {
-        return res.status(403).json({
-          error: "Account suspended",
-          reason: "Your account is temporarily suspended",
-          until: user.suspend_until
-        });
-      }
-
-      if (!user.suspend_until) {
-        return res.status(403).json({
-          error: "Account permanently suspended",
-          reason: "Your account has been permanently suspended"
-        });
-      }
-
-      await pool.query(
-        `
-        UPDATE users
-        SET status = 'active',
-            suspend_until = NULL
-        WHERE id = $1
-        `,
-        [userId]
-      );
-
-      user.status = "active";
-      user.suspend_until = null;
-    }
-
-    req.user = user;
-    req.userId = user.id;
-
-    next();
-
-  } catch (err) {
-    if (err.name === "JsonWebTokenError") {
-      return res.status(401).json({
-        error: "Invalid token"
-      });
-    }
-
-    if (err.name === "TokenExpiredError") {
-      return res.status(401).json({
-        error: "Token expired"
-      });
-    }
-
-    console.error("[AUTH] Unexpected error:", err);
-
-    return res.status(500).json({
-      error: "Authentication failed"
-    });
-  }
-};
 
 app.post("/api/chats/dm", authenticateToken, async (req, res) => {
   try {
@@ -7917,7 +7915,7 @@ app.get('/api/support/tickets', authenticateToken, async (req, res) => {
 });
 
 // GET /api/wallet/purchases — Get user's purchase history
-app.get("/api/wallet/purchases", async (req, res) => {
+app.get("/api/wallet/purchases", authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.split(" ")[1];
     if (!token) return res.status(401).json({ error: "Not authenticated" });
@@ -10503,7 +10501,7 @@ app.get('/api/music/tracks', async (req, res) => {
 
 
 // GET /api/music/favorites - Get user's favorites
-app.get("/api/music/favorites", async (req, res) => {
+app.get("/api/music/favorites", authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.split(" ")[1];
     if (!token) {
@@ -10526,7 +10524,7 @@ app.get("/api/music/favorites", async (req, res) => {
 });
 
 // POST /api/music/favorites - Add to favorites
-app.post("/api/music/favorites", async (req, res) => {
+app.post("/api/music/favorites", authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.split(" ")[1];
     if (!token) {
@@ -10554,7 +10552,7 @@ app.post("/api/music/favorites", async (req, res) => {
 });
 
 // DELETE /api/music/favorites/:trackId - Remove from favorites
-app.delete("/api/music/favorites/:trackId", async (req, res) => {
+app.delete("/api/music/favorites/:trackId", authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.split(" ")[1];
     if (!token) {
@@ -12612,7 +12610,7 @@ app.get("/api/music/:id", async (req, res) => {
 // ==========================================
 // MUSIC FAVORITES
 // ==========================================
-app.get("/api/music/favorites", async (req, res) => {
+app.get("/api/music/favorites", authenticateToken, async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader?.startsWith("Bearer ")) {
@@ -12633,7 +12631,7 @@ app.get("/api/music/favorites", async (req, res) => {
   }
 });
 
-app.post("/api/music/favorites", async (req, res) => {
+app.post("/api/music/favorites", authenticateToken, async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader?.startsWith("Bearer ")) {
@@ -12661,7 +12659,7 @@ app.post("/api/music/favorites", async (req, res) => {
   }
 });
 
-app.delete("/api/music/favorites/:trackId", async (req, res) => {
+app.delete("/api/music/favorites/:trackId", authenticateToken, async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader?.startsWith("Bearer ")) {
@@ -14010,7 +14008,7 @@ function getNotificationLink(
   return null;
 }
 
-app.get("/api/messages/search", async (req, res) => {
+app.get("/api/messages/search", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const q = String(req.query.q || "").trim();
@@ -18802,7 +18800,7 @@ app.get("/api/auth/me", authenticateToken, async (req, res) => {
 // FOLLOW / UNFOLLOW — MUST be BEFORE the catch-all user route
 // ==========================================
 
-app.post('/api/users/:userId/follow', async (req, res) => {
+app.post('/api/users/:userId/follow', authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Not authenticated' });
@@ -18855,7 +18853,7 @@ app.post('/api/users/:userId/follow', async (req, res) => {
   }
 });
 
-app.post('/api/users/:userId/unfollow', async (req, res) => {
+app.post('/api/users/:userId/unfollow', authenticateToken, async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Not authenticated' });
@@ -19462,7 +19460,7 @@ app.get(
   }
 );
 
-app.post("/api/music/favorites", async (req, res) => {
+app.post("/api/music/favorites", authenticateToken, async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader?.startsWith("Bearer ")) return res.status(401).json({ error: "No token" });
@@ -19477,7 +19475,7 @@ app.post("/api/music/favorites", async (req, res) => {
   }
 });
 
-app.delete("/api/music/favorites/:trackId", async (req, res) => {
+app.delete("/api/music/favorites/:trackId", authenticateToken, async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader?.startsWith("Bearer ")) return res.status(401).json({ error: "No token" });
