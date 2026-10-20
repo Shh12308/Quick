@@ -8279,7 +8279,7 @@ app.post('/api/videos/:id/react', authenticateToken, async (req, res) => {
 // DM & MESSAGES ENDPOINTS
 // ==========================================
 
-app.get("/api/chats/:identifier/messages", authenticateREST, async (req, res) => {
+app.get("/api/chats/:identifier/messages", authenticateToken, async (req, res) => {
   try {
     const myId = req.user.id;
     const identifier = req.params.identifier;
@@ -8383,7 +8383,7 @@ app.get("/api/chats/:identifier/messages", authenticateREST, async (req, res) =>
 });
 
 // POST /api/chats/:chatId/messages
-app.post("/api/chats/:chatId/messages", authenticateREST, async (req, res) => {
+app.post("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
   try {
     const myId = req.user.id;
     const { chatId } = req.params;
@@ -17191,7 +17191,7 @@ app.get('/api/users/search', authenticateToken, async (req, res) => {
 
 // GET /api/users/friends
 // Returns accepted connections for the logged-in user.
-app.get("/api/users/friends", authenticateREST, async (req, res) => {
+app.get("/api/users/friends", authenticateToken, async (req, res) => {
   try {
     const myId = req.user.id;
 
