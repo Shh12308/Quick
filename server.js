@@ -3306,31 +3306,6 @@ function generateAgoraToken(channelName, userId) {
   return RtcTokenBuilder.buildTokenWithUid(AGORA_APP_ID, AGORA_APP_CERTIFICATE, channelName, userId, role, privilegeExpiredTs);
 }
 
-
-const musicUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 100 * 1024 * 1024
-  },
-  fileFilter: (req, file, cb) => {
-    if (
-      file.fieldname === "audio" &&
-      !file.mimetype.startsWith("audio/")
-    ) {
-      return cb(new Error("Invalid audio file type."));
-    }
-
-    if (
-      file.fieldname === "cover" &&
-      !file.mimetype.startsWith("image/")
-    ) {
-      return cb(new Error("Invalid image file type."));
-    }
-
-    cb(null, true);
-  }
-});
-
 async function sendPushNotification(userId, title, message, data = {}) {
   if (!oneSignalClient) return;
   try {
@@ -5549,6 +5524,31 @@ app.post("/api/chats/dm", authenticateToken, async (req, res) => {
     console.error("DM create error:", err);
     return res.status(500).json({ error: "Failed to create conversation" });
   }
+});
+
+// ==========================================
+// MUSIC UPLOAD CONFIGURATION
+// ==========================================
+const musicStorage = multer.memoryStorage();
+
+const musicUpload = multer({
+  storage: musicStorage,
+  limits: {
+    fileSize: 100 * 1024 * 1024, // 100 MB per file
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.fieldname === "audio" &&
+        !file.mimetype.startsWith("audio/")) {
+      return cb(new Error("Invalid audio file type."));
+    }
+
+    if (file.fieldname === "cover" &&
+        !file.mimetype.startsWith("image/")) {
+      return cb(new Error("Invalid image file type."));
+    }
+
+    cb(null, true);
+  },
 });
 
 // ==========================================
