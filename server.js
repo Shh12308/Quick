@@ -194,11 +194,15 @@ let redisClient = null;
 
 if (REDIS_URL) {
   try {
-    const isTLS = REDIS_URL.startsWith("rediss://");
-    const redisOptions = { url: REDIS_URL };
-    if (isTLS) {
-      redisOptions.socket = { tls: { rejectUnauthorized: false } };
-    }
+ 
+const redisOptions = {
+  url: REDIS_URL
+};
+
+pubClient = createClient(redisOptions);
+subClient = pubClient.duplicate();
+redisClient = pubClient.duplicate();
+
     
     pubClient = createClient(redisOptions);
     subClient = pubClient.duplicate();
@@ -3302,16 +3306,29 @@ function generateAgoraToken(channelName, userId) {
   return RtcTokenBuilder.buildTokenWithUid(AGORA_APP_ID, AGORA_APP_CERTIFICATE, channelName, userId, role, privilegeExpiredTs);
 }
 
+
 const musicUpload = multer({
-
   storage: multer.memoryStorage(),
-
   limits: {
-
-    fileSize: 50 * 1024 * 1024,
-
+    fileSize: 100 * 1024 * 1024
   },
+  fileFilter: (req, file, cb) => {
+    if (
+      file.fieldname === "audio" &&
+      !file.mimetype.startsWith("audio/")
+    ) {
+      return cb(new Error("Invalid audio file type."));
+    }
 
+    if (
+      file.fieldname === "cover" &&
+      !file.mimetype.startsWith("image/")
+    ) {
+      return cb(new Error("Invalid image file type."));
+    }
+
+    cb(null, true);
+  }
 });
 
 async function sendPushNotification(userId, title, message, data = {}) {
@@ -4726,19 +4743,6 @@ app.get('/api/users/me', authenticateToken, async (req, res) => {
 
 // --- Multer Configs (add near your other multer setups) ---
 const musicStorage = multer.memoryStorage();
-const musicUpload = multer({
-  storage: musicStorage,
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
-  fileFilter: (req, file, cb) => {
-    if (file.fieldname === "audio" && !file.mimetype.startsWith("audio/")) {
-      return cb(new Error("Invalid audio file type."), false);
-    }
-    if (file.fieldname === "cover" && !file.mimetype.startsWith("image/")) {
-      return cb(new Error("Invalid image file type."), false);
-    }
-    cb(null, true);
-  },
-});
 
 const shortsStorage = multer.memoryStorage();
 const shortsUpload = multer({
