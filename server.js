@@ -316,6 +316,12 @@ async function redisHIncrBy(key, field, increment) {
 
 const cache = new NodeCache({ stdTTL: 600 });
 
+// General upload configuration
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+});
+
 // ==========================================
 // AWS S3 + CLOUDFRONT SETUP
 // ==========================================
