@@ -324,6 +324,12 @@ redisClient = pubClient.duplicate();
   }
 }
 
+// General upload configuration
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+});
+
 // Redis helper functions
 async function redisGet(key) {
   if (!redisClient) return null;
