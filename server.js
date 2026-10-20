@@ -336,12 +336,6 @@ async function redisGet(key) {
   }
 }
 
-// General upload configuration
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
-});
-
 async function redisSet(key, value, expirySeconds = null) {
   if (!redisClient) return false;
   try {
@@ -4245,161 +4239,7 @@ app.post("/api/auth/register", checkBan, async (req, res) => {
 // GET CURRENT USER PROFILE
 // ============================================================
 
-app.get(
-  "/api/users/profile",
-  authenticateToken,
-  async (req, res) => {
-    try {
-      // req.userId is the INTERNAL numeric ID
-      const { rows } = await pool.query(
-        `SELECT *
-         FROM users
-         WHERE id = $1`,
-        [req.userId]
-      );
-
-      if (!rows.length) {
-        return res.status(404).json({
-          success: false,
-          error: "User not found"
-        });
-      }
-
-      const user = rows[0];
-
-      const displayName =
-        user.display_name ||
-        user.name ||
-        user.username ||
-        "";
-
-      const verified =
-        Boolean(user.is_verified) ||
-        Boolean(user.verified);
-
-      return res.json({
-        success: true,
-
-        user: {
-          ...user,
-
-          // =================================================
-          // PUBLIC UUID
-          // =================================================
-
-          id: user.public_id,
-
-          uuid: user.public_id,
-
-          publicId: user.public_id,
-
-          public_id: user.public_id,
-
-          // Keep internal DB ID separately
-          user_id: user.id,
-
-          username: user.username,
-
-          email: user.email,
-
-          name: displayName,
-
-          displayName,
-
-          display_name:
-            user.display_name || "",
-
-          profileUrl:
-            user.profile_url || null,
-
-          profile_url:
-            user.profile_url || null,
-
-          avatar:
-            user.profile_url || null,
-
-          profilePicture:
-            user.profile_url || null,
-
-          coverUrl:
-            user.cover_url || null,
-
-          cover_url:
-            user.cover_url || null,
-
-          coverPhoto:
-            user.cover_url || null,
-
-          bio:
-            user.bio || "",
-
-          location:
-            user.location || "",
-
-          website:
-            user.website || "",
-
-          socialLinks:
-            user.social_links || {},
-
-          social_links:
-            user.social_links || {},
-
-          isMusician:
-            Boolean(user.is_musician),
-
-          is_musician:
-            Boolean(user.is_musician),
-
-          isCreator:
-            Boolean(user.is_creator),
-
-          is_creator:
-            Boolean(user.is_creator),
-
-          isAdmin:
-            Boolean(user.is_admin),
-
-          is_admin:
-            Boolean(user.is_admin),
-
-          isVerified:
-            verified,
-
-          is_verified:
-            verified,
-
-          verified,
-
-          role:
-            user.role || "free",
-
-          subscriptionPlan:
-            user.subscription_plan || "free",
-
-          subscriptionExpires:
-            user.subscription_expires || null,
-
-          status:
-            user.status || "active",
-
-          isSelf: true
-        }
-      });
-
-    } catch (err) {
-      console.error(
-        "[PROFILE] Error:",
-        err
-      );
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to load profile"
-      });
-    }
-  }
-);
+;
 
 
 // ============================================================
@@ -4570,98 +4410,13 @@ app.post('/users/me/music/:id', authenticateToken, async (req, res) => {
 });
 
 // 1. Get All Settings (Profile, Privacy, Preferences, Subscription)
-app.get('/api/settings', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT 
-        id, username, email, bio, profile_url as "profileImage", verified, is_creator as "isCreator",
-        privacy, preferences, subscription_plan, subscription_expires
-       FROM users 
-       WHERE id = $1`,
-      [req.userId]
-    );
-
-    if (rows.length === 0) return res.status(404).json({ error: true, msg: "User not found" });
-
-    const user = rows[0];
-
-    // Format subscription data for the frontend
-    let subscription = {
-      plan: user.subscription_plan || 'Free',
-      renewalDate: user.subscription_expires,
-      features: []
-    };
-
-    // If user has an active subscription in DB, fetch more details (optional)
-    if (user.subscription_plan && user.subscription_plan !== 'Free') {
-      const subDetails = await pool.query(
-        "SELECT * FROM user_subscriptions WHERE user_id = $1 AND status = 'active'",
-        [req.userId]
-      );
-      if (subDetails.rows.length > 0) {
-        subscription = {
-          plan: user.subscription_plan,
-          renewalDate: subDetails.rows[0].current_period_end,
-          features: [] // Add feature logic if needed
-        };
-      }
-    }
-
-    res.json({
-      settings: {
-        username: user.username,
-        email: user.email,
-        bio: user.bio,
-        profileImage: user.profileImage,
-        verified: user.verified,
-        isCreator: user.isCreator,
-        privacy: user.privacy || {},
-        preferences: user.preferences || {}
-      },
-      subscription: subscription
-    });
-  } catch (err) {
-    console.error("Get settings error:", err);
-    res.status(500).json({ error: true, msg: "Server error" });
-  }
-});
+;
 
 // 2. Update Profile
-app.patch('/api/settings/profile', authenticateToken, async (req, res) => {
-  const { username, email, bio } = req.body;
-  try {
-    await pool.query(
-      "UPDATE users SET username = $1, email = $2, bio = $3 WHERE id = $4",
-      [username, email, bio, req.userId]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Update profile error:", err);
-    if (err.code === '23505') return res.status(400).json({ error: true, msg: "Username or email already taken" });
-    res.status(500).json({ error: true, msg: "Update failed" });
-  }
-});
+;
 
 // 3. Update Privacy Settings
-app.patch('/api/settings/privacy', authenticateToken, async (req, res) => {
-  // Frontend sends body like { privateAccount: true } or { allowComments: false }
-  // We merge this into the JSONB 'privacy' column
-  try {
-    const updateData = JSON.stringify(req.body);
-    
-    await pool.query(
-      `UPDATE users 
-       SET privacy = COALESCE(privacy, '{}'::jsonb) || $1::jsonb 
-       WHERE id = $2`,
-      [updateData, req.userId]
-    );
-    
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Update privacy error:", err);
-    res.status(500).json({ error: true, msg: "Update failed" });
-  }
-});
+;
 
 // ==========================================
 // VIDEO & CONTENT ROUTES
@@ -4800,18 +4555,7 @@ app.get('/api/videos/recommended', async (req, res) => {
 // ==========================================
 // 1. GET /api/users/me
 // ==========================================
-app.get('/api/users/me', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, username, email, profile_url as avatar, profile_url, role, subscription_plan, balance, channel_points, followers_count, created_at FROM users WHERE id = $1`, [req.userId]
-    );
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json({ user: rows[0] });
-  } catch (err) {
-    console.error('Get user error:', err);
-    res.status(500).json({ error: "Failed to fetch user" });
-  }
-});
+;
 
 // ==========================================
 // DEDICATED UPLOAD ENDPOINTS
@@ -5564,160 +5308,7 @@ const musicUpload = multer({
 //   genre?: string
 //   explicit?: "true" | "false"
 //   tags?: string (JSON array)
-app.post("/api/uploadm", authenticateToken, musicUpload.fields([
-  { name: "audio", maxCount: 1 },
-  { name: "cover", maxCount: 1 },
-]), async (req, res) => {
-  const userId = req.userId;
-
-  const {
-    title,
-    artist,
-    album = "",
-    genre = "",
-    explicit = "false",
-    tags = "[]",
-  } = req.body;
-
-  const audioFile = req.files?.["audio"]?.[0];
-  const coverFile = req.files?.["cover"]?.[0];
-
-  // --- Validation ---
-  if (!audioFile) {
-    return res.status(400).json({ error: "Audio file is required." });
-  }
-  if (!title || !title.trim()) {
-    return res.status(400).json({ error: "Title is required." });
-  }
-  if (!artist || !artist.trim()) {
-    return res.status(400).json({ error: "Artist name is required." });
-  }
-
-  let parsedTags;
-  try {
-    parsedTags = JSON.parse(tags);
-    if (!Array.isArray(parsedTags)) throw new Error();
-  } catch {
-    parsedTags = [];
-  }
-  if (parsedTags.length > 15) {
-    return res.status(400).json({ error: "Maximum 15 tags allowed." });
-  }
-
-  const validGenres = ["pop", "hip-hop", "rock", "electronic", "r&b", "country", "classical", "jazz", "other", ""];
-  if (genre && !validGenres.includes(genre.toLowerCase())) {
-    return res.status(400).json({ error: "Invalid genre." });
-  }
-
-  try {
-    // Verify user exists
-    const { rows: userRows } = await pool.query(
-      "SELECT id, username FROM users WHERE id = $1",
-      [userId]
-    );
-    if (!userRows.length) {
-      return res.status(404).json({ error: "User not found." });
-    }
-
-    if (!s3) {
-      return res.status(503).json({ error: "Cloud storage is not configured." });
-    }
-
-    // --- Upload audio to S3 ---
-    const audioExt = audioFile.originalname?.split(".").pop() || "mp3";
-    const audioKey = `music/${userId}/${Date.now()}-${uuidv4()}.${audioExt}`;
-
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: S3_BUCKET_NAME,
-        Key: audioKey,
-        Body: audioFile.buffer,
-        ContentType: audioFile.mimetype,
-      })
-    );
-
-    const audioUrl = AWS_CLOUDFRONT_DOMAIN
-      ? `https://${AWS_CLOUDFRONT_DOMAIN}/${audioKey}`
-      : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${audioKey}`;
-
-    // --- Upload cover to S3 (if provided) ---
-    let coverUrl = null;
-    let coverKey = null;
-
-    if (coverFile) {
-      coverKey = `music-covers/${userId}/${Date.now()}-${uuidv4()}.jpg`;
-
-      // Optimize cover image with sharp
-      let coverBuffer = coverFile.buffer;
-      try {
-        coverBuffer = await sharp(coverFile.buffer)
-          .resize(1000, 1000, { fit: "inside", withoutEnlargement: true })
-          .jpeg({ quality: 90 })
-          .toBuffer();
-      } catch (sharpErr) {
-        console.warn("[/api/uploadm] Sharp optimization failed, using original:", sharpErr.message);
-        coverBuffer = coverFile.buffer;
-      }
-
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: S3_BUCKET_NAME,
-          Key: coverKey,
-          Body: coverBuffer,
-          ContentType: "image/jpeg",
-        })
-      );
-
-      coverUrl = AWS_CLOUDFRONT_DOMAIN
-        ? `https://${AWS_CLOUDFRONT_DOMAIN}/${coverKey}`
-        : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${coverKey}`;
-    }
-
-    // --- Insert into database ---
-    const { rows } = await pool.query(
-      `INSERT INTO music (
-        user_id, title, artist, album, genre,
-        s3_key, file_url, cover_url, cover_key,
-        explicit, tags, duration, status, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
-      RETURNING id, title, artist, created_at`,
-      [
-        userId,
-        title.trim(),
-        artist.trim(),
-        album.trim(),
-        genre.toLowerCase(),
-        audioKey,
-        audioUrl,
-        coverUrl,
-        coverKey,
-        explicit === "true",
-        JSON.stringify(parsedTags.map((t) => t.trim().toLowerCase())),
-        0, // duration — will be updated by processing worker
-        "processing",
-      ]
-    );
-
-    // Clear cache
-    cache.del(`user-music:${userId}`);
-
-    res.status(201).json({
-      success: true,
-      track: {
-        id: rows[0].id,
-        title: rows[0].title,
-        artist: rows[0].artist,
-        audioUrl,
-        coverUrl,
-        status: "processing",
-        created_at: rows[0].created_at,
-      },
-    });
-  } catch (err) {
-    console.error("[/api/uploadm] Error:", err);
-    res.status(500).json({ error: "Failed to upload track. Please try again." });
-  }
-});
+;
 
 // --- Multer error handler for upload endpoints ---
 app.use((err, req, res, next) => {
@@ -6531,51 +6122,7 @@ app.get('/api/livestreams/active', async (req, res) => {
 });
 
 // ✅ Video proxy - bypasses CloudFront CORS issues
-app.get('/api/video-proxy', async (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).json({ error: 'Missing url' });
-
-  // Only allow proxying from your own S3 bucket
-  const allowed = [
-    'cdn.mintza.xyz',
-    process.env.S3_BUCKET_NAME ? `${process.env.S3_BUCKET_NAME}.s3.amazonaws.com` : null,
-    process.env.AWS_CLOUDFRONT_DOMAIN
-  ].filter(Boolean);
-
-  const isAllowed = allowed.some(domain => url.includes(domain));
-  if (!isAllowed) return res.status(403).json({ error: 'URL not allowed' });
-
-  try {
-    const response = await fetch(url);
-    
-    if (!response.ok) {
-      return res.status(response.status).json({ error: 'Video fetch failed' });
-    }
-
-    const contentType = response.headers.get('Content-Type') || 'video/mp4';
-    const contentLength = response.headers.get('Content-Length');
-    const contentRange = response.headers.get('Content-Range');
-    const acceptRanges = response.headers.get('Accept-Ranges');
-
-    const headers = {
-      'Content-Type': contentType,
-      'Access-Control-Allow-Origin': req.headers.origin || '*',
-      'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-      'Access-Control-Allow-Headers': 'Range',
-      'Access-Control-Expose-Headers': 'Content-Length, Content-Range',
-    };
-
-    if (contentLength) headers['Content-Length'] = contentLength;
-    if (contentRange) headers['Content-Range'] = contentRange;
-    if (acceptRanges) headers['Accept-Ranges'] = acceptRanges;
-
-    res.writeHead(response.status, headers);
-    response.body.pipe(res);
-  } catch (err) {
-    console.error('Proxy error:', err);
-    res.status(500).json({ error: 'Proxy failed' });
-  }
-});
+;
 
 // Handle CORS preflight for proxy
 app.options('/api/video-proxy', (req, res) => {
@@ -7529,24 +7076,7 @@ app.delete('/api/settings/login-activity/:id', authenticateToken, async (req, re
 });
 
 // GET /api/settings/blocked - Get blocked users
-app.get('/api/settings/blocked', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT b.id as "_id", b.blocked_id as "userId", u.username, u.profile_url as "profileImage",
-              b.created_at as "blockedAt"
-       FROM blocked_users b
-       JOIN users u ON u.id = b.blocked_id
-       WHERE b.blocker_id = $1
-       ORDER BY b.created_at DESC`,
-      [req.user.id]
-    );
-    
-    res.json({ users: rows });
-  } catch (err) {
-    console.error("Get blocked users error:", err);
-    res.status(500).json({ error: "Failed to fetch blocked users" });
-  }
-});
+;
 
 // POST /api/settings/blocked - Block a user
 app.post('/api/settings/blocked', authenticateToken, async (req, res) => {
@@ -8393,57 +7923,7 @@ app.get("/api/chats/:identifier/messages", authenticateToken, async (req, res) =
 });
 
 // POST /api/chats/:chatId/messages
-app.post("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
-  try {
-    const myId = req.user.id;
-    const { chatId } = req.params;
-    const { content, type, media_url } = req.body;
-
-    if (!content && !media_url) {
-      return res.status(400).json({ error: "Message cannot be empty" });
-    }
-
-    const chatCheck = await pool.query(
-      "SELECT id FROM chats WHERE id = $1 AND $2 = ANY(participants)", [chatId, myId]
-    );
-    if (chatCheck.rows.length === 0) {
-      return res.status(403).json({ error: "Not authorized in this chat" });
-    }
-
-    const msgRes = await pool.query(
-      `INSERT INTO messages (chat_id, sender_id, content, type, media_url, timestamp)
-       VALUES ($1, $2, $3, $4, $5, NOW())
-       RETURNING *`,
-      [chatId, myId, content || "", type || "text", media_url || null]
-    );
-
-    const message = msgRes.rows[0];
-
-    // Get sender info for socket broadcast
-    const { rows: userRows } = await pool.query(
-      "SELECT username, profile_url FROM users WHERE id = $1", [myId]
-    );
-
-    // Broadcast to everyone in the chat room via socket
-    io.to(`chat-${chatId}`).emit("new-message", {
-      ...message,
-      sender_name: userRows[0]?.username,
-      sender_avatar: userRows[0]?.profile_url
-    });
-
-    // Update last_message on the chat
-    await pool.query(
-      `UPDATE chats SET last_message = $1, last_message_at = NOW() WHERE id = $2`,
-      [content || "[Media]", chatId]
-    );
-
-    res.json({ success: true, message });
-
-  } catch (err) {
-    console.error("Send Message Error:", err.message);
-    res.status(500).json({ error: `Failed to send message: ${err.message}` });
-  }
-});
+;
 
 // ============================================================
 // CREATE / GET DIRECT CHAT
@@ -10507,100 +9987,16 @@ app.get('/api/music/tracks', async (req, res) => {
 
 
 // GET /api/music/favorites - Get user's favorites
-app.get("/api/music/favorites", authenticateToken, async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split(" ")[1];
-    if (!token) {
-      return res.status(401).json({ error: "No token provided" });
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-
-    const { rows } = await pool.query(`
-      SELECT track_id 
-      FROM music_favorites 
-      WHERE user_id = $1
-    `, [decoded.id]);
-
-    res.json(rows.map(r => r.track_id));
-  } catch (err) {
-    console.error("Get favorites error:", err);
-    res.status(500).json({ error: "Failed to fetch favorites" });
-  }
-});
+;
 
 // POST /api/music/favorites - Add to favorites
-app.post("/api/music/favorites", authenticateToken, async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split(" ")[1];
-    if (!token) {
-      return res.status(401).json({ error: "No token provided" });
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const { track_id } = req.body;
-
-    if (!track_id) {
-      return res.status(400).json({ error: "track_id is required" });
-    }
-
-    await pool.query(`
-      INSERT INTO music_favorites (user_id, track_id, created_at)
-      VALUES ($1, $2, NOW())
-      ON CONFLICT (user_id, track_id) DO NOTHING
-    `, [decoded.id, track_id]);
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Add favorite error:", err);
-    res.status(500).json({ error: "Failed to add favorite" });
-  }
-});
+;
 
 // DELETE /api/music/favorites/:trackId - Remove from favorites
-app.delete("/api/music/favorites/:trackId", authenticateToken, async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split(" ")[1];
-    if (!token) {
-      return res.status(401).json({ error: "No token provided" });
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-
-    await pool.query(`
-      DELETE FROM music_favorites 
-      WHERE user_id = $1 AND track_id = $2
-    `, [decoded.id, req.params.trackId]);
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Remove favorite error:", err);
-    res.status(500).json({ error: "Failed to remove favorite" });
-  }
-});
+;
 
 // GET /api/music/:id - Get single track
-app.get("/api/music/:id", async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT * FROM music WHERE id = $1
-    `, [req.params.id]);
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Track not found" });
-    }
-
-    // Increment play count
-    await pool.query(`
-      UPDATE music SET play_count = play_count + 1 WHERE id = $1
-    `, [req.params.id]);
-
-    res.json(rows[0]);
-  } catch (err) {
-    console.error("Get track error:", err);
-    res.status(500).json({ error: "Failed to fetch track" });
-  }
-});
+;
 
 // ==========================================
 // VIDEO PROXY — Fixed version
@@ -10906,90 +10302,12 @@ app.post("/api/agora/token", authenticateToken, async (req, res) => {
 });
 
 // Add this endpoint to your Express server
-app.get('/api/hls-proxy', async (req, res) => {
-  try {
-    const url = req.query.url;
-    if (!url) return res.status(400).json({ error: 'URL required' });
-    
-    // Validate URL is from allowed domains
-    const allowedDomains = [
-      'cdn.mintza.xyz',
-      process.env.AWS_CLOUDFRONT_DOMAIN?.replace('https://', '').replace('http://', ''),
-      // Add other allowed domains
-    ].filter(Boolean);
-    
-    const urlObj = new URL(url);
-    if (!allowedDomains.some(d => urlObj.hostname.includes(d))) {
-      return res.status(403).json({ error: 'Domain not allowed' });
-    }
-    
-    const response = await axios({
-      method: 'get',
-      url,
-      responseType: 'stream',
-      timeout: 30000,
-    });
-    
-    // Forward content-type
-    res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    
-    response.data.pipe(res);
-    
-  } catch (err) {
-    console.error('HLS Proxy Error:', err.message);
-    res.status(500).json({ error: 'Proxy failed' });
-  }
-});
+;
 
 // Backend - Add these if missing
-app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      "SELECT balance FROM users WHERE id = $1",
-      [req.user.id]
-    );
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json({ balance: rows[0].balance || 0 });
-  } catch (err) {
-    console.error("Balance error:", err);
-    res.status(500).json({ error: "Failed to get balance" });
-  }
-});
+;
 
-app.post('/api/wallet/purchase-coins', authenticateToken, async (req, res) => {
-  try {
-    const { amount, price, currency } = req.body;
-    
-    // Create Stripe checkout session
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      payment_method_types: ['card'],
-      line_items: [{
-        price_data: {
-          currency: currency || 'usd',
-          product_data: {
-            name: `${amount} Coins`,
-          },
-          unit_amount: Math.round(price * 100),
-        },
-        quantity: 1,
-      }],
-      success_url: `${FRONTEND_URL}/shop?success=true&coins=${amount}`,
-      cancel_url: `${FRONTEND_URL}/shop?cancelled=true`,
-      metadata: {
-        userId: req.user.id,
-        coinAmount: amount,
-      },
-    });
-
-    res.json({ success: true, url: session.url });
-  } catch (err) {
-    console.error("Purchase error:", err);
-    res.status(500).json({ error: "Failed to create checkout" });
-  }
-});
+;
 
 // ==========================================
 // STRIPE SUBSCRIPTION CHECKOUT
@@ -11075,170 +10393,7 @@ app.post('/api/subscriptions/checkout', async (req, res) => {
 // GET CURRENT USER
 // GET /api/users/me
 // ============================================================
-app.get("/api/users/me", authenticateToken, async (req, res) => {
-  try {
-    const userId = Number(req.user?.id);
-
-    if (!userId || Number.isNaN(userId)) {
-      return res.status(401).json({
-        success: false,
-        error: "Authentication required",
-      });
-    }
-
-    const { rows } = await pool.query(
-  `
-  SELECT
-    id,
-    public_id,
-    username,
-    email,
-    name,
-    display_name,
-    phone,
-    profile_url,
-    cover_url,
-    bio,
-    location,
-    website,
-    social_links,
-    is_musician,
-    is_creator,
-    is_admin,
-    is_verified,
-    verified,
-    role,
-    subscription_plan,
-    subscription_expires,
-    preferences,
-    notification_style,
-    status,
-    followers_count,
-    following_count,
-    created_at,
-    updated_at
-  FROM users
-  WHERE id = $1
-  LIMIT 1
-  `,
-  [userId]
-);
-
- if (!rows.length) {
-  return res.status(404).json({
-    success: false,
-    error: "User not found",
-  });
-}
-
-const user = rows[0];
-
-// Always provide a usable identifier.
-// Prefer public_id, but fall back to the numeric database ID.
-const uuid =
-  user.public_id ||
-  user.publicId ||
-  String(user.id);
-
-const displayName =
-  user.display_name ||
-  user.name ||
-  user.username ||
-  "";
-
-const verified =
-  Boolean(user.is_verified) ||
-  Boolean(user.verified);
-
-return res.json({
-  success: true,
-
-  user: {
-    ...user,
-
-    // IDs
-    id: user.id,
-    user_id: user.id,
-
-    uuid,
-    publicId: uuid,
-    public_id: user.public_id || uuid,
-
-    // Basic account information
-    username: user.username || "",
-    email: user.email || "",
-
-    name: displayName,
-    displayName,
-    display_name: user.display_name || "",
-
-    // Profile
-    profileUrl: user.profile_url || null,
-    profile_url: user.profile_url || null,
-
-    avatar:
-      user.profile_url ||
-      user.avatar ||
-      null,
-
-    profilePicture:
-      user.profile_url ||
-      user.avatar ||
-      null,
-
-    coverUrl: user.cover_url || null,
-    cover_url: user.cover_url || null,
-    coverPhoto: user.cover_url || null,
-
-    // About
-    bio: user.bio || "",
-    location: user.location || "",
-    website: user.website || "",
-
-    // Social links
-    socialLinks: user.social_links || {},
-    social_links: user.social_links || {},
-
-    // Account types
-    isMusician: Boolean(user.is_musician),
-    is_musician: Boolean(user.is_musician),
-
-    isCreator: Boolean(user.is_creator),
-    is_creator: Boolean(user.is_creator),
-
-    isAdmin: Boolean(user.is_admin),
-    is_admin: Boolean(user.is_admin),
-
-    // Verification
-    isVerified: verified,
-    is_verified: verified,
-    verified,
-
-    // Subscription
-    role: user.role || "free",
-
-    subscriptionPlan:
-      user.subscription_plan || "free",
-
-    subscriptionExpires:
-      user.subscription_expires || null,
-
-    // Account status
-    status: user.status || "active",
-
-    // Useful frontend flag
-    isSelf: true,
-  },
-});
-  } catch (err) {
-    console.error("GET /api/users/me error:", err);
-
-    return res.status(500).json({
-      success: false,
-      error: "Failed to fetch user",
-    });
-  }
-});
+;
 
 
 // ============================================================
@@ -12012,64 +11167,13 @@ app.get(
 );
 
 // 4. Update Preferences
-app.patch('/api/settings/preferences', authenticateToken, async (req, res) => {
-  try {
-    const updateData = JSON.stringify(req.body);
-    
-    await pool.query(
-      `UPDATE users 
-       SET preferences = COALESCE(preferences, '{}'::jsonb) || $1::jsonb 
-       WHERE id = $2`,
-      [updateData, req.userId]
-    );
-    
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Update preferences error:", err);
-    res.status(500).json({ error: true, msg: "Update failed" });
-  }
-});
+;
 
 // 5. Change Password
-app.post('/api/settings/change-password', authenticateToken, async (req, res) => {
-  const { currentPassword, newPassword } = req.body;
-  try {
-    const { rows } = await pool.query("SELECT password_hash FROM users WHERE id = $1", [req.userId]);
-    if (rows.length === 0) return res.status(404).json({ error: true, msg: "User not found" });
-
-    const valid = await argon2.verify(rows[0].password_hash, currentPassword);
-    if (!valid) return res.status(400).json({ error: true, msg: "Current password is incorrect" });
-
-    const pepperedPassword = newPassword + (PASSWORD_PEPPER || '');
-    const hashedPassword = await argon2.hash(pepperedPassword);
-
-    await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [hashedPassword, req.userId]);
-    
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Change password error:", err);
-    res.status(500).json({ error: true, msg: "Server error" });
-  }
-});
+;
 
 // 6. Get Login Activity
-app.get('/api/settings/login-activity', authenticateToken, async (req, res) => {
-  try {
-    // Assuming you have a 'sessions' table. If not, this query needs adjustment.
-    const { rows } = await pool.query(
-      `SELECT id, device, ip, created_at, 
-        (id = (SELECT id FROM sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1)) as current
-       FROM sessions 
-       WHERE user_id = $1 
-       ORDER BY created_at DESC`,
-      [req.userId]
-    );
-    res.json({ sessions: rows });
-  } catch (err) {
-    console.error("Get login activity error:", err);
-    res.json({ sessions: [] }); // Fail gracefully
-  }
-});
+;
 
 
 app.post('/api/faith/prayers', authenticateToken, async (req, res) => {
@@ -12159,81 +11263,24 @@ app.delete('/api/faith/prayers/:id', authenticateToken, async (req, res) => {
 });
 
 // 7. Revoke Session
-app.delete('/api/settings/login-activity/:id', authenticateToken, async (req, res) => {
-  const sessionId = req.params.id;
-  try {
-    await pool.query("DELETE FROM sessions WHERE id = $1 AND user_id = $2", [sessionId, req.userId]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Revoke session error:", err);
-    res.status(500).json({ error: true, msg: "Failed to revoke session" });
-  }
-});
+;
 
 
 
 // 8. Get Blocked Users
-app.get('/api/settings/blocked', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT u.id, u.username, u.profile_url, b.blocked_at 
-       FROM blocked_users b
-       JOIN users u ON b.blocked_id = u.id
-       WHERE b.user_id = $1`,
-      [req.userId]
-    );
-    res.json({ users: rows });
-  } catch (err) {
-    console.error("Get blocked users error:", err);
-    res.json({ users: [] });
-  }
-});
+;
 
 // 9. Unblock User
-app.delete('/api/settings/blocked/:id', authenticateToken, async (req, res) => {
-  try {
-    await pool.query("DELETE FROM blocked_users WHERE blocked_id = $1 AND user_id = $2", [req.params.id, req.userId]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Unblock user error:", err);
-    res.status(500).json({ error: true, msg: "Failed" });
-  }
-});
+;
 
 // 10. Get Hidden Words
-app.get('/api/settings/hidden-words', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      "SELECT word FROM hidden_words WHERE user_id = $1",
-      [req.userId]
-    );
-    res.json({ words: rows.map(r => r.word) });
-  } catch (err) {
-    res.json({ words: [] });
-  }
-});
+;
 
 // 11. Add Hidden Word
-app.post('/api/settings/hidden-words', authenticateToken, async (req, res) => {
-  const { word } = req.body;
-  if (!word) return res.status(400).json({ error: true, msg: "Word required" });
-  try {
-    await pool.query("INSERT INTO hidden_words (user_id, word) VALUES ($1, $2)", [req.userId, word.toLowerCase()]);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: true, msg: "Failed" });
-  }
-});
+;
 
 // 12. Remove Hidden Word
-app.delete('/api/settings/hidden-words/:word', authenticateToken, async (req, res) => {
-  try {
-    await pool.query("DELETE FROM hidden_words WHERE user_id = $1 AND word = $2", [req.userId, req.params.word]);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: true, msg: "Failed" });
-  }
-});
+;
 
 // ==========================================
 // POST /api/uploadm - Upload Music
@@ -12616,26 +11663,7 @@ app.get("/api/music/:id", async (req, res) => {
 // ==========================================
 // MUSIC FAVORITES
 // ==========================================
-app.get("/api/music/favorites", authenticateToken, async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith("Bearer ")) {
-      return res.status(401).json({ error: "No token" });
-    }
-
-    const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
-
-    const { rows } = await pool.query(
-      "SELECT track_id FROM music_favorites WHERE user_id = $1",
-      [decoded.id]
-    );
-
-    res.json(rows.map(r => r.track_id));
-  } catch (err) {
-    console.error("Get favorites error:", err);
-    res.status(500).json({ error: "Failed to fetch favorites" });
-  }
-});
+;
 
 app.post("/api/music/favorites", authenticateToken, async (req, res) => {
   try {
@@ -12710,93 +11738,16 @@ app.get("/api/music/debug", async (req, res) => {
 });
 
 // 13. Download Data (Zip File)
-app.get('/api/settings/download-data', authenticateToken, async (req, res) => {
-  try {
-    // 1. Setup Archiver
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    
-    // Catch warnings (e.g. stat failures)
-    archive.on('warning', (err) => { if (err.code !== 'ENOENT') throw err; });
-    archive.on('error', (err) => { throw err; });
-
-    // 2. Set Headers
-    res.attachment('mintza-data.zip');
-    archive.pipe(res);
-
-    // 3. Fetch Data to include
-    const { rows: userData } = await pool.query("SELECT * FROM users WHERE id = $1", [req.userId]);
-    // Exclude sensitive fields from JSON export
-    const { password_hash, ...safeUser } = userData[0];
-
-    // 4. Append files to zip
-    archive.append(JSON.stringify(safeUser, null, 2), { name: 'profile.json' });
-    
-    // You can add more data here, e.g., user's videos, comments, etc.
-    // Example:
-    // const videos = await pool.query("SELECT * FROM videos WHERE user_id = $1", [req.userId]);
-    // archive.append(JSON.stringify(videos.rows, null, 2), { name: 'videos.json' });
-
-    archive.finalize();
-  } catch (err) {
-    console.error("Download data error:", err);
-    if (!res.headersSent) res.status(500).json({ error: true, msg: "Failed to generate data" });
-  }
-});
+;
 
 // 14. Delete Account
-app.delete('/api/settings/account', authenticateToken, async (req, res) => {
-  try {
-    // 1. Begin transaction
-    await pool.query('BEGIN');
-
-    // 2. Delete related data (You should addCASCADE constraints in your DB schema instead of doing this manually for better performance)
-    await pool.query("DELETE FROM sessions WHERE user_id = $1", [req.userId]);
-    await pool.query("DELETE FROM hidden_words WHERE user_id = $1", [req.userId]);
-    await pool.query("DELETE FROM blocked_users WHERE user_id = $1 OR blocked_id = $1", [req.userId]);
-    
-    // 3. Delete User
-    await pool.query("DELETE FROM users WHERE id = $1", [req.userId]);
-
-    // 4. Commit
-    await pool.query('COMMIT');
-
-    res.json({ success: true });
-  } catch (err) {
-    await pool.query('ROLLBACK');
-    console.error("Delete account error:", err);
-    res.status(500).json({ error: true, msg: "Failed to delete account" });
-  }
-});
+;
 
 // ==========================================
 // SUPPORT ROUTES
 // ==========================================
 
-app.post('/api/support/feedback', authenticateToken, async (req, res) => {
-  const { subject, message } = req.body;
-  try {
-    // Save to DB
-    await pool.query(
-      "INSERT INTO support_tickets (user_id, type, subject, message, status, created_at) VALUES ($1, 'feedback', $2, $3, 'open', NOW())",
-      [req.userId, subject, message]
-    );
-    
-    // Optional: Send Email
-    if (transporter) {
-      await transporter.sendMail({
-        from: `"MintZa Support" <${EMAIL_USER}>`,
-        to: 'support@mintza.com', // Your support email
-        subject: `New Feedback: ${subject}`,
-        text: `From User ID: ${req.userId}\n\n${message}`
-      });
-    }
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Feedback error:", err);
-    res.status(500).json({ error: true, msg: "Failed" });
-  }
-});
+;
 
 // ==========================================
 // HLS PROXY - Fixed version
@@ -12901,143 +11852,18 @@ app.options("/api/hls-proxy", (req, res) => {
 // FOLLOWERS
 // ============================================================
 
-app.get(
-  "/api/users/:userId/followers",
-  authenticateToken,
-  async (req, res) => {
-    try {
-      const userId = Number(req.params.userId);
-
-      if (!userId || Number.isNaN(userId)) {
-        return res.status(400).json({
-          success: false,
-          error: "Invalid user ID",
-        });
-      }
-
-      const result = await pool.query(
-        `
-        SELECT
-          u.id,
-          u.username,
-          u.display_name,
-          u.profile_url,
-          u.is_verified
-        FROM follows f
-        INNER JOIN users u
-          ON u.id = f.follower_id
-        WHERE f.following_id = $1
-        ORDER BY f.created_at DESC
-        `,
-        [userId]
-      );
-
-      return res.json({
-        success: true,
-        users: result.rows,
-        count: result.rows.length,
-      });
-    } catch (err) {
-      console.error(
-        "Get followers error:",
-        err
-      );
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to load followers",
-      });
-    }
-  }
-);
+;
 
 
 // ============================================================
 // FOLLOWING
 // ============================================================
 
-app.get(
-  "/api/users/:userId/following",
-  authenticateToken,
-  async (req, res) => {
-    try {
-      const userId = Number(req.params.userId);
+;
 
-      if (!userId || Number.isNaN(userId)) {
-        return res.status(400).json({
-          success: false,
-          error: "Invalid user ID",
-        });
-      }
+;
 
-      const result = await pool.query(
-        `
-        SELECT
-          u.id,
-          u.username,
-          u.display_name,
-          u.profile_url,
-          u.is_verified
-        FROM follows f
-        INNER JOIN users u
-          ON u.id = f.following_id
-        WHERE f.follower_id = $1
-        ORDER BY f.created_at DESC
-        `,
-        [userId]
-      );
-
-      return res.json({
-        success: true,
-        users: result.rows,
-        count: result.rows.length,
-      });
-    } catch (err) {
-      console.error(
-        "Get following error:",
-        err
-      );
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to load following",
-      });
-    }
-  }
-);
-
-app.post('/api/support/report', async (req, res) => {
-  const { category, description, email } = req.body;
-  // Report can be sent anonymously (no authenticateToken middleware)
-  try {
-    const userId = req.userId || null;
-    
-    await pool.query(
-      "INSERT INTO support_tickets (user_id, type, subject, message, contact_email, status, created_at) VALUES ($1, 'report', $2, $3, $4, 'open', NOW())",
-      [userId, category, description, email]
-    );
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Report error:", err);
-    res.status(500).json({ error: true, msg: "Failed" });
-  }
-});
-
-app.post('/api/support/contact', async (req, res) => {
-  const { name, email, subject, message } = req.body;
-  try {
-    await pool.query(
-      "INSERT INTO contact_messages (name, email, subject, message, created_at) VALUES ($1, $2, $3, $4, NOW())",
-      [name, email, subject, message]
-    );
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Contact error:", err);
-    res.status(500).json({ error: true, msg: "Failed" });
-  }
-});
+;
 
 // 15. Logout
 app.post('/api/auth/logout', authenticateToken, async (req, res) => {
@@ -14111,152 +12937,7 @@ app.get("/api/messages/search", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/api/chats", authenticateToken, async (req, res) => {
-  try {
-    // authenticateToken sets req.userId = user.id
-    const userId = Number(req.userId);
-
-    console.log("[CHATS] Authenticated user:", {
-      reqUserId: req.userId,
-      reqUser: req.user ? {
-        id: req.user.id,
-        username: req.user.username
-      } : null
-    });
-
-    if (!Number.isInteger(userId)) {
-      return res.status(401).json({
-        error: "Invalid authenticated user"
-      });
-    }
-
-    const result = await pool.query(
-      `
-      SELECT
-        c.id,
-        c.type,
-        c.name,
-        c.avatar,
-        c.last_message,
-        c.last_message_id,
-        c.last_message_at,
-        c.is_archived,
-
-        CASE
-          WHEN $1 = ANY(COALESCE(c.pinned_by, ARRAY[]::integer[]))
-          THEN true
-          ELSE false
-        END AS is_pinned,
-
-        CASE
-          WHEN COALESCE(c.muted_by, '{}'::jsonb) ? $1::text
-          THEN COALESCE(
-            (c.muted_by ->> $1::text)::boolean,
-            false
-          )
-          ELSE false
-        END AS is_muted,
-
-        other_user.id AS other_user_id,
-        other_user.username AS other_username,
-        other_user.name AS other_name,
-        other_user.display_name AS other_display_name,
-        other_user.profile_url AS other_profile_url,
-        other_user.is_verified AS other_is_verified,
-
-        COALESCE(unread.unread_count, 0) AS unread_count
-
-      FROM chats c
-
-      INNER JOIN chat_participants me
-        ON me.chat_id = c.id
-       AND me.user_id = $1
-
-      LEFT JOIN LATERAL (
-        SELECT
-          u.id,
-          u.username,
-          u.name,
-          u.display_name,
-          u.profile_url,
-          u.is_verified
-        FROM chat_participants cp
-        INNER JOIN users u
-          ON u.id = cp.user_id
-        WHERE cp.chat_id = c.id
-          AND cp.user_id <> $1
-        ORDER BY cp.created_at ASC
-        LIMIT 1
-      ) other_user ON true
-
-      LEFT JOIN LATERAL (
-        SELECT COUNT(*)::integer AS unread_count
-        FROM messages m
-        LEFT JOIN chat_read_states rs
-          ON rs.chat_id = c.id
-         AND rs.user_id = $1
-        WHERE m.chat_id = c.id::text
-          AND m.sender_id <> $1
-          AND (
-            rs.last_read_at IS NULL
-            OR COALESCE(m.timestamp, m.created_at) > rs.last_read_at
-          )
-      ) unread ON true
-
-      WHERE c.is_archived = false
-
-      ORDER BY
-        CASE
-          WHEN $1 = ANY(COALESCE(c.pinned_by, ARRAY[]::integer[]))
-          THEN 0
-          ELSE 1
-        END,
-        c.last_message_at DESC NULLS LAST,
-        c.created_at DESC
-      `,
-      [userId]
-    );
-
-    const chats = result.rows.map((chat) => ({
-      ...chat,
-
-      pinned: Boolean(chat.is_pinned),
-      muted: Boolean(chat.is_muted),
-      archived: Boolean(chat.is_archived),
-
-      unreadCount: Number(chat.unread_count || 0),
-      unread: Number(chat.unread_count || 0) > 0,
-
-      otherUserId: chat.other_user_id,
-
-      otherUser: chat.other_user_id
-        ? {
-            id: chat.other_user_id,
-            username: chat.other_username,
-            name: chat.other_name,
-            displayName: chat.other_display_name,
-            profileUrl: chat.other_profile_url,
-            isVerified: chat.other_is_verified
-          }
-        : null
-    }));
-
-    console.log(`[CHATS] Returning ${chats.length} chats for user ${userId}`);
-
-    return res.json(chats);
-
-  } catch (err) {
-    console.error("GET /api/chats:", err);
-
-    return res.status(500).json({
-      error: "Failed to load chats",
-      details:
-        process.env.NODE_ENV === "production"
-          ? undefined
-          : err.message
-    });
-  }
-});
+;
 
 app.post("/api/users/block", authenticateToken, async (req, res) => {
   try {
@@ -16924,116 +15605,7 @@ app.get(
 );
 
 // Create or get existing chat with a user
-app.post('/api/chats/direct', authenticateToken, async (req, res) => {
-  try {
-    const targetUserId = Number(req.body.userId);
-    const currentUserId = Number(req.user.id);
-
-    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
-      return res.status(400).json({ error: "Invalid user ID" });
-    }
-
-    if (!Number.isInteger(currentUserId) || currentUserId === targetUserId) {
-      return res.status(400).json({ error: "Invalid user ID" });
-    }
-
-    // Check if target user exists
-    const { rows: userCheck } = await pool.query(
-      `SELECT id, username, profile_url
-       FROM users
-       WHERE id = $1::integer`,
-      [targetUserId]
-    );
-
-    if (!userCheck.length) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    // Check for an existing direct/private chat
-    const { rows: existingChat } = await pool.query(
-      `SELECT c.*
-       FROM chats c
-       JOIN chat_participants cp1
-         ON c.id = cp1.chat_id
-        AND cp1.user_id = $1::integer
-       JOIN chat_participants cp2
-         ON c.id = cp2.chat_id
-        AND cp2.user_id = $2::integer
-       WHERE c.type = 'private'
-       LIMIT 1`,
-      [currentUserId, targetUserId]
-    );
-
-    if (existingChat.length > 0) {
-      const chat = existingChat[0];
-
-      return res.json({
-        id: chat.id,
-        type: chat.type,
-        name: userCheck[0].username,
-        avatar: userCheck[0].profile_url,
-        otherUserId: targetUserId
-      });
-    }
-
-    // Create new chat
-    const { rows: newChat } = await pool.query(
-      `INSERT INTO chats (
-         creator_id,
-         type,
-         name,
-         avatar,
-         participants,
-         created_at
-       )
-       VALUES (
-         $1::integer,
-         'private',
-         $2,
-         $3,
-         ARRAY[$1::integer, $4::integer],
-         NOW()
-       )
-       RETURNING *`,
-      [
-        currentUserId,
-        userCheck[0].username,
-        userCheck[0].profile_url,
-        targetUserId
-      ]
-    );
-
-    const chatId = newChat[0].id;
-
-    // Add both users to chat_participants
-    await pool.query(
-      `INSERT INTO chat_participants (
-         chat_id,
-         user_id,
-         created_at
-       )
-       VALUES
-         ($1::uuid, $2::integer, NOW()),
-         ($1::uuid, $3::integer, NOW())
-       ON CONFLICT (chat_id, user_id) DO NOTHING`,
-      [chatId, currentUserId, targetUserId]
-    );
-
-    return res.json({
-      id: chatId,
-      type: 'private',
-      name: userCheck[0].username,
-      avatar: userCheck[0].profile_url,
-      otherUserId: targetUserId
-    });
-
-  } catch (err) {
-    console.error("Create direct chat error:", err);
-    return res.status(500).json({
-      error: "Failed to create chat"
-    });
-  }
-});
+;
 
 // ======================================================
 // CREATE PRODUCT
@@ -17725,35 +16297,7 @@ app.post('/api/admin/notifications/send', authenticateToken, async (req, res) =>
 // ==========================================================
 // ENDPOINT 1: SEARCH USERS
 // ==========================================================
-app.get("/api/users/search", authenticateToken, async (req, res) => {
-  try {
-    const q = req.query.q;
-    const limit = parseInt(req.query.limit) || 10;
-
-    if (!q || q.trim() === "") {
-      return res.json([]);
-    }
-
-    // Case-insensitive search, excluding the currently logged-in user
-    const regex = new RegExp(q, "i");
-
-    const users = await User.find({
-      _id: { $ne: req.user._id }, // Don't search yourself
-      $or: [
-        { username: regex },
-        { display_name: regex },
-        { name: regex }
-      ]
-    })
-    .limit(limit)
-    .select("id username display_name profile_url bio");
-
-    return res.json(users);
-  } catch (error) {
-    console.error("Search error:", error);
-    return res.status(500).json({ error: "Server error during search" });
-  }
-});
+;
 
 // ==========================================================
 // ENDPOINT 2: SUGGESTED USERS
@@ -18806,58 +17350,7 @@ app.get("/api/auth/me", authenticateToken, async (req, res) => {
 // FOLLOW / UNFOLLOW — MUST be BEFORE the catch-all user route
 // ==========================================
 
-app.post('/api/users/:userId/follow', authenticateToken, async (req, res) => {
-  try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Not authenticated' });
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-
-    const { rows: targetRows } = await pool.query(
-      'SELECT id FROM users WHERE username = $1',
-      [req.params.username]
-    );
-
-    if (!targetRows.length) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    const followingId = targetRows[0].id;
-
-    if (decoded.id === followingId) {
-      return res.status(400).json({ error: 'Cannot follow yourself' });
-    }
-
-    const { rows: existing } = await pool.query(
-      'SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2',
-      [decoded.id, followingId]
-    );
-
-    if (existing.length > 0) {
-      return res.status(409).json({ error: 'Already following' });
-    }
-
-    await pool.query(
-      'INSERT INTO follows (follower_id, following_id, created_at) VALUES ($1, $2, NOW())',
-      [decoded.id, followingId]
-    );
-
-    await pool.query(
-      'UPDATE users SET subscribers_count = subscribers_count + 1 WHERE id = $1',
-      [followingId]
-    );
-
-    await pool.query(
-      'UPDATE users SET following_count = COALESCE(following_count, 0) + 1 WHERE id = $1',
-      [decoded.id]
-    );
-
-    res.json({ success: true, following: true });
-  } catch (err) {
-    console.error('Follow error:', err);
-    res.status(500).json({ error: 'Failed to follow' });
-  }
-});
+;
 
 app.post('/api/users/:userId/unfollow', authenticateToken, async (req, res) => {
   try {
@@ -19351,42 +17844,7 @@ app.get("/api/channel-rewards/:streamId", async (req, res) => {
 // MUSIC ENDPOINTS - PUBLIC (NO AUTH)
 // ==========================================
 
-app.get("/api/music", async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT 
-        id, title, artist, album, genre, duration,
-        file_url, audio_url, cover_url,
-        is_explicit, explicit, tags, plays, status, created_at
-      FROM music 
-      ORDER BY created_at DESC 
-      LIMIT 500
-    `);
-
-    const tracks = rows.map(t => ({
-      id: t.id,
-      title: t.title,
-      artist: t.artist,
-      album: t.album || "",
-      genre: t.genre || "",
-      duration: t.duration || 0,
-      cover: t.cover_url || null,
-      thumbnail: t.cover_url || null,
-      audio_url: t.file_url || t.audio_url,
-      url: t.file_url || t.audio_url,
-      explicit: t.is_explicit || t.explicit || false,
-      tags: typeof t.tags === "string" ? JSON.parse(t.tags || "[]") : (t.tags || []),
-      plays: parseInt(t.plays) || 0,
-      createdAt: t.created_at,
-    }));
-
-    console.log(`🎵 Returning ${tracks.length} tracks`);
-    res.json(tracks);
-  } catch (err) {
-    console.error("MUSIC ERROR:", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
+;
 
 app.get(
   "/api/music/favorites",
@@ -19466,32 +17924,9 @@ app.get(
   }
 );
 
-app.post("/api/music/favorites", authenticateToken, async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith("Bearer ")) return res.status(401).json({ error: "No token" });
-    const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
-    await pool.query(
-      "INSERT INTO music_favorites (user_id, track_id, created_at) VALUES ($1, $2, NOW()) ON CONFLICT DO NOTHING",
-      [decoded.id, req.body.track_id]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+;
 
-app.delete("/api/music/favorites/:trackId", authenticateToken, async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith("Bearer ")) return res.status(401).json({ error: "No token" });
-    const decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
-    await pool.query("DELETE FROM music_favorites WHERE user_id = $1 AND track_id = $2", [decoded.id, req.params.trackId]);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+;
 
 
 
@@ -19499,174 +17934,7 @@ app.delete("/api/music/favorites/:trackId", authenticateToken, async (req, res) 
 // MUSIC UPLOAD - REQUIRES AUTH
 // ==========================================
 
-app.post("/api/uploadm", musicUpload.fields([
-  { name: "audio", maxCount: 1 },
-  { name: "cover", maxCount: 1 }
-]), async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith("Bearer ")) {
-      return res.status(401).json({ error: "No token provided" });
-    }
-
-    let decoded;
-    try {
-      decoded = jwt.verify(authHeader.split(" ")[1], JWT_SECRET);
-    } catch (err) {
-      return res.status(401).json({ error: "Invalid or expired token" });
-    }
-
-    const audioFile = req.files?.audio?.[0];
-    if (!audioFile) {
-      return res.status(400).json({ error: "Audio file is required" });
-    }
-
-    const { title, artist, album, genre, explicit, tags } = req.body;
-    if (!title?.trim()) {
-      return res.status(400).json({ error: "Title is required" });
-    }
-
-    if (!s3) {
-      return res.status(500).json({ error: "Storage not configured" });
-    }
-
-    console.log(`🎵 Uploading: "${title}" by ${artist || "Unknown"}`);
-
-    // Upload audio to S3
-    const audioExt = audioFile.originalname.split(".").pop()?.toLowerCase() || "mp3";
-    const audioS3Key = `music/${decoded.id}/${Date.now()}-${crypto.randomUUID()}.${audioExt}`;
-
-    await s3.send(new PutObjectCommand({
-      Bucket: S3_BUCKET_NAME,
-      Key: audioS3Key,
-      Body: audioFile.buffer,
-      ContentType: audioFile.mimetype || "audio/mpeg",
-    }));
-
-    const fileUrl = AWS_CLOUDFRONT_DOMAIN
-      ? `https://${AWS_CLOUDFRONT_DOMAIN}/${audioS3Key}`
-      : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${audioS3Key}`;
-
-    // Upload cover if provided
-    let coverUrl = null;
-    let coverS3Key = null;
-
-    const coverFile = req.files?.cover?.[0];
-    if (coverFile) {
-      try {
-        const coverBuffer = await sharp(coverFile.buffer)
-          .resize(1000, 1000, { fit: "cover" })
-          .jpeg({ quality: 85 })
-          .toBuffer();
-
-        coverS3Key = `music-covers/${decoded.id}/${Date.now()}-${crypto.randomUUID()}.jpg`;
-
-        await s3.send(new PutObjectCommand({
-          Bucket: S3_BUCKET_NAME,
-          Key: coverS3Key,
-          Body: coverBuffer,
-          ContentType: "image/jpeg",
-        }));
-
-        coverUrl = AWS_CLOUDFRONT_DOMAIN
-          ? `https://${AWS_CLOUDFRONT_DOMAIN}/${coverS3Key}`
-          : `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${coverS3Key}`;
-      } catch (err) {
-        console.error("Cover upload failed:", err.message);
-      }
-    }
-
-    // Get duration
-    let duration = 0;
-    try {
-      const tempPath = path.join(os.tmpdir(), `audio-${Date.now()}.${audioExt}`);
-      fs.writeFileSync(tempPath, audioFile.buffer);
-      duration = await new Promise((resolve) => {
-        ffmpeg.ffprobe(tempPath, (err, metadata) => {
-          fs.unlink(tempPath, () => {});
-          resolve(err ? 0 : Math.floor(metadata?.format?.duration || 0));
-        });
-      });
-    } catch (err) {
-      console.error("Duration error:", err.message);
-    }
-
-    // Parse tags
-    let parsedTags = [];
-    try {
-      if (tags) {
-        parsedTags = typeof tags === "string" ? JSON.parse(tags) : tags;
-        if (!Array.isArray(parsedTags)) parsedTags = [];
-      }
-    } catch (err) {
-      parsedTags = [];
-    }
-
-    // Save to database - MATCHING YOUR EXACT TABLE SCHEMA
-    const { rows } = await pool.query(
-      `INSERT INTO music (
-        user_id, title, artist, album, genre,
-        is_explicit, explicit,
-        audio_url, file_url, s3_key, audio_s3_key,
-        cover_url, cover_s3_key, cover_key,
-        duration, tags, plays, listens, likes, status, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, NOW())
-      RETURNING *`,
-      [
-        decoded.id,
-        title.trim(),
-        artist?.trim() || decoded.username || "Unknown Artist",
-        album?.trim() || "",
-        genre?.trim()?.toLowerCase() || "",
-        explicit === "true" || explicit === true,
-        explicit === "true" || explicit === true,
-        null,
-        fileUrl,
-        audioS3Key,
-        audioS3Key,
-        coverUrl,
-        coverS3Key,
-        coverS3Key,
-        duration,
-        JSON.stringify(parsedTags),
-        0,
-        0,
-        0,
-        "completed",
-      ]
-    );
-
-    if (!rows.length) {
-      return res.status(500).json({ error: "Failed to save track" });
-    }
-
-    console.log(`✅ Saved: ID=${rows[0].id}, "${rows[0].title}"`);
-
-    res.status(201).json({
-      success: true,
-      track: {
-        id: rows[0].id,
-        title: rows[0].title,
-        artist: rows[0].artist,
-        album: rows[0].album,
-        genre: rows[0].genre,
-        duration: rows[0].duration,
-        cover: rows[0].cover_url,
-        thumbnail: rows[0].cover_url,
-        audio_url: rows[0].file_url || rows[0].audio_url,
-        url: rows[0].file_url || rows[0].audio_url,
-        explicit: rows[0].is_explicit || rows[0].explicit,
-        tags: rows[0].tags,
-        plays: rows[0].plays,
-        createdAt: rows[0].created_at,
-      },
-    });
-
-  } catch (err) {
-    console.error("Upload error:", err);
-    res.status(500).json({ error: "Upload failed: " + err.message });
-  }
-});
+;
 
 // Create clip
 app.post("/api/clips/create", authenticateToken, async (req, res) => {
@@ -19834,42 +18102,7 @@ app.post("/api/livestreams/end/:id", authenticateToken, async (req, res) => {
 // ============================================================
 
 // GET /api/settings - Fetch all user data
-app.get("/api/settings", authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT 
-        id, username, email, bio, profile_url, 
-        privacy_settings, preferences, hidden_words, 
-        subscription_plan, subscription_expires, is_creator 
-       FROM users WHERE id = $1`,
-      [req.user.id]
-    );
-
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-
-    // Format response to match frontend expectations
-    const user = rows[0];
-    res.json({
-      settings: {
-        username: user.username,
-        email: user.email,
-        bio: user.bio,
-        profileImage: user.profile_url,
-        verified: user.is_verified, // Using is_verified from DB
-        isCreator: user.is_creator,
-        privacy: user.privacy_settings || {},
-        preferences: user.preferences || {},
-      },
-      subscription: {
-        plan: user.subscription_plan || 'Free',
-        renewalDate: user.subscription_expires
-      }
-    });
-  } catch (err) {
-    console.error("GET /api/settings error:", err);
-    res.status(500).json({ error: "Failed to fetch settings" });
-  }
-});
+;
 
 // In your user profile endpoint, add these fields to the SELECT query:
 app.get('/api/users/:id', authenticateToken, async (req, res) => {
@@ -19901,100 +18134,16 @@ app.get('/api/users/:id', authenticateToken, async (req, res) => {
 });
 
 // PATCH /api/settings/profile
-app.patch("/api/settings/profile", authenticateToken, async (req, res) => {
-  try {
-    const { username, email, bio } = req.body;
-    
-    // Basic validation
-    if (email) {
-      const emailCheck = await pool.query("SELECT id FROM users WHERE email = $1 AND id != $2", [email, req.user.id]);
-      if (emailCheck.rows.length) return res.status(400).json({ error: "Email taken" });
-    }
-    if (username) {
-      const userCheck = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id != $2", [username, req.user.id]);
-      if (userCheck.rows.length) return res.status(400).json({ error: "Username taken" });
-    }
-
-    const { rows } = await pool.query(
-      `UPDATE users SET 
-        username = COALESCE($1, username),
-        email = COALESCE($2, email),
-        bio = COALESCE($3, bio),
-        updated_at = NOW()
-       WHERE id = $4 RETURNING *`,
-      [username, email, bio, req.user.id]
-    );
-
-    res.json(rows[0]);
-  } catch (err) {
-    console.error("PATCH /api/settings/profile error:", err);
-    res.status(500).json({ error: "Update failed" });
-  }
-});
+;
 
 // PATCH /api/settings/privacy
-app.patch("/api/settings/privacy", authenticateToken, async (req, res) => {
-  try {
-    // req.body contains { key: value }, e.g. { privateAccount: true }
-    // We merge this into the existing JSONB column
-    const updates = req.body;
-    
-    const { rows } = await pool.query(
-      `UPDATE users SET 
-        privacy_settings = COALESCE(privacy_settings, '{}'::jsonb) || $1::jsonb,
-        updated_at = NOW()
-       WHERE id = $2 RETURNING privacy_settings`,
-      [JSON.stringify(updates), req.user.id]
-    );
-
-    res.json({ privacy: rows[0].privacy_settings });
-  } catch (err) {
-    console.error("PATCH /api/settings/privacy error:", err);
-    res.status(500).json({ error: "Update failed" });
-  }
-});
+;
 
 // PATCH /api/settings/preferences
-app.patch("/api/settings/preferences", authenticateToken, async (req, res) => {
-  try {
-    const updates = req.body;
-    
-    const { rows } = await pool.query(
-      `UPDATE users SET 
-        preferences = COALESCE(preferences, '{}'::jsonb) || $1::jsonb,
-        updated_at = NOW()
-       WHERE id = $2 RETURNING preferences`,
-      [JSON.stringify(updates), req.user.id]
-    );
-
-    res.json({ preferences: rows[0].preferences });
-  } catch (err) {
-    console.error("PATCH /api/settings/preferences error:", err);
-    res.status(500).json({ error: "Update failed" });
-  }
-});
+;
 
 // POST /api/settings/change-password
-app.post("/api/settings/change-password", authenticateToken, async (req, res) => {
-  try {
-    const { currentPassword, newPassword } = req.body;
-    
-    const { rows } = await pool.query("SELECT password_hash FROM users WHERE id = $1", [req.user.id]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-
-    const isValid = await verifyPassword(rows[0].password_hash, currentPassword);
-    if (!isValid) return res.status(400).json({ error: "Current password is incorrect" });
-
-    const password_hash = await hashPassword(newPassword);
-    
-    await pool.query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", [password_hash, req.user.id]);
-    
-    res.json({ message: "Password changed successfully" });
-  } catch (err) {
-    console.error("POST /api/settings/change-password error:", err);
-    res.status(500).json({ error: "Failed to change password" });
-  }
-});
+;
 
 // ==========================================
 // AUDIO PROXY
@@ -20238,46 +18387,10 @@ app.get("/api/music/audio/:id", async (req, res) => {
 });
 
 // GET /api/settings/login-activity
-app.get("/api/settings/login-activity", authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, device, ip_address, created_at, is_current 
-       FROM login_sessions 
-       WHERE user_id = $1 
-       ORDER BY created_at DESC 
-       LIMIT 10`,
-      [req.user.id]
-    );
-    
-    // Map to frontend structure
-    const sessions = rows.map(s => ({
-      _id: s.id,
-      device: s.device,
-      ip: s.ip_address,
-      createdAt: s.created_at,
-      current: s.is_current
-    }));
-
-    res.json({ sessions });
-  } catch (err) {
-    console.error("GET /api/settings/login-activity error:", err);
-    res.status(500).json({ error: "Failed to fetch activity" });
-  }
-});
+;
 
 // DELETE /api/settings/login-activity/:id
-app.delete("/api/settings/login-activity/:id", authenticateToken, async (req, res) => {
-  try {
-    await pool.query(
-      "DELETE FROM login_sessions WHERE id = $1 AND user_id = $2",
-      [req.params.id, req.user.id]
-    );
-    res.json({ message: "Session revoked" });
-  } catch (err) {
-    console.error("DELETE /api/settings/login-activity error:", err);
-    res.status(500).json({ error: "Failed to revoke session" });
-  }
-});
+;
 
 // ==========================================
 // CHAT MESSAGING API ENDPOINTS
@@ -20402,77 +18515,7 @@ app.post("/api/chats/find-or-create", authenticateToken, async (req, res) => {
 });
 
 // Get all chats for current user
-app.get("/api/chats", authenticateToken, async (req, res) => {
-  try {
-    // Get chats from participants table
-    const { rows: chats } = await pool.query(
-      `SELECT c.*, 
-              cp.last_read_at,
-              cp.role,
-              (SELECT COUNT(*) FROM messages m 
-               WHERE m.chat_id = c.id 
-               AND m.created_at > COALESCE(cp.last_read_at, '1970-01-01') 
-               AND m.sender_id != $1) as unread_count
-       FROM chats c
-       JOIN chat_participants cp ON c.id = cp.chat_id
-       WHERE cp.user_id = $1
-       ORDER BY COALESCE(c.last_message_at, c.created_at) DESC`,
-      [req.user.id]
-    ).catch(() => ({ rows: [] }));
-    
-    // Also get old-style chats
-    const { rows: oldChats } = await pool.query(
-      `SELECT *, 0 as unread_count FROM chats WHERE $1 = ANY(participants) AND id NOT IN (SELECT chat_id FROM chat_participants WHERE user_id = $1)
-       ORDER BY COALESCE(last_message_at, created_at) DESC`,
-      [req.user.id]
-    ).catch(() => ({ rows: [] }));
-    
-    const allChats = [...chats, ...oldChats];
-    
-    // Get other user info for private chats
-    const enrichedChats = await Promise.all(allChats.map(async (chat) => {
-      let otherUserId = null;
-      
-      if (chat.participants && Array.isArray(chat.participants)) {
-        otherUserId = chat.participants.find(id => id !== req.user.id);
-      } else {
-        const { rows: partRows } = await pool.query(
-          "SELECT user_id FROM chat_participants WHERE chat_id = $1 AND user_id != $2 LIMIT 1",
-          [chat.id, req.user.id]
-        ).catch(() => ({ rows: [] }));
-        otherUserId = partRows[0]?.user_id;
-      }
-      
-      let otherUser = null;
-      if (otherUserId) {
-        const { rows: userRows } = await pool.query(
-          "SELECT id, username, profile_url FROM users WHERE id = $1",
-          [otherUserId]
-        ).catch(() => ({ rows: [] }));
-        otherUser = userRows[0];
-      }
-      
-      return {
-        id: chat.id,
-        name: chat.name || otherUser?.username || "Chat",
-        avatar: chat.avatar || otherUser?.profile_url || `https://ui-avatars.com/api/?name=${encodeURIComponent(otherUser?.username || 'Chat')}`,
-        type: chat.type,
-        lastMessage: chat.last_message ? { text: chat.last_message, timestamp: chat.last_message_at } : null,
-        unread: chat.unread_count > 0,
-        unreadCount: chat.unread_count || 0,
-        otherUserId: otherUserId,
-        createdAt: chat.created_at,
-        updatedAt: chat.updated_at,
-      };
-    }));
-    
-    res.json(enrichedChats);
-    
-  } catch (err) {
-    console.error("Get chats error:", err);
-    res.status(500).json({ error: "Failed to get chats" });
-  }
-});
+;
 
 // Get messages for a chat
 app.get("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
@@ -20538,125 +18581,10 @@ app.get("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
 });
 
 // Send a message
-app.post("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    const { content, type = "text", media_url, replyTo, poll, sender_id } = req.body;
-    
-    if (!content && !media_url) {
-      return res.status(400).json({ error: "Message content required" });
-    }
-    
-    // Verify participant
-    let isParticipant = false;
-    
-    const { rows: newCheck } = await pool.query(
-      "SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2",
-      [chatId, req.user.id]
-    ).catch(() => ({ rows: [] }));
-    isParticipant = newCheck.length > 0;
-    
-    if (!isParticipant) {
-      const { rows: oldCheck } = await pool.query(
-        "SELECT 1 FROM chats WHERE id = $1 AND $2 = ANY(participants)",
-        [chatId, req.user.id]
-      ).catch(() => ({ rows: [] }));
-      isParticipant = oldCheck.length > 0;
-    }
-    
-    if (!isParticipant) {
-      return res.status(403).json({ error: "Not a participant" });
-    }
-    
-    // Create message
-    const { rows: message } = await pool.query(
-      `INSERT INTO messages (chat_id, sender_id, content, type, media_url, reply_to, poll_data, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       RETURNING *`,
-      [
-        chatId, 
-        req.user.id, 
-        content, 
-        type, 
-        media_url, 
-        replyTo ? JSON.stringify(replyTo) : null, 
-        poll ? JSON.stringify(poll) : null
-      ]
-    );
-    
-    const newMessage = {
-      ...message[0],
-      sender: {
-        id: req.user.id,
-        username: req.user.username,
-        profile_url: req.user.profile_url,
-      }
-    };
-    
-    // Emit to chat room
-    io.to(`chat-${chatId}`).emit("new-message", newMessage);
-    
-    // Also emit to other participants' personal rooms
-    const { rows: participants } = await pool.query(
-      "SELECT user_id FROM chat_participants WHERE chat_id = $1 AND user_id != $2",
-      [chatId, req.user.id]
-    ).catch(() => ({ rows: [] }));
-    
-    for (const p of participants) {
-      io.to(`user-${p.user_id}`).emit("new-message", newMessage);
-    }
-    
-    // Fallback: check old participants array
-    const { rows: chat } = await pool.query(
-      "SELECT participants FROM chats WHERE id = $1",
-      [chatId]
-    ).catch(() => ({ rows: [] }));
-    
-    if (chat[0]?.participants) {
-      for (const uid of chat[0].participants) {
-        if (uid !== req.user.id) {
-          io.to(`user-${uid}`).emit("new-message", newMessage);
-        }
-      }
-    }
-    
-    // Update chat's last message
-    await pool.query(
-      `UPDATE chats SET last_message = $1, last_message_at = NOW(), updated_at = NOW() WHERE id = $2`,
-      [content?.substring(0, 100) || "[Media]", chatId]
-    ).catch(() => {});
-    
-    res.status(201).json(newMessage);
-    
-  } catch (err) {
-    console.error("Send message error:", err);
-    res.status(500).json({ error: "Failed to send message" });
-  }
-});
+;
 
 // Mark chat as read
-app.post("/api/chats/:chatId/read", authenticateToken, async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    
-    await pool.query(
-      `INSERT INTO chat_read_states (chat_id, user_id, last_read_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (chat_id, user_id) DO UPDATE SET last_read_at = NOW()`,
-      [chatId, req.user.id]
-    ).catch(() => {});
-    
-    await pool.query(
-      `UPDATE chat_participants SET last_read_at = NOW() WHERE chat_id = $1 AND user_id = $2`,
-      [chatId, req.user.id]
-    ).catch(() => {});
-    
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Mark read error:", err);
-    res.status(500).json({ error: "Failed to mark as read" });
-  }
-});
+;
 
 // Upload endpoint for chat media
 const chatUpload = multer({
@@ -20733,151 +18661,32 @@ app.get("/api/settings/blocked", authenticateToken, async (req, res) => {
 });
 
 // DELETE /api/settings/blocked/:id
-app.delete("/api/settings/blocked/:id", authenticateToken, async (req, res) => {
-  try {
-    await pool.query(
-      "DELETE FROM blocked_users WHERE blocker_id = $1 AND blocked_id = $2",
-      [req.user.id, req.params.id]
-    );
-    res.json({ message: "Unblocked" });
-  } catch (err) {
-    console.error("DELETE /api/settings/blocked error:", err);
-    res.status(500).json({ error: "Failed to unblock" });
-  }
-});
+;
 
 // GET /api/settings/hidden-words
-app.get("/api/settings/hidden-words", authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query("SELECT hidden_words FROM users WHERE id = $1", [req.user.id]);
-    res.json({ words: rows[0]?.hidden_words || [] });
-  } catch (err) {
-    console.error("GET /api/settings/hidden-words error:", err);
-    res.status(500).json({ error: "Failed" });
-  }
-});
+;
 
 // POST /api/settings/hidden-words
-app.post("/api/settings/hidden-words", authenticateToken, async (req, res) => {
-  try {
-    const { word } = req.body;
-    if (!word) return res.status(400).json({ error: "Word required" });
-
-    // Append to array
-    await pool.query(
-      "UPDATE users SET hidden_words = array_append(hidden_words, $1) WHERE id = $2 AND NOT ($1 = ANY(hidden_words))",
-      [word.toLowerCase(), req.user.id]
-    );
-
-    res.json({ message: "Added" });
-  } catch (err) {
-    console.error("POST /api/settings/hidden-words error:", err);
-    res.status(500).json({ error: "Failed" });
-  }
-});
+;
 
 // DELETE /api/settings/hidden-words/:word
-app.delete("/api/settings/hidden-words/:word", authenticateToken, async (req, res) => {
-  try {
-    const word = decodeURIComponent(req.params.word);
-    await pool.query(
-      "UPDATE users SET hidden_words = array_remove(hidden_words, $1) WHERE id = $2",
-      [word, req.user.id]
-    );
-    res.json({ message: "Removed" });
-  } catch (err) {
-    console.error("DELETE /api/settings/hidden-words error:", err);
-    res.status(500).json({ error: "Failed" });
-  }
-});
+;
 
 // GET /api/settings/download-data
-app.get("/api/settings/download-data", authenticateToken, async (req, res) => {
-  try {
-    // 1. Fetch user data
-    const { rows: userRows } = await pool.query("SELECT * FROM users WHERE id = $1", [req.user.id]);
-    if (!userRows.length) return res.status(404).send("User not found");
-    
-    const userData = JSON.stringify(userRows[0], null, 2);
-
-    // 2. Setup Archiver for ZIP
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', 'attachment; filename="mintza-data.zip"');
-
-    archive.pipe(res);
-
-    // 3. Add files to ZIP
-    archive.append(userData, { name: 'user_profile.json' });
-    
-    // You could add more data here, e.g., comments, likes, etc.
-    // archive.append(JSON.stringify(comments), { name: 'comments.json' });
-
-    archive.finalize();
-  } catch (err) {
-    console.error("Download data error:", err);
-    res.status(500).send("Failed to generate data");
-  }
-});
+;
 
 // DELETE /api/settings/account
-app.delete("/api/settings/account", authenticateToken, async (req, res) => {
-  try {
-    await pool.query("DELETE FROM users WHERE id = $1", [req.user.id]);
-    res.json({ message: "Account deleted" });
-  } catch (err) {
-    console.error("DELETE /api/settings/account error:", err);
-    res.status(500).json({ error: "Failed to delete account" });
-  }
-});
+;
 
 // ============================================================
 // SUPPORT ROUTES
 // ============================================================
 
-app.post("/api/support/feedback", authenticateToken, async (req, res) => {
-  try {
-    const { subject, message } = req.body;
-    await pool.query(
-      `INSERT INTO support_tickets (user_id, type, subject, message) VALUES ($1, 'feedback', $2, $3)`,
-      [req.user.id, subject, message]
-    );
-    res.json({ message: "Feedback sent" });
-  } catch (err) {
-    console.error("Support feedback error:", err);
-    res.status(500).json({ error: "Failed" });
-  }
-});
+;
 
-app.post("/api/support/report", authenticateToken, async (req, res) => {
-  try {
-    const { category, description, email } = req.body;
-    await pool.query(
-      `INSERT INTO support_tickets (user_id, type, category, subject, message, email) VALUES ($1, 'report', $2, $3, $4, $5)`,
-      [req.user.id, category, category, description, email]
-    );
-    res.json({ message: "Report submitted" });
-  } catch (err) {
-    console.error("Support report error:", err);
-    res.status(500).json({ error: "Failed" });
-  }
-});
+;
 
-app.post("/api/support/contact", async (req, res) => {
-  try {
-    const { name, email, subject, message } = req.body;
-    // Allow contact without auth, so we don't use req.user.id here
-    await pool.query(
-      `INSERT INTO support_tickets (type, subject, message, email) VALUES ($1, $2, $3, $4)`,
-      ['contact', subject || `From ${name}`, message, email]
-    );
-    res.json({ message: "Message sent" });
-  } catch (err) {
-    console.error("Support contact error:", err);
-    res.status(500).json({ error: "Failed" });
-  }
-});
+;
 
 // ============================================================
 // 404 + ERROR HANDLERS
