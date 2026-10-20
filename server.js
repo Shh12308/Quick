@@ -3384,15 +3384,6 @@ async function verifyTurnstile(token, ip) {
 
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 500 }));
 
-function authMiddleware(req, res, next) { 
-  try { 
-    const token = req.headers.authorization?.split(" ")[1] || req.body.token || req.query.token; 
-    if (!token) return res.status(401).json({ error: "No token" }); 
-    req.user = jwt.verify(token, JWT_SECRET); 
-    next(); 
-  } catch (err) { res.status(401).json({ error: "Unauthorized" }); } 
-}
-
 function adminMiddleware(req, res, next) { 
   const key = req.headers["x-admin-key"] || req.body.adminKey; 
   if (!key || key !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" }); 
@@ -7106,7 +7097,7 @@ app.get("/api/users/:username", async (req, res) => {
   }
 });
 
-app.post("/api/test-notification", authMiddleware, async (req, res) => {
+app.post("/api/test-notification", authenticateToken, async (req, res) => {
   try {
     await createNotification(
       req.user.id,
@@ -15019,7 +15010,7 @@ app.get('/api/users/:userId/following', authenticateToken, async (req, res) => {
 // POST /api/videos/:id/hide
 // Hide a video for the current user
 // ------------------------------------------------------------
-app.post('/api/videos/:id/hide', authMiddleware, async (req, res) => {
+app.post('/api/videos/:id/hide', authenticateToken, async (req, res) => {
   try {
     const videoId = req.params.id;
     const userId = req.user.id;
@@ -15065,7 +15056,7 @@ app.post('/api/videos/:id/hide', authMiddleware, async (req, res) => {
 // ------------------------------------------------------------
 app.post(
   '/api/users/:id/not-recommended',
-  authMiddleware,
+  authenticateToken,
   async (req, res) => {
     try {
       const targetUserId = req.params.id;
@@ -15119,7 +15110,7 @@ app.post(
 // ------------------------------------------------------------
 app.post(
   '/api/users/:id/block',
-  authMiddleware,
+  authenticateToken,
   async (req, res) => {
     try {
       const targetUserId = req.params.id;
@@ -15173,7 +15164,7 @@ app.post(
 // ------------------------------------------------------------
 app.post(
   '/api/videos/:id/watch-later',
-  authMiddleware,
+  authenticateToken,
   async (req, res) => {
     try {
       const videoId = req.params.id;
@@ -15222,7 +15213,7 @@ app.post(
 // ------------------------------------------------------------
 app.delete(
   '/api/videos/:id/watch-later',
-  authMiddleware,
+  authenticateToken,
   async (req, res) => {
     try {
       const videoId = req.params.id;
@@ -15257,7 +15248,7 @@ app.delete(
 // ------------------------------------------------------------
 app.post(
   '/api/videos/:id/save',
-  authMiddleware,
+  authenticateToken,
   async (req, res) => {
     try {
       const videoId = req.params.id;
@@ -15306,7 +15297,7 @@ app.post(
 // ------------------------------------------------------------
 app.delete(
   '/api/videos/:id/save',
-  authMiddleware,
+  authenticateToken,
   async (req, res) => {
     try {
       const videoId = req.params.id;
@@ -16871,7 +16862,7 @@ app.get(
 // ------------------------------------------------------------
 app.get(
   '/api/videos/:id/download',
-  authMiddleware,
+  authenticateToken,
   async (req, res) => {
     try {
       const videoId = req.params.id;
@@ -17039,7 +17030,7 @@ app.post('/api/chats/direct', authenticateToken, async (req, res) => {
 // ======================================================
 
 // POST /api/products
-app.post("/api/products", async (req, res) => {
+app.post("/api/products", authenticateToken, async (req, res) => {
   try {
     const {
       name,
@@ -19180,7 +19171,7 @@ app.get("/api/users/me", authenticateToken, async (req, res) => {
   }
 });
 
-app.put("/api/users/me", authMiddleware, upload.fields([{ name: 'profile', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), async (req, res) => {
+app.put("/api/users/me", authenticateToken, upload.fields([{ name: 'profile', maxCount: 1 }, { name: 'cover', maxCount: 1 }]), async (req, res) => {
   try {
     const userId = req.user.id;
     const { username, bio, social_links, preferences, notificationStyle } = req.body;
@@ -20708,7 +20699,7 @@ app.post("/api/upload", authenticateToken, chatUpload.single('file'), async (req
 });
 
 // GET /api/settings/blocked
-app.get("/api/settings/blocked", authMiddleware, async (req, res) => {
+app.get("/api/settings/blocked", authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT u.id, u.username, b.created_at as blocked_at 
@@ -20732,7 +20723,7 @@ app.get("/api/settings/blocked", authMiddleware, async (req, res) => {
 });
 
 // DELETE /api/settings/blocked/:id
-app.delete("/api/settings/blocked/:id", authMiddleware, async (req, res) => {
+app.delete("/api/settings/blocked/:id", authenticateToken, async (req, res) => {
   try {
     await pool.query(
       "DELETE FROM blocked_users WHERE blocker_id = $1 AND blocked_id = $2",
@@ -20746,7 +20737,7 @@ app.delete("/api/settings/blocked/:id", authMiddleware, async (req, res) => {
 });
 
 // GET /api/settings/hidden-words
-app.get("/api/settings/hidden-words", authMiddleware, async (req, res) => {
+app.get("/api/settings/hidden-words", authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT hidden_words FROM users WHERE id = $1", [req.user.id]);
     res.json({ words: rows[0]?.hidden_words || [] });
@@ -20757,7 +20748,7 @@ app.get("/api/settings/hidden-words", authMiddleware, async (req, res) => {
 });
 
 // POST /api/settings/hidden-words
-app.post("/api/settings/hidden-words", authMiddleware, async (req, res) => {
+app.post("/api/settings/hidden-words", authenticateToken, async (req, res) => {
   try {
     const { word } = req.body;
     if (!word) return res.status(400).json({ error: "Word required" });
@@ -20776,7 +20767,7 @@ app.post("/api/settings/hidden-words", authMiddleware, async (req, res) => {
 });
 
 // DELETE /api/settings/hidden-words/:word
-app.delete("/api/settings/hidden-words/:word", authMiddleware, async (req, res) => {
+app.delete("/api/settings/hidden-words/:word", authenticateToken, async (req, res) => {
   try {
     const word = decodeURIComponent(req.params.word);
     await pool.query(
@@ -20791,7 +20782,7 @@ app.delete("/api/settings/hidden-words/:word", authMiddleware, async (req, res) 
 });
 
 // GET /api/settings/download-data
-app.get("/api/settings/download-data", authMiddleware, async (req, res) => {
+app.get("/api/settings/download-data", authenticateToken, async (req, res) => {
   try {
     // 1. Fetch user data
     const { rows: userRows } = await pool.query("SELECT * FROM users WHERE id = $1", [req.user.id]);
@@ -20821,7 +20812,7 @@ app.get("/api/settings/download-data", authMiddleware, async (req, res) => {
 });
 
 // DELETE /api/settings/account
-app.delete("/api/settings/account", authMiddleware, async (req, res) => {
+app.delete("/api/settings/account", authenticateToken, async (req, res) => {
   try {
     await pool.query("DELETE FROM users WHERE id = $1", [req.user.id]);
     res.json({ message: "Account deleted" });
@@ -20835,7 +20826,7 @@ app.delete("/api/settings/account", authMiddleware, async (req, res) => {
 // SUPPORT ROUTES
 // ============================================================
 
-app.post("/api/support/feedback", authMiddleware, async (req, res) => {
+app.post("/api/support/feedback", authenticateToken, async (req, res) => {
   try {
     const { subject, message } = req.body;
     await pool.query(
@@ -20849,7 +20840,7 @@ app.post("/api/support/feedback", authMiddleware, async (req, res) => {
   }
 });
 
-app.post("/api/support/report", authMiddleware, async (req, res) => {
+app.post("/api/support/report", authenticateToken, async (req, res) => {
   try {
     const { category, description, email } = req.body;
     await pool.query(
