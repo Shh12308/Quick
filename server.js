@@ -324,12 +324,6 @@ redisClient = pubClient.duplicate();
   }
 }
 
-// General upload configuration
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
-});
-
 // Redis helper functions
 async function redisGet(key) {
   if (!redisClient) return null;
@@ -6145,150 +6139,55 @@ app.options('/api/video-proxy', (req, res) => {
 // ONLY SERVE MODERATION-APPROVED VIDEOS
 // ============================================================
 
-app.get(
-  "/api/videos/:id",
-  async (req, res) => {
+app.get("/api/videos/:id", async (req, res) => {
+  const { id } = req.params;
+  const cacheKey = `video:${id}`;
 
-    const id = Number(req.params.id);
+  try {
+    // 1. Try Redis first
+    const cached = await redisGet(cacheKey);
 
-    if (
-      !Number.isInteger(id) ||
-      id <= 0
-    ) {
-      return res.status(400).json({
-        error: true,
-        msg: "Invalid video ID"
-      });
-    }
-
-    try {
-
-      const query = `
-        SELECT
-          v.id,
-          v.title,
-          v.description,
-
-          COALESCE(
-            v.video_url,
-            v.file_url
-          ) AS video_url,
-
-          v.file_url,
-          v.thumbnail_url,
-          v.duration,
-          v.views,
-          v.likes,
-          v.dislikes,
-          v.created_at,
-
-          v.processing_status,
-          v.status,
-          v.moderation_status,
-
-          v.auto_captions,
-          v.custom_captions,
-
-          u.id AS user_id,
-          u.username,
-          u.profile_url,
-
-          (
-            SELECT COUNT(*)
-            FROM follows
-            WHERE following_id = u.id
-          ) AS subscriber_count
-
-        FROM videos v
-
-        JOIN users u
-          ON v.user_id = u.id
-
-        WHERE v.id = $1
-          AND v.processing_status = 'ready'
-          AND v.status NOT IN (
-            'removed',
-            'deleted'
-          )
-          AND v.moderation_status IN (
-            'approved',
-            'limited'
-          )
-          AND u.status NOT IN (
-            'banned',
-            'suspended'
-          );
-      `;
-
-      const { rows } =
-        await pool.query(
-          query,
-          [id]
-        );
-
-      if (!rows.length) {
-        return res.status(404).json({
-          error: true,
-          msg: "Video not found or unavailable"
-        });
-      }
-
-      // Increment view ONLY for available content.
-      await pool.query(
-        `
-        UPDATE videos
-        SET views = COALESCE(views, 0) + 1
-        WHERE id = $1
-        `,
-        [id]
-      );
-
-      const row = rows[0];
-
-      const video = {
-        ...row,
-
-        src:
-          row.video_url ||
-          row.file_url,
-
-        thumbnail:
-          row.thumbnail_url,
-
-        channelName:
-          row.username,
-
-        channelAvatar:
-          row.profile_url,
-
-        channelSubscribers:
-          Number(row.subscriber_count || 0),
-
-        subtitles:
-          row.auto_captions ||
-          row.custom_captions ||
-          []
-      };
-
+    if (cached) {
       return res.json({
         success: true,
-        video
-      });
-
-    } catch (err) {
-
-      console.error(
-        "Get moderated video error:",
-        err
-      );
-
-      res.status(500).json({
-        error: true,
-        msg: "Server error"
+        video: cached,
+        source: "cache"
       });
     }
+
+    // 2. Fall back to PostgreSQL
+    const { rows } = await pool.query(
+      `SELECT id, title, description, thumbnail_url,
+              video_url, views, likes
+       FROM videos
+       WHERE id = $1
+         AND is_public = true`,
+      [id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        error: "Video not found"
+      });
+    }
+
+    const video = rows[0];
+
+    // 3. Cache for 60 seconds
+    await redisSet(cacheKey, video, 60);
+
+    return res.json({
+      success: true,
+      video,
+      source: "database"
+    });
+  } catch (err) {
+    console.error("Video retrieval error:", err);
+    return res.status(500).json({
+      error: "Failed to retrieve video"
+    });
   }
-);
+});
 
 // ==========================================
 // COMMENTS ROUTES
@@ -15743,39 +15642,101 @@ app.post("/api/products", authenticateToken, async (req, res) => {
 });
 
 // User search for finding users to follow/message
+
 app.get('/api/users/search', authenticateToken, async (req, res) => {
   try {
-    const { q } = req.query;
-    const limit = parseInt(req.query.limit) || 20;
-    
-    if (!q || q.length < 2) {
+    const userId = req.user.id;
+
+    const rawQuery = req.query.q;
+    if (typeof rawQuery !== 'string') {
       return res.json({ users: [] });
     }
-    
+
+    const q = rawQuery.trim().replace(/^@/, '').toLowerCase();
+
+    if (q.length < 2) {
+      return res.json({ users: [] });
+    }
+
+    // Prevent excessive result requests.
+    const requestedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(requestedLimit, 1), 25)
+      : 20;
+
+    // Cache is specific to this user and search term.
+    const cacheKey =
+      `user-search:v1:${userId}:${limit}:${q}`;
+
+    // Use cached results when available.
+    const cachedUsers = await redisGet(cacheKey);
+
+    if (cachedUsers !== null && Array.isArray(cachedUsers)) {
+      return res.json({
+        users: cachedUsers,
+        cached: true
+      });
+    }
+
+    // Escape SQL LIKE wildcard characters in user input.
+    const escapedQuery = q.replace(/[\\%_]/g, '\\$&');
+
     const { rows } = await pool.query(
-      `SELECT u.id, u.username, u.profile_url, u.bio, u.is_verified, u.is_musician, u.role,
-              (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as followers_count,
-              CASE WHEN EXISTS (
-                SELECT 1 FROM follows WHERE follower_id = $2 AND following_id = u.id
-              ) THEN true ELSE false END as is_following
+      `SELECT
+         u.id,
+         u.username,
+         u.profile_url,
+         u.bio,
+         u.is_verified,
+         u.is_musician,
+         u.role,
+         (
+           SELECT COUNT(*)
+           FROM follows f
+           WHERE f.following_id = u.id
+         ) AS followers_count,
+         CASE WHEN EXISTS (
+           SELECT 1
+           FROM follows f
+           WHERE f.follower_id = $2
+             AND f.following_id = u.id
+         ) THEN true ELSE false END AS is_following
        FROM users u
        WHERE u.id != $2
          AND u.status = 'active'
-         AND (u.username ILIKE $1 OR u.email ILIKE $1)
-       ORDER BY 
-         CASE WHEN u.username ILIKE $1 THEN 0 ELSE 1 END,
+         AND u.username ILIKE $1
+       ORDER BY
+         CASE
+           WHEN LOWER(u.username) = $3 THEN 0
+           WHEN LOWER(u.username) LIKE $4 THEN 1
+           ELSE 2
+         END,
          u.username
-       LIMIT $3`,
-      [`%${q}%`, req.user.id, limit]
+       LIMIT $5`,
+      [
+        `${escapedQuery}%`,
+        userId,
+        q,
+        `${escapedQuery}%`,
+        limit
+      ]
     );
-    
-    res.json({ users: rows });
-    
+
+    // Cache briefly; PostgreSQL remains the source of truth.
+    await redisSet(cacheKey, rows, 15);
+
+    return res.json({
+      users: rows,
+      cached: false
+    });
   } catch (err) {
-    console.error("User search error:", err);
-    res.status(500).json({ error: "Failed to search users" });
+    console.error('User search error:', err);
+    return res.status(500).json({
+      error: 'Failed to search users'
+    });
   }
 });
+
 
 // GET /api/users/friends
 // Returns accepted connections for the logged-in user.
