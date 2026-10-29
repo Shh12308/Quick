@@ -8366,6 +8366,33 @@ app.post(
   }
 );
 
+// ============================================================
+// SNAP UPLOAD MIDDLEWARE
+// ============================================================
+
+const handleSnapUpload = multer({
+  storage: multer.memoryStorage(),
+
+  limits: {
+    fileSize: 100 * 1024 * 1024, // 100MB
+  },
+
+  fileFilter: (req, file, cb) => {
+    const allowed =
+      file.mimetype.startsWith("image/") ||
+      file.mimetype.startsWith("video/");
+
+    if (!allowed) {
+      return cb(
+        new Error("Only image and video files are allowed"),
+        false
+      );
+    }
+
+    cb(null, true);
+  },
+}).single("media");
+
  // ============================================================
 // SNAP MESSAGES
 // POST /api/chats/:chatId/snaps
