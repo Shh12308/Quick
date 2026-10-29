@@ -11005,6 +11005,36 @@ app.get('/api/faith/prayers', authenticateToken, async (req, res) => {
   }
 });
 
+app.get("/api/health", async (req, res) => {
+  try {
+    if (!DATABASE_URL) {
+      return res.status(503).json({
+        status: "degraded",
+        database: "disconnected",
+        s3: !!s3,
+        cdn: !!AWS_CLOUDFRONT_DOMAIN,
+      });
+    }
+
+    await pool.query("SELECT 1");
+
+    res.json({
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      s3: !!s3,
+      cdn: !!AWS_CLOUDFRONT_DOMAIN,
+    });
+  } catch (err) {
+    console.error("Health check failed:", err);
+
+    res.status(503).json({
+      status: "error",
+      database: "error",
+      message: err.message,
+    });
+  }
+});
+
 // Update prayer
 app.put('/api/faith/prayers/:id', authenticateToken, async (req, res) => {
   try {
