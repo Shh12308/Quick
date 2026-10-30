@@ -5563,28 +5563,6 @@ app.get('/api/videos', authenticateToken, async (req, res) => {
   }
 });
 
-const chatUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = [
-      'image/jpeg',
-      'image/png',
-      'image/gif',
-      'image/webp',
-      'video/mp4',
-      'audio/webm',
-      'audio/mpeg'
-    ];
-
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Invalid file type'), false);
-    }
-  }
-});
-
 // ==========================================
 // 4. GET /api/search (USERS)
 // ==========================================
@@ -18103,7 +18081,16 @@ const chatUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'audio/webm', 'audio/mpeg'];
+    const allowedTypes = [
+      'image/jpeg',
+      'image/png',
+      'image/gif',
+      'image/webp',
+      'video/mp4',
+      'audio/webm',
+      'audio/mpeg'
+    ];
+
     if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
     } else {
