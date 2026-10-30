@@ -3450,7 +3450,7 @@ const MEDIA_DIRS = {
 Object.values(MEDIA_DIRS).forEach(dir => { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); });
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => { 
+  destination: (req, file, cb) => {
     const dirMap = {
       video: MEDIA_DIRS.video,
       thumbnail: MEDIA_DIRS.thumbnail,
@@ -3461,18 +3461,21 @@ const storage = multer.diskStorage({
       profile: MEDIA_DIRS.profile,
       media: MEDIA_DIRS.image,
     };
-    cb(null, dirMap[file.fieldname] || MEDIA_DIRS.image); 
+
+    cb(null, dirMap[file.fieldname] || MEDIA_DIRS.image);
   },
-  filename: (req, file, cb) => { 
+
+  filename: (req, file, cb) => {
     const ext = path.extname(file.originalname);
-    cb(null, `${Date.now()}-${file.fieldname}${ext}`); 
+    cb(null, `${Date.now()}-${file.fieldname}${ext}`);
   },
 });
 
+// RESUME UPLOAD MIDDLEWARE
 const upload = multer({
-  storage,
+  storage: storage,
   limits: {
-    fileSize: 10 * 1024 * 1024 // 10 MB
+    fileSize: 10 * 1024 * 1024, // 10 MB
   },
   fileFilter: (req, file, cb) => {
     const allowedTypes = [
@@ -3484,7 +3487,7 @@ const upload = multer({
     if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error("Resume must be a PDF or Word document."), false);
+      cb(new Error("Resume must be a PDF or Word document."));
     }
   }
 });
