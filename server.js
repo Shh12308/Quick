@@ -11303,6 +11303,20 @@ app.post("/api/uploadm", musicUpload.fields([
   }
 });
 
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024,
+  },
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith("image/")) {
+      return cb(new Error("Only images are allowed"), false);
+    }
+
+    cb(null, true);
+  },
+});
+
 // ==========================================
 // GET /api/music - Get all music tracks
 // ==========================================
