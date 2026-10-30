@@ -8018,7 +8018,7 @@ app.post(
 app.post(
   "/api/chats/:chatId/snaps",
   authenticateToken,
-  handleSnapUpload,
+  chatUpload.single("media"),
   async (req, res) => {
     let uploadedKey = null;
     let databaseSaved = false;
