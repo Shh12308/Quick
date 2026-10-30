@@ -8919,7 +8919,7 @@ app.post("/api/livestreams/cleanup", authenticateToken, async (req, res) => {
 app.post(
   "/api/users/cover",
   authenticateToken,
-  upload.single("cover_photo"),
+chatUpload.single("cover_photo"),
   async (req, res) => {
     try {
       const userId = Number(req.user?.id);
