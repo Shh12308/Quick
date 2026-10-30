@@ -9140,7 +9140,7 @@ chatUpload.single("cover_photo"),
 app.post(
   "/api/users/profile/pic",
   authenticateToken,
-  upload.single("profile_pic"),
+chatUpload.single("profile_pic"),
   async (req, res) => {
     try {
       const userId = Number(req.user?.id);
