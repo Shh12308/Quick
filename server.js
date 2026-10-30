@@ -8968,6 +8968,20 @@ app.delete(
   }
 );
 
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024,
+  },
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith("image/")) {
+      return cb(new Error("Only images are allowed"), false);
+    }
+
+    cb(null, true);
+  },
+});
+
 // ============================================================
 // GET MESSAGE REQUESTS
 // ============================================================
@@ -11301,20 +11315,6 @@ app.post("/api/uploadm", musicUpload.fields([
     console.error("Music upload error:", err);
     res.status(500).json({ error: "Upload failed: " + err.message });
   }
-});
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024,
-  },
-  fileFilter: (req, file, cb) => {
-    if (!file.mimetype.startsWith("image/")) {
-      return cb(new Error("Only images are allowed"), false);
-    }
-
-    cb(null, true);
-  },
 });
 
 // ==========================================
