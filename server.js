@@ -5161,6 +5161,28 @@ RETURNING *
 
 });
 
+const chatUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      'image/jpeg',
+      'image/png',
+      'image/gif',
+      'image/webp',
+      'video/mp4',
+      'audio/webm',
+      'audio/mpeg'
+    ];
+
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type'), false);
+    }
+  }
+});
+
 // ==========================================
 // 3. GET /api/videos (FEED & SEARCH)
 // ==========================================
@@ -18077,27 +18099,7 @@ app.get("/api/chats/:chatId/messages", authenticateToken, async (req, res) => {
 ;
 
 // Upload endpoint for chat media
-const chatUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = [
-      'image/jpeg',
-      'image/png',
-      'image/gif',
-      'image/webp',
-      'video/mp4',
-      'audio/webm',
-      'audio/mpeg'
-    ];
 
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Invalid file type'), false);
-    }
-  }
-});
 
 app.post("/api/upload", authenticateToken, chatUpload.single('file'), async (req, res) => {
   try {
