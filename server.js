@@ -11,7 +11,7 @@ import { Strategy as DiscordStrategy } from "passport-discord";
 import { Strategy as GitHubStrategy } from "passport-github2";
 import http from "http";
 import nodemailer from "nodemailer";
-import multer from "multer";
+
 // ==========================================
 // IMPORT AND USE FOLLOW ROUTES
 // ==========================================
@@ -39,6 +39,11 @@ import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import OneSignal from "@onesignal/node-onesignal";
 import FormData from "form-data";
+import multer from "multer";
+
+const upload = multer({
+  storage: multer.memoryStorage()
+});
 import archiver from 'archiver';
 
 import { 
