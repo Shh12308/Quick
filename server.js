@@ -3878,83 +3878,179 @@ app.post("/api/auth/login", checkBan, async (req, res) => {
 // REGISTER
 // ============================================================
 
+
 console.log("REGISTER ROUTE LOADED");
+
+// ============================================================
+// POST /api/auth/register
+// ============================================================
 
 app.post("/api/auth/register", checkBan, async (req, res) => {
   console.log("REGISTER ROUTE HIT");
-  // Keep your existing registration code here
+
+  try {
+    const { username, email, password, dob } = req.body;
+
+    // Validate input
+    if (!username || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Username, email and password are required"
+      });
+    }
+
+    const cleanUsername = username.trim().toLowerCase();
+    const cleanEmail = email.trim().toLowerCase();
+
+    if (!/^[a-z0-9_]{3,30}$/.test(cleanUsername)) {
+      return res.status(400).json({
+        success: false,
+        message: "Username must be 3-30 characters and contain only letters, numbers and underscores"
+      });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 characters"
+      });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid email address"
+      });
+    }
+
+    // Check if username or email already exists
+    const existingUser = await pool.query(
+      `SELECT id FROM users
+       WHERE LOWER(username) = $1
+          OR LOWER(email) = $2
+       LIMIT 1`,
+      [cleanUsername, cleanEmail]
+    );
+
+    if (existingUser.rows.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message: "Username or email is already registered"
+      });
+    }
+
+    // Hash password using Argon2
+    const passwordHash = await argon2.hash(password);
+
+    const publicId = crypto.randomUUID();
+
+    // Create account
+    const result = await pool.query(
+      `INSERT INTO users (
+        username,
+        email,
+        password_hash,
+        dob,
+        role,
+        subscription_plan,
+        status,
+        public_id,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, 'free', 'free', 'active', $5, NOW(), NOW())
+      RETURNING
+        id,
+        username,
+        email,
+        public_id,
+        role,
+        subscription_plan,
+        status,
+        created_at`,
+      [
+        cleanUsername,
+        cleanEmail,
+        passwordHash,
+        dob || null,
+        publicId
+      ]
+    );
+
+    const user = result.rows[0];
+
+    // Create login session using your existing function
+    await createLoginSession(user.id, req);
+
+    // Generate JWT
+    const token = jwt.sign(
+      {
+        id: user.id,
+        public_id: user.public_id
+      },
+      process.env.JWT_SECRET,
+      {
+        expiresIn: "7d"
+      }
+    );
+
+    console.log("REGISTER SUCCESS:", user.id);
+
+    return res.status(201).json({
+      success: true,
+      message: "Account registered successfully",
+      token,
+      user
+    });
+
+  } catch (error) {
+    console.error("REGISTER ERROR:", error);
+
+    if (error.code === "23505") {
+      return res.status(409).json({
+        success: false,
+        message: "Username or email already exists"
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: "Registration failed"
+    });
+  }
 });
-
-
-// ============================================================
-// GET CURRENT USER PROFILE
-// ============================================================
-
-;
 
 
 // ============================================================
 // CREATE LOGIN SESSION
 // ============================================================
 
-async function createLoginSession(
-  userId,
-  req
-) {
+async function createLoginSession(userId, req) {
   try {
     const ip =
-      req.headers["x-forwarded-for"]?.split(",")[0] ||
+      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
       req.socket.remoteAddress;
 
     const userAgent =
-      req.headers["user-agent"] ||
-      "Unknown";
+      req.headers["user-agent"] || "Unknown";
 
-    let device = "Desktop";
-
-    if (
-      /mobile|android|iphone|ipad/i.test(
-        userAgent
-      )
-    ) {
-      device = "Mobile";
-    }
-
-    if (
-      /mac|windows|linux/i.test(
-        userAgent
-      )
-    ) {
-      device = "Desktop";
-    }
+    const device =
+      /mobile|android|iphone|ipad/i.test(userAgent)
+        ? "Mobile"
+        : "Desktop";
 
     await pool.query(
-      `
-      INSERT INTO login_sessions
-      (
-        user_id,
-        device,
-        ip_address,
-        user_agent,
-        is_current
-      )
-      VALUES ($1, $2, $3, $4, true)
-      `,
-      [
-        userId,
-        device,
-        ip,
-        userAgent
-      ]
+      `INSERT INTO login_sessions
+       (user_id, device, ip_address, user_agent, is_current)
+       VALUES ($1, $2, $3, $4, true)`,
+      [userId, device, ip, userAgent]
     );
 
   } catch (err) {
-    console.error(
-      "Login session error:",
-      err
-    );
+    console.error("Login session error:", err);
   }
 }
+
 
 // ==========================================
 // LIBRARY / USER DATA ROUTES
