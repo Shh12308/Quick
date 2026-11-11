@@ -3603,7 +3603,14 @@ app.get("/api/health", async (req, res) => {
 // ============================================================
 
 
-
+app.get("/api/auth/register", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "Registration endpoint is available",
+    method: "POST",
+    registerEndpoint: "/api/auth/register"
+  });
+});
 
 // ============================================================
 // LOGIN
