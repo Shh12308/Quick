@@ -62,6 +62,17 @@ const __dirname = dirname(__filename);
 
 const app = express(); 
 const server = http.createServer(app);
+
+console.log("QUICK BACKEND VERSION: REGISTER-ROUTES-CHECK-2026-11-24");
+
+app.get("/__deployment_check", (req, res) => {
+  res.json({
+    version: "REGISTER-ROUTES-CHECK-2026-11-24",
+    file: "server.js",
+    status: "correct deployment"
+  });
+});
+
 app.set("trust proxy", 1);
 
 // ==========================================
