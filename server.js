@@ -18323,6 +18323,27 @@ app.get("/api/settings/blocked", authenticateToken, async (req, res) => {
 // 404 + ERROR HANDLERS
 // ============================================================
 
+app.get("/__routes_debug", (req, res) => {
+  const stack = app._router?.stack || [];
+  const routes = stack
+    .filter(layer => layer.route)
+    .map(layer => ({
+      path: layer.route.path,
+      methods: Object.keys(layer.route.methods)
+    }));
+
+  res.json({
+    totalLayers: stack.length,
+    directRouteCount: routes.length,
+    healthRoute: routes.filter(r => String(r.path).includes("/api/health")),
+    registerRoutes: routes.filter(r => String(r.path).includes("/api/auth/register")),
+    apiRoutes: routes.filter(r => String(r.path).startsWith("/api/")).slice(0, 100),
+    routerMiddleware: stack
+      .filter(layer => layer.name === "router")
+      .map(layer => String(layer.regexp))
+  });
+});
+
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
 });
